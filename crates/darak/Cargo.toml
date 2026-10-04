@@ -1,0 +1,13 @@
+[package]
+name = "darak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+darak-core.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit"] }
+rfd = "0.17"
+
+[build-dependencies]
+winresource = "0.1"

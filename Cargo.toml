@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/darak-core", "crates/darak-cli", "crates/darak"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+darak-core = { path = "crates/darak-core" }
+rayon = "1.12"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+# 개발 중에도 스캔/레이아웃은 빠르게
+[profile.dev.package."*"]
+opt-level = 2
+[profile.dev.package.darak-core]
+opt-level = 2
