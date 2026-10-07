@@ -14,11 +14,24 @@ use darak_core::{
 use eframe::egui::{self, Color32, Key, PointerButton, RichText};
 
 use crate::delete::{self, Dialog, Method, Stage};
-use crate::doc::Doc;
+use crate::doc::{Doc, RemovalApply};
+use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
+use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
+use darak_core::search::{Query, now_secs2000};
 use crate::search_panel;
-use crate::treemap::{self, Detail, Highlights, ItemKind, Layout, Morph, Style, ZoomAnim};
+use crate::treemap::{self, Detail, Highlights, Item, ItemKind, Layout, LayoutSource, Morph, MorphKey, Style, ZoomAnim};
 
 pub struct App {
+    preview: PreviewController,
+    next_scan_id: u64,
+    search: SearchController,
+    search_key: Option<SearchKey>,
+    search_generation: u64,
+    search_submitted: bool,
+    search_failed: Option<String>,
+    pending_removal: Option<PendingRemoval>,
+    removal_released: bool,
+    next_fence: u64,
     drives: Vec<Drive>,
     root_input: String,
     scanning: Option<Scanning>,
@@ -40,10 +53,25 @@ pub struct App {
     last_focus: Option<(u64, NodeId)>,
     /// 미리 보기와 스캔 완료 직후의 모양 변화 보간
     morph: Morph,
+    morph_items: Vec<Item>,
     morph_until: Option<Instant>,
+    #[cfg(feature = "perf")]
+    perf_trace: Option<crate::perf_trace::PerfTrace>,
+    #[cfg(feature = "perf")]
+    perf_fixture_id: Option<String>,
+    #[cfg(feature = "perf")]
+    perf_measurement: Option<crate::perf_trace::Measurement>,
+    #[cfg(feature = "perf")]
+    perf_highlight_draw: Option<crate::perf_trace::DrawIdentity>,
+}
+
+struct PendingRemoval {
+    fence: ReleaseFence,
+    ids: Vec<NodeId>,
 }
 
 struct Scanning {
+    scan_id: u64,
     root: String,
     progress: Arc<ScanProgress>,
     rx: mpsc::Receiver<io::Result<ScanResult>>,
@@ -60,11 +88,21 @@ struct Scanning {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext) -> Self {
+    pub fn new(cc: &eframe::CreationContext, mut search: SearchController, mut preview: PreviewController,
+        #[cfg(feature = "perf")] fixture: Option<(Doc, String)>,
+        #[cfg(feature = "perf")] trace: Option<crate::perf_trace::PerfTrace>,
+    ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        search.set_waker(cc.egui_ctx.clone());
+        preview.set_waker(cc.egui_ctx.clone());
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &trace { search.set_release_observer(trace.release_observer()); }
         let drives = list_drives();
         let root_input = drives.first().map(|d| d.root.clone()).unwrap_or_else(|| "C:\\".into());
         let mut app = Self {
+            preview, next_scan_id: 1,
+            search, search_key: None, search_generation: 0, search_submitted: false,
+            search_failed: None, pending_removal: None, removal_released: false, next_fence: 0,
             drives,
             root_input,
             scanning: None,
@@ -83,8 +121,21 @@ impl App {
             anim: None,
             last_focus: None,
             morph: Morph::default(),
+            morph_items: Vec::new(),
             morph_until: None,
+            #[cfg(feature = "perf")] perf_trace: trace,
+            #[cfg(feature = "perf")] perf_fixture_id: None,
+            #[cfg(feature = "perf")] perf_measurement: None,
+            #[cfg(feature = "perf")] perf_highlight_draw: None,
         };
+        #[cfg(feature = "perf")]
+        if let Some((doc, id)) = fixture {
+            app.root_input = doc.tree.name(Tree::ROOT).into();
+            app.next_doc_id = 2;
+            app.doc = Some(doc);
+            app.perf_fixture_id = Some(id);
+            return app;
+        }
         // `darak.exe D:\` 처럼 경로를 주면 바로 스캔
         if let Some(arg) = std::env::args().nth(1) {
             app.start_scan(arg);
@@ -93,17 +144,12 @@ impl App {
     }
 
     fn start_scan(&mut self, root: String) {
-        if self.delete_dialog.is_some() {
+        #[cfg(feature = "perf")]
+        if self.perf_fixture_id.is_some() { return; }
+        if self.delete_dialog.is_some() || self.pending_removal.is_some() {
             return;
         }
-        if let Some(s) = &self.scanning {
-            s.progress.cancel();
-        }
         let root = normalize_root(&root);
-        self.root_input = root.clone();
-        self.morph.reset();
-        self.morph_until = None;
-        self.error = None;
         let progress = Arc::new(ScanProgress::default());
         let (tx, rx) = mpsc::channel();
         {
@@ -119,7 +165,22 @@ impl App {
         }
         let is_drive_root = root.len() == 3 && root.ends_with(":\\");
         let used = is_drive_root.then(|| disk_space(&root)).flatten().map(|(t, f)| t - f);
+        self.begin_scan(root, progress, rx, used);
+    }
+
+    fn begin_scan(&mut self, root: String, progress: Arc<ScanProgress>, rx: mpsc::Receiver<io::Result<ScanResult>>, used: Option<u64>) {
+        self.cancel_scan();
+        self.suspend_search();
+        self.root_input = root.clone();
+        self.morph.reset();
+        self.morph_items.clear();
+        self.morph_until = None;
+        self.error = None;
+        let scan_id = self.next_scan_id;
+        self.next_scan_id = scan_id.checked_add(1).expect("scan ID exhausted");
+        self.preview.activate(scan_id);
         self.scanning = Some(Scanning {
+            scan_id,
             root,
             progress,
             rx,
@@ -133,8 +194,51 @@ impl App {
         });
     }
 
+    fn cancel_scan(&mut self) {
+        if let Some(scan) = &self.scanning {
+            scan.progress.cancel();
+            self.preview.invalidate(scan.scan_id);
+        }
+    }
+
+    fn accept_preview(&mut self, packet: PreviewPacket) -> bool {
+        let Some(scan) = &mut self.scanning else { return false };
+        // Validate identity and lifecycle before accessing any packet tree node.
+        if scan.scan_id != packet.scan_id || scan.progress.is_cancelled()
+            || packet.version <= scan.preview_version {
+            return false;
+        }
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace {
+            trace.record("preview", packet.scan_id, packet.version, "capture", packet.capture_time);
+            trace.record("preview", packet.scan_id, packet.version, "build", packet.build_time);
+        }
+        scan.preview = Some(packet.tree);
+        scan.preview_version = packet.version;
+        true
+    }
+
+    fn poll_preview(&mut self) {
+        if let Some(scan) = &self.scanning && scan.progress.is_cancelled() {
+            self.preview.invalidate(scan.scan_id);
+        }
+        if let Some(packet) = self.preview.try_take_latest() {
+            self.accept_preview(packet);
+        }
+        let Some(scan) = &mut self.scanning else { return };
+        if !scan.progress.is_cancelled() && scan.last_preview.elapsed() >= Duration::from_millis(1200) {
+            scan.last_preview = Instant::now();
+            self.preview.request_latest(PreviewRequest {
+                scan_id: scan.scan_id,
+                progress: Arc::clone(&scan.progress),
+                after_version: scan.preview_version,
+            });
+        }
+    }
+
     fn open_delete_review(&mut self) {
-        if self.scanning.is_some() || self.delete_dialog.is_some() {
+        if self.doc.as_ref().is_some_and(|doc| !filesystem_actions_enabled(doc)) { return; }
+        if self.scanning.is_some() || self.delete_dialog.is_some() || self.pending_removal.is_some() {
             return;
         }
         if let Some(doc) = &self.doc
@@ -152,8 +256,17 @@ impl App {
 
     fn poll_scan(&mut self) {
         let Some(s) = &self.scanning else { return };
-        match s.rx.try_recv() {
+        let result = s.rx.try_recv();
+        if !matches!(result, Err(mpsc::TryRecvError::Empty)) {
+            self.preview.invalidate(s.scan_id);
+            self.morph.invalidate();
+        }
+        match result {
             Ok(Ok(res)) => {
+                self.suspend_search();
+                self.context_node = None;
+                self.anim = None;
+                self.last_focus = None;
                 self.doc = Some(Doc::new(self.next_doc_id, res.tree, res.stats));
                 self.morph_until = Some(Instant::now() + Duration::from_millis(1500));
                 self.next_doc_id += 1;
@@ -178,6 +291,7 @@ impl App {
     }
 
     fn toggle_mark(&mut self, id: NodeId) {
+        if self.pending_removal.is_some() { return; }
         if let Some(doc) = &mut self.doc
             && let Err(e) = doc.toggle_mark(id) {
                 self.toast = Some((e, Instant::now()));
@@ -185,17 +299,197 @@ impl App {
     }
 }
 
+impl App {
+    fn suspend_search(&mut self) {
+        #[cfg(feature = "perf")]
+        self.perf_supersede();
+        self.search.invalidate();
+        self.search_submitted = false;
+        self.search_key = None;
+        if let Some(doc) = &mut self.doc {
+            doc.clear_search();
+        }
+    }
+
+    fn observe_search_input(&mut self) {
+        // A suspended query becomes a new request at resume, excluding scan time.
+        if self.scanning.is_some() {
+            return;
+        }
+        let key = self.doc.as_ref().map(|doc| doc.search_key(self.mode));
+        if self.search_key == key {
+            return;
+        }
+        self.search.invalidate();
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.search_submitted = false;
+        self.search_key = key;
+        if let Some(doc) = &mut self.doc {
+            doc.clear_search();
+            doc.search.edited_at = Some(Instant::now());
+        }
+        #[cfg(feature = "perf")]
+        self.perf_observe_input();
+    }
+
+    fn update_search(&mut self) {
+        self.search_pass(true);
+    }
+
+    fn search_pass(&mut self, accept_completion: bool) {
+        // Invalidation must precede consuming completions in the same frame.
+        self.observe_search_input();
+        while let Some(event) = self.search.try_take_control() {
+            self.search_control(event);
+        }
+        self.finish_removal();
+        self.observe_search_input();
+        if self.scanning.is_some() || self.pending_removal.is_some() {
+            return;
+        }
+        if let Some(error) = &self.search_failed {
+            if let Some(doc) = &mut self.doc {
+                doc.search.error = Some(error.clone());
+            }
+            return;
+        }
+        if accept_completion
+            && let Some(completion) = self.search.try_take_completion()
+            && let (Some(doc), Some(key)) = (&mut self.doc, &self.search_key)
+        {
+            #[cfg(feature = "perf")]
+            let timings = completion.timings;
+            if doc.accept_search(completion, key, self.search_generation) {
+                #[cfg(feature = "perf")]
+                if let Some(trace) = &mut self.perf_trace {
+                    for (phase, elapsed) in [
+                        ("queued", timings.queued),
+                        ("search", timings.search),
+                        ("highlight", timings.highlight),
+                    ] {
+                        trace.record("search", doc.id, self.search_generation, phase, elapsed);
+                    }
+                }
+            }
+        }
+        if self.search_submitted {
+            return;
+        }
+        let (Some(doc), Some(key)) = (&mut self.doc, &self.search_key) else {
+            return;
+        };
+        self.search_submitted = true;
+        if key.query.trim().is_empty() {
+            return;
+        }
+        let now = now_secs2000();
+        #[cfg(feature = "perf")]
+        let now = if self.perf_fixture_id.is_some() {
+            darak_core::perf::FIXTURE_NOW_SECS2000
+        } else {
+            now
+        };
+        match Query::parse(&key.query, now) {
+            Ok(query) if !query.is_empty() => self.search.submit_latest(SearchRequest {
+                generation: self.search_generation,
+                key: key.clone(),
+                tree: Arc::clone(&doc.tree),
+                query,
+                edited_at: doc.search.edited_at.unwrap_or_else(Instant::now),
+            }),
+            Ok(_) => {}
+            Err(error) => doc.search.error = Some(error),
+        }
+    }
+
+    fn begin_removal(&mut self, doc_id: u64, ids: Vec<NodeId>) {
+        if self.pending_removal.is_some() || ids.is_empty() {
+            return;
+        }
+        let Some(doc) = &mut self.doc else { return };
+        if doc.id != doc_id || ids.iter().any(|&id| id as usize >= doc.tree.len()) {
+            return;
+        }
+        self.next_fence = self.next_fence.wrapping_add(1);
+        let fence = ReleaseFence {
+            token: self.next_fence,
+            doc_id,
+            tree_version: doc.tree.version,
+        };
+        doc.clear_search();
+        self.search_submitted = false;
+        self.removal_released = false;
+        self.pending_removal = Some(PendingRemoval { fence, ids });
+        self.search.release_for_mutation(fence);
+    }
+
+    fn search_control(&mut self, event: SearchControlEvent) {
+        match event {
+            SearchControlEvent::Released(fence) => {
+                if self
+                    .pending_removal
+                    .as_ref()
+                    .is_some_and(|p| p.fence == fence)
+                {
+                    self.removal_released = true;
+                }
+            }
+            SearchControlEvent::WorkerFailed(error) => {
+                self.search_failed = Some(error);
+                if let Some(doc) = &mut self.doc {
+                    doc.clear_search();
+                }
+            }
+        }
+    }
+
+    fn finish_removal(&mut self) {
+        if !self.removal_released {
+            return;
+        }
+        let Some(pending) = &self.pending_removal else {
+            return;
+        };
+        let applied = match &mut self.doc {
+            Some(doc) if doc.tree.version == pending.fence.tree_version => {
+                doc.apply_removed_for(pending.fence.doc_id, &pending.ids)
+            }
+            _ => RemovalApply::Rejected,
+        };
+        if applied == RemovalApply::Busy {
+            self.error = Some("검색 작업자가 트리 소유권을 반환하지 않았습니다".into());
+            return;
+        }
+        let fence = pending.fence;
+        if applied == RemovalApply::Applied {
+            self.layout.invalidate();
+            self.anim = None;
+            self.morph.reset();
+            self.morph_until = None;
+            self.last_focus = None;
+            self.context_node = None;
+        }
+        self.pending_removal = None;
+        self.removal_released = false;
+        self.search.resume_after_mutation(fence);
+        self.search_submitted = false;
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        #[cfg(feature = "perf")]
+        let frame_started = Instant::now();
         let ctx = ui.ctx().clone();
+        #[cfg(feature = "perf")]
+        { self.perf_highlight_draw = None; }
+        #[cfg(feature = "perf")]
+        let mut table_draw = None;
         self.poll_scan();
+        self.poll_preview();
         if self.scanning.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
-        if let Some(doc) = &mut self.doc
-            && search_panel::update(doc, self.mode) {
-                ctx.request_repaint_after(Duration::from_millis(50));
-            }
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
@@ -205,9 +499,13 @@ impl eframe::App for App {
         if show_results {
             let mut action = search_panel::Action::None;
             egui::Panel::right("results").resizable(true).default_size(440.0).min_size(260.0).show(ui, |ui| {
+                if let Some(doc) = &mut self.doc { search_panel::controls(ui, doc); }
+                self.update_search();
                 if let Some(doc) = &mut self.doc {
-                    action = search_panel::panel(ui, doc, self.mode);
+                    action = search_panel::results(ui, doc, self.mode);
                 }
+                #[cfg(feature = "perf")]
+                { table_draw = self.perf_draw_identity(); }
             });
             if let Some(doc) = &mut self.doc {
                 match action {
@@ -224,20 +522,34 @@ impl eframe::App for App {
             }
         }
 
+        // Result clicks can change a focus-only scope before the treemap draws.
+        if show_results { self.search_pass(false); } else { self.update_search(); }
         let bg = ui.style().visuals.extreme_bg_color;
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| {
             if self.scanning.is_some() {
                 self.scan_view(ui);
             } else if self.doc.is_some() {
-                self.treemap_view(ui);
+                ui.add_enabled_ui(self.pending_removal.is_none(), |ui| self.treemap_view(ui));
             } else {
                 self.welcome(ui);
             }
         });
 
+        #[cfg(feature = "perf")]
+        self.perf_record_draw(table_draw.as_ref());
         self.delete_dialog_ui(&ctx);
         self.toast_ui(&ctx);
         self.keyboard(&ctx);
+        // Treemap/context/keyboard navigation happens after the results panel.
+        let generation = self.search_generation;
+        self.search_pass(false);
+        if self.search_generation != generation { ctx.request_repaint(); }
+        #[cfg(feature = "perf")]
+        {
+            if let Some(trace) = &mut self.perf_trace {
+                trace.record("frame", self.doc.as_ref().map_or(0, |d| d.id), self.search_generation, "cpu", frame_started.elapsed());
+            }
+        }
     }
 }
 
@@ -249,7 +561,7 @@ impl App {
         ui.add_space(4.0);
         let mut review = false;
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(self.delete_dialog.is_none(), |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
+            ui.add_enabled_ui(self.delete_dialog.is_none() && self.pending_removal.is_none(), |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
                 let mut chosen = None;
                 for d in &self.drives {
                     let txt = format!(
@@ -268,22 +580,23 @@ impl App {
                 }
             }));
 
-            let edit = ui.add_enabled(self.delete_dialog.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
+            let edit = ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-            if ui.add_enabled(self.delete_dialog.is_none(), egui::Button::new("📁 폴더…")).clicked()
+            if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("📁 폴더…")).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.start_scan(dir.display().to_string());
                 }
-            if let Some(s) = &self.scanning {
+            if self.scanning.is_some() {
                 if ui.button("⏹ 중지").clicked() {
-                    s.progress.cancel();
+                    self.cancel_scan();
                 }
-            } else if ui.add_enabled(self.delete_dialog.is_none(), egui::Button::new("🔍 스캔")).clicked() || enter {
+            } else if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("🔍 스캔")).clicked() || enter {
                 self.start_scan(self.root_input.clone());
             }
 
             if !self.elevated
+                && self.doc.as_ref().is_none_or(filesystem_actions_enabled)
                 && ui
                     .button("🛡 관리자로 실행")
                     .on_hover_text("관리자 권한이면 NTFS의 $MFT를 직접 읽어 드라이브 전체를 몇 초 안에 스캔합니다")
@@ -345,10 +658,10 @@ impl App {
                 if !doc.marks.is_empty() {
                     ui.separator();
                     let txt = format!("🗑 표시 {}개 · {}  검토…", doc.marks.len(), human_size(doc.marked_size(self.mode)));
-                    if ui.add_enabled(self.scanning.is_none() && self.delete_dialog.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 45))).clicked() {
+                    if ui.add_enabled(filesystem_actions_enabled(doc) && self.scanning.is_none() && self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 45))).clicked() {
                         review = true;
                     }
-                    if ui.small_button("표시 모두 해제").clicked() {
+                    if ui.add_enabled(self.pending_removal.is_none(), egui::Button::new("표시 모두 해제").small()).clicked() {
                         doc.clear_marks();
                     }
                 }
@@ -528,16 +841,6 @@ impl App {
             None => egui::ProgressBar::new(0.0).animate(true),
         };
 
-        // 일반 순회는 지금까지의 결과를 주기적으로 미리 보여 준다 (MFT는 몇 초면 끝나므로 진행률만)
-        if total_hint == 0 && s.last_preview.elapsed() > Duration::from_millis(1200) {
-            s.last_preview = Instant::now();
-            let lt = p.live.lock().unwrap();
-            if lt.version != s.preview_version {
-                s.preview_version = lt.version;
-                s.preview = lt.snapshot();
-            }
-        }
-
         let Some(tree) = &s.preview else {
             ui.add_space(80.0);
             ui.vertical_centered(|ui| {
@@ -549,6 +852,7 @@ impl App {
                 ui.add_space(16.0);
                 if ui.button("중지").clicked() {
                     p.cancel();
+                    self.preview.invalidate(s.scan_id);
                 }
             });
             return;
@@ -561,12 +865,26 @@ impl App {
             ui.label(&eta_text);
             if ui.small_button("중지").clicked() {
                 p.cancel();
+                self.preview.invalidate(s.scan_id);
             }
         });
         let (resp, painter) = treemap::canvas(ui);
         let area = resp.rect.shrink(2.0);
-        s.preview_layout.update(tree, 0, Tree::ROOT, area, mode, detail);
-        let (shown, moving) = self.morph.step(&s.preview_layout.items);
+        #[cfg(feature = "perf")]
+        let layout_started = Instant::now();
+        s.preview_layout.update(tree, s.scan_id, Tree::ROOT, area, mode, detail);
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace {
+            trace.record("preview", s.scan_id, s.preview_layout.generation(), "layout", layout_started.elapsed());
+        }
+        let key = MorphKey { layout_id: LayoutSource::Preview(s.scan_id), generation: s.preview_layout.generation() };
+        #[cfg(feature = "perf")]
+        let morph_started = Instant::now();
+        let (shown, moving) = morph_items(&mut self.morph, &s.preview_layout.items, key, &mut self.morph_items);
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace {
+            trace.record("preview", s.scan_id, key.generation, "morph", morph_started.elapsed());
+        }
         if moving {
             ui.ctx().request_repaint();
         }
@@ -576,7 +894,7 @@ impl App {
         treemap::paint(
             &painter,
             tree,
-            &shown,
+            shown,
             None,
             &Style { dark },
             mode,
@@ -616,7 +934,13 @@ impl App {
             }
         }
         self.last_focus = Some((doc.id, doc.focus));
+        #[cfg(feature = "perf")]
+        let layout_started = Instant::now();
         self.layout.update(&doc.tree, doc.id, doc.focus, area, mode, detail);
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace {
+            trace.record("document", doc.id, self.layout.generation(), "layout", layout_started.elapsed());
+        }
         if let Some(pf) = zoom_out_from
             && let Some(r) = self.layout.deepest_rect(&doc.tree.ancestry(pf))
         {
@@ -630,24 +954,28 @@ impl App {
         }
 
         // 스캔이 막 끝났으면 미리 보기 모양에서 최종 모양으로 부드럽게 바꾼다
-        let morphed = match self.morph_until {
-            Some(until) if camera.is_none() && Instant::now() < until => {
-                let (shown, moving) = self.morph.step(&self.layout.items);
-                if moving {
-                    ui.ctx().request_repaint();
-                    Some(shown)
-                } else {
-                    None
-                }
-            }
-            _ => None,
+        #[cfg(feature = "perf")]
+        let morph_started = Instant::now();
+        let shown = if camera.is_none() && self.morph_until.is_some_and(|until| Instant::now() < until) {
+            let key = MorphKey { layout_id: LayoutSource::Document(doc.id), generation: self.layout.generation() };
+            let (shown, moving) = morph_items(&mut self.morph, &self.layout.items, key, &mut self.morph_items);
+            if moving { ui.ctx().request_repaint(); }
+            shown
+        } else {
+            if self.morph_until.take().is_some() { self.morph.invalidate(); }
+            &self.layout.items
         };
-        if morphed.is_none() && self.morph_until.is_some() {
-            self.morph_until = None;
-            self.morph.reset();
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace {
+            trace.record("document", doc.id, self.layout.generation(), "morph", morph_started.elapsed());
         }
 
-        let hit = if camera.is_some() { None } else { resp.hover_pos().and_then(|p| self.layout.hit(p)).copied() };
+        let hit = if camera.is_some() { None } else {
+            resp.hover_pos().and_then(|pos| {
+                if std::ptr::eq(shown, self.layout.items.as_slice()) { self.layout.hit(pos) }
+                else { shown.iter().rev().find(|it| it.rect.contains(pos)) }
+            }).copied()
+        };
         doc.hovered = hit.map(|it| it.node);
 
         {
@@ -666,12 +994,17 @@ impl App {
             treemap::paint(
                 &painter,
                 &d.tree,
-                morphed.as_deref().unwrap_or(&self.layout.items),
+                shown,
                 camera,
                 &style,
                 mode,
                 &Highlights { hovered: d.hovered, hover_chain: &chain, selected: d.selected, marked: &marked, filter },
             );
+            #[cfg(feature = "perf")]
+            { self.perf_highlight_draw = d.search.applied.as_ref().map(|key| crate::perf_trace::DrawIdentity {
+                key: key.clone(), generation: self.search_generation,
+            }); }
+
         }
 
         if resp.clicked() {
@@ -683,7 +1016,8 @@ impl App {
             match it.kind {
                 ItemKind::OpenDir | ItemKind::ClosedDir => doc.navigate(it.node),
                 ItemKind::File => open_item(doc, it.node),
-                ItemKind::Link => reveal_in_explorer(&doc.tree.path(it.node)),
+                ItemKind::Link if filesystem_actions_enabled(doc) => reveal_in_explorer(&doc.tree.path(it.node)),
+                ItemKind::Link => {},
                 ItemKind::Group { .. } => {}
             }
         }
@@ -737,16 +1071,8 @@ impl App {
         let Some(dlg) = &mut self.delete_dialog else { return };
         let mut removed = Vec::new();
         let open = delete::show(ctx, dlg, self.doc.as_mut(), self.mode, &mut removed);
-        if !removed.is_empty()
-            && let Some(doc) = &mut self.doc
-            && doc.apply_removed_for(dlg.doc_id, &removed)
-        {
-            self.layout.invalidate();
-            self.anim = None;
-            self.morph.reset();
-            self.context_node = None;
-            self.drives = list_drives();
-        }
+        let source_id = dlg.doc_id;
+        if !removed.is_empty() { self.begin_removal(source_id, removed); }
         if !open {
             self.delete_dialog = None;
         }
@@ -771,7 +1097,7 @@ impl App {
         if ctrl_f || (!ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Slash))) {
             self.focus_search = true;
         }
-        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() || self.scanning.is_some() {
+        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() || self.scanning.is_some() || self.pending_removal.is_some() {
             return;
         }
         let mut toggle = None;
@@ -829,20 +1155,20 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId) -> bool {
     }
     match doc.tree.node(n).kind {
         Kind::File => {
-            if ui.button("📄 열기").clicked() {
+            if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("📄 열기")).clicked() {
                 open_item(doc, n);
                 ui.close();
             }
         }
         Kind::Dir => {
-            if ui.button("📂 폴더 열기").clicked() {
+            if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("📂 폴더 열기")).clicked() {
                 shell_open(&path);
                 ui.close();
             }
         }
         Kind::Link => {}
     }
-    if ui.button("🔎 탐색기에서 위치 보기").clicked() {
+    if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("🔎 탐색기에서 위치 보기")).clicked() {
         reveal_in_explorer(&path);
         ui.close();
     }
@@ -933,6 +1259,12 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
     }
 }
 
+fn morph_items<'a>(morph: &mut Morph, items: &'a [Item], key: MorphKey, out: &'a mut Vec<Item>) -> (&'a [Item], bool) {
+    if morph.is_settled(key) { return (items, false); }
+    let moving = morph.step_into(items, key, out);
+    (if morph.is_settled(key) { items } else { out }, moving)
+}
+
 fn fmt_duration(secs: f64) -> String {
     let s = secs.round() as u64;
     if s < 60 { format!("{s}초") } else { format!("{}분 {:02}초", s / 60, s % 60) }
@@ -959,6 +1291,7 @@ fn wheel_delta(i: &egui::InputState) -> f32 {
 
 /// 파일을 기본 앱으로 연다
 fn open_item(doc: &Doc, id: NodeId) {
+    if !filesystem_actions_enabled(doc) { return; }
     let path = doc.tree.path(id);
     if !shell_open(&path) {
         reveal_in_explorer(&path);
@@ -969,6 +1302,135 @@ fn reveal_in_explorer(path: &str) {
     let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{path}\"")).spawn();
 }
 
+// The marker is carried by the synthetic tree, so leaf handlers cannot bypass it.
+fn filesystem_actions_enabled(doc: &Doc) -> bool {
+    #[cfg(feature = "perf")]
+    if doc.tree.node(Tree::ROOT).has(flags::SYNTHETIC) { return false; }
+    #[cfg(not(feature = "perf"))]
+    let _ = doc;
+    true
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.cancel_scan();
+        self.preview.shutdown();
+        self.search.shutdown();
+        #[cfg(feature = "perf")]
+        if let Some(trace) = &mut self.perf_trace { trace.finish(); }
+    }
+}
+
+#[cfg(feature = "perf")]
+impl App {
+    fn perf_supersede(&mut self) {
+        if let Some(previous) = self.perf_measurement.take()
+            && !previous.drawn
+            && let Some(trace) = &mut self.perf_trace
+        {
+            trace.record(
+                "search",
+                previous.key.doc_id,
+                previous.generation,
+                "superseded",
+                previous.input_at.elapsed(),
+            );
+        }
+    }
+
+    fn perf_observe_input(&mut self) {
+        if self.perf_trace.is_none() {
+            return;
+        }
+        let Some(key) = self.search_key.clone() else {
+            return;
+        };
+        if self
+            .perf_measurement
+            .as_ref()
+            .is_some_and(|m| m.generation == self.search_generation)
+        {
+            return;
+        }
+        self.perf_supersede();
+        let input_at = self
+            .doc
+            .as_ref()
+            .and_then(|doc| doc.search.edited_at)
+            .unwrap_or_else(Instant::now);
+        let fixture = self.perf_fixture_id.as_deref().unwrap_or("real-corpus");
+        let mode = match key.mode {
+            SizeMode::Allocated => "allocated",
+            SizeMode::Logical => "logical",
+        };
+        let trace = self.perf_trace.as_mut().unwrap();
+        trace.map_query(
+            key.doc_id,
+            self.search_generation,
+            fixture,
+            &key.query,
+            key.scope,
+            mode,
+        );
+        trace.record(
+            "search",
+            key.doc_id,
+            self.search_generation,
+            "input",
+            Duration::ZERO,
+        );
+        self.perf_measurement = Some(crate::perf_trace::Measurement {
+            key,
+            generation: self.search_generation,
+            input_at,
+            drawn: false,
+        });
+    }
+
+    fn perf_draw_identity(&self) -> Option<crate::perf_trace::DrawIdentity> {
+        let doc = self.doc.as_ref()?;
+        let measurement = self.perf_measurement.as_ref()?;
+        if doc.search.result.is_none()
+            || doc.search.error.is_some()
+            || measurement.generation != self.search_generation
+            || doc.search.applied.as_ref() != Some(&measurement.key)
+            || doc.search_key(self.mode) != measurement.key
+        {
+            return None;
+        }
+        Some(crate::perf_trace::DrawIdentity {
+            key: measurement.key.clone(),
+            generation: measurement.generation,
+        })
+    }
+
+    fn perf_record_draw(&mut self, table: Option<&crate::perf_trace::DrawIdentity>) {
+        let Some(table) = table else { return };
+        if self.perf_highlight_draw.as_ref() != Some(table) {
+            return;
+        }
+        let (Some(trace), Some(measurement)) = (&mut self.perf_trace, &mut self.perf_measurement)
+        else {
+            return;
+        };
+        if measurement.drawn
+            || measurement.generation != table.generation
+            || measurement.key != table.key
+        {
+            return;
+        }
+        trace.record(
+            "search",
+            table.key.doc_id,
+            table.generation,
+            "first_accepted_draw",
+            measurement.input_at.elapsed(),
+        );
+        measurement.drawn = true;
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,7 +1438,14 @@ mod tests {
     use darak_core::NO_NODE;
 
     fn app(doc: Doc) -> App {
+        let (search, runtime) = crate::search_worker::SearchRuntime::new();
+        runtime.shutdown_and_join();
+        let (preview, runtime) = crate::preview_worker::PreviewRuntime::new();
+        runtime.shutdown_and_join();
         App {
+            preview, next_scan_id: 1,
+            search, search_key: None, search_generation: 0, search_submitted: false,
+            search_failed: None, pending_removal: None, removal_released: false, next_fence: 0,
             drives: Vec::new(),
             root_input: "C:\\Data".into(),
             scanning: None,
@@ -995,8 +1464,49 @@ mod tests {
             anim: None,
             last_focus: None,
             morph: Morph::default(),
+            morph_items: Vec::new(),
             morph_until: None,
+            #[cfg(feature = "perf")] perf_trace: None,
+            #[cfg(feature = "perf")] perf_fixture_id: None,
+            #[cfg(feature = "perf")] perf_measurement: None,
+            #[cfg(feature = "perf")] perf_highlight_draw: None,
         }
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn synthetic_fixture_disables_filesystem_actions_and_delete_review() {
+        let tree = darak_core::perf::make_fixture(100, darak_core::perf::Shape::Balanced, 25);
+        let mut app = app(doc(1, tree));
+        assert!(!filesystem_actions_enabled(app.doc.as_ref().unwrap()));
+        app.doc.as_mut().unwrap().marks.insert(1);
+        app.open_delete_review();
+        assert!(app.delete_dialog.is_none());
+        assert!(filesystem_actions_enabled(&fixture(2)));
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn perf_generation_tracks_query_mode_and_focus_scope() {
+        let mut app = app(fixture(1));
+        let (trace, _runtime) = crate::perf_trace::PerfTraceRuntime::new("unused.csv".into());
+        app.perf_trace = Some(trace);
+        app.observe_search_input();
+        let generation = app.search_generation;
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation);
+        app.doc.as_mut().unwrap().search.query = "file:".into();
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation + 1);
+        app.doc.as_mut().unwrap().focus = 1;
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation + 1);
+        app.doc.as_mut().unwrap().search.in_focus_only = true;
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation + 2);
+        app.mode = SizeMode::Logical;
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation + 3);
     }
 
     fn group_fixture() -> Doc {
@@ -1189,6 +1699,7 @@ mod tests {
         app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
         let (_tx, rx) = mpsc::channel();
         app.scanning = Some(Scanning {
+            scan_id: 1,
             root: "C:\\Data".into(),
             progress: Arc::new(ScanProgress::default()),
             rx,
@@ -1291,4 +1802,842 @@ mod tests {
             ));
         }
     }
+    struct TestWake {
+        ctx: egui::Context,
+        rx: mpsc::Receiver<()>,
+    }
+
+    fn running_app(
+        hook: impl Fn(u64) + Send + Sync + 'static,
+    ) -> (App, crate::search_worker::SearchRuntime, TestWake) {
+        let mut app = app(fixture(1));
+        let (mut controller, runtime) =
+            crate::search_worker::SearchRuntime::with_hook(Box::new(hook));
+        let (tx, wake) = mpsc::channel();
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |_| {
+            let _ = tx.send(());
+        });
+        controller.set_waker(ctx.clone());
+        app.search = controller;
+        (app, runtime, TestWake { ctx, rx: wake })
+    }
+
+    fn pump_until(app: &mut App, wake: &TestWake, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let mut output = wake
+                .ctx
+                .run_ui(egui::RawInput::default(), |_| app.update_search());
+            output.textures_delta.clear();
+            if done(app) {
+                return;
+            }
+            wake.rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("worker repaint deadline");
+        }
+    }
+
+    fn shutdown(runtime: crate::search_worker::SearchRuntime) {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            runtime.shutdown_and_join();
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("worker join deadline");
+    }
+
+    #[test]
+    fn mutation_fence_blocks_resubmission() {
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let release = std::sync::Mutex::new(release);
+        let (mut app, runtime, wake) = running_app(move |generation| {
+            started_tx.send(generation).unwrap();
+            if generation == 1 {
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+            }
+        });
+        app.doc.as_mut().unwrap().search.query = "file:".into();
+        app.update_search();
+        assert_eq!(started.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+        app.doc.as_mut().unwrap().search.query = "folder:".into();
+        app.update_search(); // One active and one pending lease.
+        assert_eq!(Arc::strong_count(&app.doc.as_ref().unwrap().tree), 3);
+        app.begin_removal(1, vec![1]);
+        app.doc.as_mut().unwrap().search.query = "sibling".into();
+        app.mode = SizeMode::Logical;
+        for _ in 0..3 {
+            app.update_search();
+        }
+        assert!(!app.search_submitted);
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
+        assert_eq!(Arc::strong_count(&app.doc.as_ref().unwrap().tree), 2);
+        assert!(started.try_recv().is_err());
+        app.start_scan("C:\\blocked".into());
+        app.open_delete_review();
+        app.toggle_mark(3);
+        assert!(app.scanning.is_none());
+        assert!(app.delete_dialog.is_none());
+        assert!(app.doc.as_ref().unwrap().marks.is_empty());
+        release_tx.send(()).unwrap();
+        pump_until(&mut app, &wake, |app| {
+            app.doc.as_ref().unwrap().search.result.is_some()
+        });
+        let doc = app.doc.as_mut().unwrap();
+        assert_eq!(doc.tree.version, 1);
+        assert!(Arc::get_mut(&mut doc.tree).is_some());
+        assert_eq!(doc.search.result.as_ref().unwrap().hits, [2]);
+        assert_eq!(
+            started.recv_timeout(Duration::from_secs(10)).unwrap(),
+            app.search_generation
+        );
+        assert!(started.try_recv().is_err());
+        assert!(app.pending_removal.is_none());
+        shutdown(runtime);
+    }
+
+    #[test]
+    fn wrong_fence_cannot_apply_removal() {
+        let mut app = app(fixture(1));
+        app.begin_removal(1, vec![1]);
+        let fence = app.pending_removal.as_ref().unwrap().fence;
+        for wrong in [
+            ReleaseFence {
+                token: fence.token + 1,
+                ..fence
+            },
+            ReleaseFence { doc_id: 2, ..fence },
+            ReleaseFence {
+                tree_version: 1,
+                ..fence
+            },
+        ] {
+            app.search_control(SearchControlEvent::Released(wrong));
+            app.finish_removal();
+            assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
+            assert!(!app.removal_released);
+        }
+        let lease = Arc::clone(&app.doc.as_ref().unwrap().tree);
+        app.search_control(SearchControlEvent::Released(fence));
+        app.finish_removal();
+        assert!(app.pending_removal.is_some());
+        assert!(app.error.is_some());
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
+        drop(lease);
+        app.finish_removal();
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 1);
+    }
+
+    #[test]
+    fn worker_failure_does_not_strand_pending_removal() {
+        for fail_before_fence in [false, true] {
+            let (started_tx, started) = mpsc::channel();
+            let (release_tx, release) = mpsc::channel();
+            let release = std::sync::Mutex::new(release);
+            let (mut app, runtime, wake) = running_app(move |_| {
+                started_tx.send(()).unwrap();
+                release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap();
+                panic!("injected search failure");
+            });
+            app.doc.as_mut().unwrap().search.query = "file:".into();
+            app.update_search();
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
+            if !fail_before_fence {
+                app.begin_removal(1, vec![1]);
+            }
+            release_tx.send(()).unwrap();
+            pump_until(&mut app, &wake, |app| app.search_failed.is_some());
+            if fail_before_fence {
+                app.begin_removal(1, vec![1]);
+            }
+            pump_until(&mut app, &wake, |app| app.pending_removal.is_none());
+            assert_eq!(app.doc.as_ref().unwrap().tree.version, 1);
+            app.doc.as_mut().unwrap().search.query = "sibling".into();
+            app.update_search();
+            assert!(!app.search_submitted);
+            assert!(app.doc.as_ref().unwrap().search.error.is_some());
+            assert!(Arc::get_mut(&mut app.doc.as_mut().unwrap().tree).is_some());
+            shutdown(runtime);
+        }
+    }
+
+    #[test]
+    fn empty_invalid_query_clears_old_presentation() {
+        let (mut app, runtime, wake) = running_app(|_| {});
+        for query in ["", "size:>nonsense"] {
+            app.doc.as_mut().unwrap().search.query = "file:".into();
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            app.doc.as_mut().unwrap().search.query = query.into();
+            app.update_search();
+            let doc = app.doc.as_ref().unwrap();
+            assert!(doc.search.result.is_none());
+            assert!(doc.search.bits.is_empty());
+            assert!(doc.search.applied.is_none());
+            assert_eq!(doc.search.error.is_some(), !query.is_empty());
+        }
+        shutdown(runtime);
+    }
+
+    #[test]
+    fn scope_and_mode_changes_invalidate_same_frame() {
+        let (mut app, runtime, wake) = running_app(|_| {});
+        app.doc.as_mut().unwrap().search.query = "file:".into();
+        pump_until(&mut app, &wake, |app| {
+            app.doc.as_ref().unwrap().search.result.is_some()
+        });
+        let generation = app.search_generation;
+        let edited = app.doc.as_ref().unwrap().search.edited_at;
+        let bits = app.doc.as_ref().unwrap().search.bits.as_ptr();
+        app.doc.as_mut().unwrap().navigate(1);
+        app.doc.as_mut().unwrap().search.highlight = false;
+        app.update_search();
+        assert_eq!(app.search_generation, generation);
+        assert_eq!(app.doc.as_ref().unwrap().search.edited_at, edited);
+        assert_eq!(app.doc.as_ref().unwrap().search.bits.as_ptr(), bits);
+        app.doc.as_mut().unwrap().search.in_focus_only = true;
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation + 1);
+        assert!(app.doc.as_ref().unwrap().search.result.is_none());
+        pump_until(&mut app, &wake, |app| {
+            app.doc.as_ref().unwrap().search.result.is_some()
+        });
+        app.mode = SizeMode::Logical;
+        app.observe_search_input();
+        assert!(app.doc.as_ref().unwrap().search.result.is_none());
+        assert_eq!(app.search_generation, generation + 2);
+        app.doc.as_mut().unwrap().go_up();
+        app.search_pass(false);
+        assert_eq!(app.search_generation, generation + 3);
+        assert!(app.doc.as_ref().unwrap().search.bits.is_empty());
+        shutdown(runtime);
+    }
+
+    fn install_scan(app: &mut App) -> mpsc::Sender<io::Result<ScanResult>> {
+        app.suspend_search();
+        let (tx, rx) = mpsc::channel();
+        app.scanning = Some(Scanning {
+            scan_id: 1,
+            root: "C:\\Data".into(),
+            progress: Arc::default(),
+            rx,
+            started: Instant::now(),
+            used: None,
+            eta: None,
+            preview: None,
+            preview_version: 0,
+            preview_layout: Layout::stable(),
+            last_preview: Instant::now(),
+        });
+        tx
+    }
+
+    #[test]
+    fn scan_start_suspends_old_document_search() {
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let release = std::sync::Mutex::new(release);
+        let (mut app, runtime, _wake) = running_app(move |_| {
+            started_tx.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        });
+        app.doc.as_mut().unwrap().search.query = "file:".into();
+        app.update_search();
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let _scan = install_scan(&mut app);
+        app.doc.as_mut().unwrap().search.query = "sibling".into();
+        app.update_search();
+        assert!(!app.search_submitted);
+        assert!(app.doc.as_ref().unwrap().search.result.is_none());
+        release_tx.send(()).unwrap();
+        shutdown(runtime);
+        app.update_search();
+        assert!(app.doc.as_ref().unwrap().search.result.is_none());
+        assert!(!app.search_submitted);
+    }
+
+    #[test]
+    fn scan_failure_resumes_current_query_once() {
+        for disconnected in [false, true] {
+            let (started_tx, started) = mpsc::channel();
+            let (mut app, runtime, wake) = running_app(move |generation| {
+                started_tx.send(generation).unwrap();
+            });
+            let scan = install_scan(&mut app);
+            app.doc.as_mut().unwrap().search.query = "sibling".into();
+            app.update_search();
+            assert!(!app.search_submitted);
+            if !disconnected {
+                scan.send(Err(io::Error::other("injected scan failure")))
+                    .unwrap();
+            }
+            drop(scan);
+            app.poll_scan();
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            assert_eq!(
+                app.doc
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .result
+                    .as_ref()
+                    .unwrap()
+                    .hits,
+                [2]
+            );
+            let generation = started.recv_timeout(Duration::from_secs(10)).unwrap();
+            for _ in 0..3 {
+                app.update_search();
+            }
+            assert_eq!(app.search_generation, generation);
+            assert!(started.try_recv().is_err());
+            shutdown(runtime);
+        }
+    }
+    #[cfg(feature = "perf")]
+    fn enable_trace(app: &mut App) {
+        let (trace, _runtime) = crate::perf_trace::PerfTraceRuntime::new("unused.csv".into());
+        app.search.set_release_observer(trace.release_observer());
+        app.perf_trace = Some(trace);
+    }
+
+    #[cfg(feature = "perf")]
+    fn draw_search_frame(app: &mut App, reveal: Option<NodeId>) {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 820.0),
+            )),
+            ..Default::default()
+        };
+        app.perf_highlight_draw = None;
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::Panel::right("trace-results").show(ui, |ui| {
+                search_panel::results(ui, app.doc.as_mut().unwrap(), app.mode);
+            });
+            let table = app.perf_draw_identity();
+            let count_before = app
+                .perf_trace
+                .as_ref()
+                .unwrap()
+                .samples("first_accepted_draw")
+                .len();
+            app.perf_record_draw(table.as_ref());
+            assert_eq!(
+                app.perf_trace
+                    .as_ref()
+                    .unwrap()
+                    .samples("first_accepted_draw")
+                    .len(),
+                count_before,
+                "table alone was counted before highlights painted"
+            );
+            if let Some(id) = reveal {
+                app.doc.as_mut().unwrap().reveal(id);
+            }
+            app.search_pass(false);
+            egui::CentralPanel::default().show(ui, |ui| app.treemap_view(ui));
+            app.perf_record_draw(table.as_ref());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn first_draw_requires_matching_table_and_painted_highlights() {
+        for reveal in [None, Some(3)] {
+            let (mut app, runtime, wake) = running_app(|_| {});
+            enable_trace(&mut app);
+            let doc = app.doc.as_mut().unwrap();
+            doc.search.query = "file:".into();
+            doc.search.in_focus_only = true;
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            let generation = app.search_generation;
+            draw_search_frame(&mut app, reveal);
+            let samples = app
+                .perf_trace
+                .as_ref()
+                .unwrap()
+                .samples("first_accepted_draw");
+            if reveal.is_none() {
+                assert_eq!(samples.len(), 1);
+                assert_eq!(samples[0].1, generation);
+                assert!(app.perf_measurement.as_ref().unwrap().drawn);
+                draw_search_frame(&mut app, None);
+                assert_eq!(
+                    app.perf_trace
+                        .as_ref()
+                        .unwrap()
+                        .samples("first_accepted_draw")
+                        .len(),
+                    1
+                );
+            } else {
+                assert!(
+                    samples.is_empty(),
+                    "scope-changed result never painted its highlights"
+                );
+                assert_eq!(app.search_generation, generation + 1);
+                assert!(
+                    app.perf_trace
+                        .as_ref()
+                        .unwrap()
+                        .samples("superseded")
+                        .iter()
+                        .any(|sample| sample.1 == generation)
+                );
+            }
+            shutdown(runtime);
+        }
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn unchanged_query_after_scan_failure_has_new_trace_generation() {
+        for drawn_before_scan in [false, true] {
+            let (mut app, runtime, wake) = running_app(|_| {});
+            enable_trace(&mut app);
+            app.doc.as_mut().unwrap().search.query = "file:".into();
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            let old_generation = app.search_generation;
+            let old_key = app.search_key.clone().unwrap();
+            if drawn_before_scan {
+                draw_search_frame(&mut app, None);
+            }
+            let scan = install_scan(&mut app);
+            assert!(
+                app.perf_measurement.is_none(),
+                "scan did not close old measurement"
+            );
+            app.update_search();
+            assert_eq!(
+                app.search_generation, old_generation,
+                "suspended query acquired a request identity"
+            );
+            scan.send(Err(io::Error::other("injected scan failure")))
+                .unwrap();
+            app.poll_scan();
+            let resumed_at = Instant::now();
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            assert_eq!(app.search_key.as_ref(), Some(&old_key));
+            let measurement = app.perf_measurement.as_ref().unwrap();
+            assert_eq!(measurement.generation, app.search_generation);
+            assert_eq!(measurement.generation, old_generation + 1);
+            assert!(
+                measurement.input_at >= resumed_at,
+                "resumed sample includes scan suspension time"
+            );
+            assert!(!measurement.drawn);
+            draw_search_frame(&mut app, None);
+            let trace = app.perf_trace.as_ref().unwrap();
+            let accepted = trace.samples("first_accepted_draw");
+            assert_eq!(accepted.len(), if drawn_before_scan { 2 } else { 1 });
+            assert_eq!(accepted.last().unwrap().1, old_generation + 1);
+            assert_eq!(
+                trace
+                    .samples("superseded")
+                    .iter()
+                    .any(|sample| sample.1 == old_generation),
+                !drawn_before_scan
+            );
+            assert_eq!(
+                trace
+                    .samples("input")
+                    .iter()
+                    .map(|sample| sample.1)
+                    .collect::<Vec<_>>(),
+                [old_generation, old_generation + 1]
+            );
+            shutdown(runtime);
+        }
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn ordinary_invalidations_record_actual_lease_release() {
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let release = std::sync::Mutex::new(release);
+        let (mut app, runtime, wake) = running_app(move |generation| {
+            started_tx.send(generation).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        });
+        enable_trace(&mut app);
+        app.doc.as_mut().unwrap().search.query = "file:".into();
+        app.update_search();
+        assert_eq!(started.recv_timeout(Duration::from_secs(10)).unwrap(), 1);
+        app.mode = SizeMode::Logical;
+        app.update_search();
+        app.doc.as_mut().unwrap().search.in_focus_only = true;
+        app.doc.as_mut().unwrap().navigate(1);
+        app.update_search();
+        app.doc.as_mut().unwrap().search.query = "child".into();
+        app.update_search();
+        let _scan = install_scan(&mut app);
+        let released = app
+            .perf_trace
+            .as_ref()
+            .unwrap()
+            .samples("cancel_to_lease_release");
+        assert_eq!(
+            released.iter().map(|sample| sample.1).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert_eq!(Arc::strong_count(&app.doc.as_ref().unwrap().tree), 2);
+        release_tx.send(()).unwrap();
+        pump_until(&mut app, &wake, |app| {
+            app.perf_trace
+                .as_ref()
+                .unwrap()
+                .samples("cancel_to_lease_release")
+                .len()
+                == 4
+        });
+        assert_eq!(Arc::strong_count(&app.doc.as_ref().unwrap().tree), 1);
+        let released = app
+            .perf_trace
+            .as_ref()
+            .unwrap()
+            .samples("cancel_to_lease_release");
+        assert_eq!(released.last().unwrap().1, 1);
+        assert!(released.iter().all(|sample| sample.0 == 1));
+        assert!(started.try_recv().is_err());
+        shutdown(runtime);
+    }
+
+    fn preview_packet(scan_id: u64, version: u64, valid: bool) -> crate::preview_worker::PreviewPacket {
+        crate::preview_worker::PreviewPacket {
+            scan_id, version,
+            tree: if valid { Arc::try_unwrap(fixture(1).tree).ok().unwrap() } else { Tree::default() },
+            capture_time: Duration::from_micros(7),
+            build_time: Duration::from_micros(11),
+        }
+    }
+
+    fn preview_scan(app: &mut App) -> mpsc::Sender<io::Result<ScanResult>> {
+        let (tx, rx) = mpsc::channel();
+        app.begin_scan("C:\\Data".into(), Arc::default(), rx, None);
+        tx
+    }
+
+    fn preview_live(progress: &ScanProgress, version: u64) {
+        let mut live = progress.live.lock().unwrap();
+        live.version = version;
+        live.dirs = vec![darak_core::scan::LiveDir {
+            parent: NO_NODE, depth: 0, name: "walk".into(), alloc: 100,
+            logical: 100, files: 1, direct_alloc: 100, direct_logical: 100, direct_files: 1,
+        }];
+    }
+
+    fn request_preview(app: &mut App) {
+        app.scanning.as_mut().unwrap().last_preview = Instant::now() - Duration::from_secs(2);
+        app.poll_preview();
+    }
+
+    fn gated_preview(app: &mut App) -> (crate::preview_worker::PreviewRuntime, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (started_tx, started) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let release = std::sync::Mutex::new(release);
+        let (controller, runtime) = crate::preview_worker::PreviewRuntime::with_hook(Box::new(move |stage, _, _| {
+            if stage == crate::preview_worker::Stage::Built {
+                started_tx.send(()).unwrap();
+                release.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        }));
+        app.preview = controller;
+        (runtime, started, release_tx)
+    }
+
+    #[test]
+    fn late_preview_cannot_replace_final_or_new_scan() {
+        let mut app = app(fixture(1));
+        let tx = preview_scan(&mut app);
+        let first = app.scanning.as_ref().unwrap().scan_id;
+        assert!(!app.accept_preview(preview_packet(first + 1, 99, false)));
+        assert!(app.accept_preview(preview_packet(first, 2, true)));
+        assert!(!app.accept_preview(preview_packet(first, 2, false)));
+        assert!(!app.accept_preview(preview_packet(first, 1, false)));
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 2);
+        let final_doc = fixture(9);
+        tx.send(Ok(ScanResult { tree: Arc::try_unwrap(final_doc.tree).ok().unwrap(), stats: final_doc.stats })).unwrap();
+        app.poll_scan();
+        assert!(app.scanning.is_none());
+        let final_id = app.doc.as_ref().unwrap().id;
+        assert!(!app.accept_preview(preview_packet(first, 99, false)));
+        assert_eq!(app.doc.as_ref().unwrap().id, final_id);
+        let _next = preview_scan(&mut app);
+        let second = app.scanning.as_ref().unwrap().scan_id;
+        assert!(second > first);
+        assert!(!app.accept_preview(preview_packet(first, 100, false)));
+        assert!(app.scanning.as_ref().unwrap().preview.is_none());
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 0);
+        assert!(app.accept_preview(preview_packet(second, 1, true)));
+    }
+
+    #[test]
+    fn final_installs_while_preview_is_paused() {
+        let mut app = app(fixture(1));
+        let (runtime, started, release) = gated_preview(&mut app);
+        let tx = preview_scan(&mut app);
+        let progress = app.scanning.as_ref().unwrap().progress.clone();
+        preview_live(&progress, 1);
+        request_preview(&mut app);
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        let final_doc = fixture(9);
+        tx.send(Ok(ScanResult { tree: Arc::try_unwrap(final_doc.tree).ok().unwrap(), stats: final_doc.stats })).unwrap();
+        app.poll_scan();
+        app.poll_preview();
+        assert!(app.scanning.is_none());
+        assert_eq!(app.doc.as_ref().unwrap().id, 2);
+        assert!(app.morph_until.is_some());
+        release.send(()).unwrap();
+        app.preview.wait_idle();
+        app.poll_preview();
+        assert_eq!(app.doc.as_ref().unwrap().id, 2);
+        assert_eq!(Arc::strong_count(&progress), 1);
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn empty_and_contended_preview_do_not_advance_installed_version() {
+        let mut app = app(fixture(1));
+        let (controller, runtime) = crate::preview_worker::PreviewRuntime::new();
+        app.preview = controller;
+        let _scan = preview_scan(&mut app);
+        let progress = app.scanning.as_ref().unwrap().progress.clone();
+        progress.total_hint.store(100, Relaxed); // MFT can have no live directories.
+        progress.live.lock().unwrap().version = 5;
+        request_preview(&mut app);
+        app.preview.wait_idle();
+        app.poll_preview();
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 0);
+        preview_live(&progress, 5); // Walk fallback can publish that same version.
+        let guard = progress.live.lock().unwrap();
+        request_preview(&mut app);
+        app.preview.wait_idle();
+        app.poll_preview();
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 0);
+        drop(guard);
+        request_preview(&mut app);
+        app.preview.wait_idle();
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 0);
+        app.poll_preview();
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 5);
+        assert_eq!(app.scanning.as_ref().unwrap().preview.as_ref().unwrap().name(0), "walk");
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn cancel_stops_preview_requests_and_keeps_last_preview() {
+        let mut app = app(fixture(1));
+        let (runtime, started, release) = gated_preview(&mut app);
+        let _scan = preview_scan(&mut app);
+        let scan_id = app.scanning.as_ref().unwrap().scan_id;
+        assert!(app.accept_preview(preview_packet(scan_id, 1, true)));
+        let progress = app.scanning.as_ref().unwrap().progress.clone();
+        preview_live(&progress, 2);
+        request_preview(&mut app);
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        app.cancel_scan();
+        let last = Instant::now() - Duration::from_secs(2);
+        app.scanning.as_mut().unwrap().last_preview = last;
+        app.poll_preview();
+        assert_eq!(app.scanning.as_ref().unwrap().last_preview, last);
+        assert!(progress.is_cancelled());
+        assert!(!app.accept_preview(preview_packet(scan_id, 3, false)));
+        assert_eq!(app.scanning.as_ref().unwrap().preview_version, 1);
+        assert!(app.scanning.as_ref().unwrap().preview.is_some());
+        release.send(()).unwrap();
+        app.preview.wait_idle();
+        assert_eq!(Arc::strong_count(&progress), 2);
+        runtime.shutdown_and_join();
+    }
+
+    #[test]
+    fn scan_error_and_disconnect_invalidate_paused_preview() {
+        for disconnected in [false, true] {
+            let mut app = app(fixture(1));
+            let (runtime, started, release) = gated_preview(&mut app);
+            let tx = preview_scan(&mut app);
+            let progress = app.scanning.as_ref().unwrap().progress.clone();
+            preview_live(&progress, 1);
+            request_preview(&mut app);
+            started.recv_timeout(Duration::from_secs(10)).unwrap();
+            if !disconnected { tx.send(Err(io::Error::other("scan failure"))).unwrap(); }
+            drop(tx);
+            app.poll_scan();
+            assert!(app.scanning.is_none());
+            assert!(app.error.is_some());
+            release.send(()).unwrap();
+            app.preview.wait_idle();
+            assert!(app.preview.try_take_latest().is_none());
+            assert_eq!(Arc::strong_count(&progress), 1);
+            assert_eq!(app.doc.as_ref().unwrap().id, 1);
+            runtime.shutdown_and_join();
+        }
+    }
+
+    #[test]
+    fn app_drop_signals_preview_without_joining_paused_worker() {
+        let mut app = app(fixture(1));
+        let (runtime, started, release) = gated_preview(&mut app);
+        let _scan = preview_scan(&mut app);
+        let progress = app.scanning.as_ref().unwrap().progress.clone();
+        preview_live(&progress, 1);
+        request_preview(&mut app);
+        started.recv_timeout(Duration::from_secs(10)).unwrap();
+        drop(app); // Must return before the explicit release, even with active work.
+        assert!(progress.is_cancelled());
+        release.send(()).unwrap();
+        runtime.shutdown_and_join();
+        assert_eq!(Arc::strong_count(&progress), 1);
+    }
+
+
+    #[test]
+    fn both_render_paths_keep_settled_layout_and_reuse_morph_buffer() {
+        for preview in [true, false] {
+            let mut app = app(fixture(1));
+            let ctx = egui::Context::default();
+            let _scan = preview.then(|| preview_scan(&mut app));
+            if preview {
+                let id = app.scanning.as_ref().unwrap().scan_id;
+                app.accept_preview(preview_packet(id, 1, true));
+            } else {
+                app.morph_until = Some(Instant::now() + Duration::from_secs(60));
+            }
+            let render = |app: &mut App| {
+                let mut output = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                    ..Default::default()
+                }, |ui| { egui::CentralPanel::default().show(ui, |ui| {
+                    if preview { app.scan_view(ui); } else { app.treemap_view(ui); }
+                }); });
+                output.textures_delta.clear();
+            };
+            render(&mut app);
+            let key = if let Some(scan) = &app.scanning {
+                MorphKey { layout_id: LayoutSource::Preview(scan.scan_id), generation: scan.preview_layout.generation() }
+            } else {
+                MorphKey { layout_id: LayoutSource::Document(1), generation: app.layout.generation() }
+            };
+            assert!(app.morph.is_settled(key));
+            let capacity = app.morph_items.capacity();
+            assert!(capacity > 0);
+            app.morph_items.clear();
+            render(&mut app);
+            assert!(app.morph_items.is_empty(), "settled drawing must not refill scratch output");
+            assert!(app.morph.is_settled(key));
+            assert_eq!(app.morph_items.capacity(), capacity);
+            let _new = preview_scan(&mut app);
+            assert!(!app.morph.is_settled(key));
+            assert_eq!(app.morph_items.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn settled_morph_borrows_fresh_layout_metadata_for_hit_testing() {
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        let mut layout = Layout::default();
+        let doc = fixture(1);
+        layout.update(&doc.tree, 1, 0, egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)), SizeMode::Allocated, Detail::default());
+        let key = MorphKey { layout_id: LayoutSource::Document(1), generation: layout.generation() };
+        let (shown, moving) = morph_items(&mut morph, &layout.items, key, &mut out);
+        assert!(!moving);
+        assert_eq!(shown.as_ptr(), layout.items.as_ptr());
+        assert!(morph.is_settled(key));
+        // Same immutable layout geometry, refreshed metadata must come from Layout.
+        let last = layout.items.last_mut().unwrap();
+        last.node = 2;
+        let pos = last.rect.center();
+        out.clear();
+        let (shown, moving) = morph_items(&mut morph, &layout.items, key, &mut out);
+        assert!(!moving);
+        assert_eq!(shown.as_ptr(), layout.items.as_ptr());
+        assert_eq!(shown.iter().rev().find(|it| it.rect.contains(pos)).unwrap().node, 2);
+        assert!(out.is_empty());
+    }
+
+
+    #[test]
+    fn smaller_final_renders_only_current_nodes_after_preview_transition() {
+        let mut app = app(fixture(1));
+        let ctx = egui::Context::default();
+        let tx = preview_scan(&mut app);
+        let scan_id = app.scanning.as_ref().unwrap().scan_id;
+        app.accept_preview(preview_packet(scan_id, 1, true));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.scan_view(ui));
+        });
+        output.textures_delta.clear();
+        let preview_key = MorphKey { layout_id: LayoutSource::Preview(scan_id), generation: app.scanning.as_ref().unwrap().preview_layout.generation() };
+        assert!(app.morph.is_settled(preview_key));
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 40, 1, 1);
+        node(&mut tree, "sibling", 0, Kind::File, 40, 0, 0); // Was preview NodeId 2.
+        let final_doc = doc(9, tree);
+        tx.send(Ok(ScanResult { tree: Arc::try_unwrap(final_doc.tree).ok().unwrap(), stats: final_doc.stats })).unwrap();
+        app.poll_scan();
+        assert!(!app.morph.is_settled(preview_key));
+        frame(&ctx, &mut app, vec![], 0.1);
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.tree.len(), 2);
+        for it in app.morph_items.iter().chain(&app.layout.items) {
+            assert!(it.node < doc.tree.len() as u32);
+            assert_eq!(doc.tree.name(it.node), if it.node == 0 { "C:\\Data" } else { "sibling" });
+        }
+        let pos = app.layout.items.last().unwrap().rect.center();
+        frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)], 0.2);
+        assert!(app.doc.as_ref().unwrap().hovered.is_none_or(|id| id < 2));
+        assert!(app.scanning.is_none());
+    }
+
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn preview_trace_records_only_accepted_capture_and_build() {
+        let mut app = app(fixture(1));
+        let (trace, _runtime) = crate::perf_trace::PerfTraceRuntime::new("unused-preview.csv".into());
+        app.perf_trace = Some(trace);
+        let _scan = preview_scan(&mut app);
+        let scan_id = app.scanning.as_ref().unwrap().scan_id;
+        assert!(!app.accept_preview(preview_packet(scan_id + 1, 9, false)));
+        assert!(app.perf_trace.as_ref().unwrap().samples("capture").is_empty());
+        assert!(app.accept_preview(preview_packet(scan_id, 3, true)));
+        assert!(!app.accept_preview(preview_packet(scan_id, 3, false)));
+        let trace = app.perf_trace.as_ref().unwrap();
+        assert_eq!(trace.samples("capture"), vec![(scan_id, 3, Duration::from_micros(7))]);
+        assert_eq!(trace.samples("build"), vec![(scan_id, 3, Duration::from_micros(11))]);
+    }
+
 }

@@ -18,7 +18,9 @@ pub struct PreviewPacket {
     pub scan_id: u64,
     pub version: u64,
     pub tree: Tree,
+    #[cfg_attr(not(feature = "perf"), allow(dead_code))] // Optional accepted-packet telemetry.
     pub capture_time: Duration,
+    #[cfg_attr(not(feature = "perf"), allow(dead_code))] // Optional accepted-packet telemetry.
     pub build_time: Duration,
 }
 
@@ -54,12 +56,15 @@ struct Shared {
     epoch: AtomicU64,
     stop: AtomicBool,
     #[cfg(test)]
-    hook: Option<Box<dyn Fn(Stage, u64, u64) + Send + Sync>>,
+    hook: Option<TestHook>,
 }
 
 #[cfg(test)]
+type TestHook = Box<dyn Fn(Stage, u64, u64) + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Stage {
+pub(crate) enum Stage {
     Captured,
     Built,
 }
@@ -113,7 +118,7 @@ impl PreviewRuntime {
     }
 
     #[cfg(test)]
-    fn with_hook(hook: Box<dyn Fn(Stage, u64, u64) + Send + Sync>) -> (PreviewController, Self) {
+    pub(crate) fn with_hook(hook: TestHook) -> (PreviewController, Self) {
         Self::start(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -125,6 +130,16 @@ impl PreviewRuntime {
 }
 
 impl PreviewController {
+    #[cfg(test)]
+    pub(crate) fn wait_idle(&self) {
+        let state = self.shared.lock();
+        let (state, timed) = self.shared.changed.wait_timeout_while(
+            state, Duration::from_secs(10), |state| state.active || state.pending.is_some(),
+        ).unwrap();
+        assert!(!timed.timed_out(), "preview worker did not become idle");
+        assert!(!state.active);
+    }
+
     pub fn set_waker(&mut self, ctx: egui::Context) {
         let old = self.shared.lock().waker.replace(ctx.clone());
         drop(old);

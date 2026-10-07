@@ -506,15 +506,6 @@ impl Morph {
         self.settled == Some(key)
     }
 
-    // Temporary compatibility for App until it supplies the real layout key.
-    // An unkeyed caller must check targets every frame, including after settling.
-    pub fn step(&mut self, items: &[Item]) -> (Vec<Item>, bool) {
-        self.invalidate();
-        let mut out = Vec::with_capacity(items.len());
-        let moving = self.step_into(items, MorphKey { layout_id: LayoutSource::Preview(0), generation: 0 }, &mut out);
-        (out, moving)
-    }
-
     /// `out`을 현재 항목/metadata로 채운다. 아직 보간 중이면 true.
     /// 완료된 같은 키는 Layout.items를 직접 사용하면 복사도 생략할 수 있다.
     pub fn step_into(&mut self, items: &[Item], key: MorphKey, out: &mut Vec<Item>) -> bool {
@@ -1078,13 +1069,6 @@ mod tests {
         assert!(!morph.step_into_at(&[item(1, 110.01)], morph_key(5), &mut out, done));
         assert_eq!(out[0].rect.min.x, 110.01);
         assert_eq!(out[0].fade, 1.0);
-    }
-
-    #[test]
-    fn unkeyed_compatibility_step_checks_new_targets_after_settling() {
-        let mut morph = Morph::default();
-        assert!(!morph.step(&[item(1, 0.0)]).1);
-        assert!(morph.step(&[item(1, 20.0)]).1);
     }
 
     #[test]

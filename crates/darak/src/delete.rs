@@ -208,10 +208,10 @@ mod tests {
         );
         assert!(build_items(&doc, &[2, Tree::ROOT], SizeMode::Allocated).is_err());
         assert!(build_items(&doc, &[2, u32::MAX], SizeMode::Allocated).is_err());
-        doc.tree.nodes[1].flags |= darak_core::flags::LOSSY_NAME;
+        Arc::get_mut(&mut doc.tree).unwrap().nodes[1].flags |= darak_core::flags::LOSSY_NAME;
         assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
-        doc.tree.nodes[1].flags &= !darak_core::flags::LOSSY_NAME;
-        doc.tree.nodes[3].flags |= darak_core::flags::REMOVED;
+        Arc::get_mut(&mut doc.tree).unwrap().nodes[1].flags &= !darak_core::flags::LOSSY_NAME;
+        Arc::get_mut(&mut doc.tree).unwrap().nodes[3].flags |= darak_core::flags::REMOVED;
         assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
     }
 }
