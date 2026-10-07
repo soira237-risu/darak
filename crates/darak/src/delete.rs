@@ -37,17 +37,22 @@ pub enum Stage {
 }
 
 pub struct Dialog {
+    pub doc_id: u64,
     pub stage: Stage,
 }
 
 /// 창이 닫혀야 하면 false. 삭제된 노드는 `removed`에 넣는다.
-pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode, removed: &mut Vec<NodeId>) -> bool {
+pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mode: SizeMode, removed: &mut Vec<NodeId>) -> bool {
+    if matches!(dlg.stage, Stage::Review { .. }) && doc.as_ref().is_none_or(|doc| doc.id != dlg.doc_id) {
+        return false;
+    }
     let mut open = true;
     let mut next: Option<Stage> = None;
     let modal = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
         ui.set_width(640.0);
         match &mut dlg.stage {
             Stage::Review { method, confirmed } => {
+                let doc = doc.as_mut().expect("review document identity checked");
                 let items: Vec<NodeId> = top_level_marks(&doc.tree, &doc.marks.iter().copied().collect::<Vec<_>>());
                 let total: u64 = items.iter().map(|&i| doc.tree.node(i).size(mode)).sum();
                 let files: u64 = items.iter().map(|&i| doc.tree.node(i).files as u64).sum();
@@ -90,14 +95,10 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode
                     };
                     let btn = egui::Button::new(RichText::new(label).strong()).fill(Color32::from_rgb(170, 50, 45));
                     if ui.add_enabled(can_run, btn).clicked() {
-                        let jobs: Vec<Item> = items
-                            .iter()
-                            .map(|&id| {
-                                let n = doc.tree.node(id);
-                                Item { node: id, path: doc.tree.path(id), is_dir: n.kind == Kind::Dir, size: n.size(mode) }
-                            })
-                            .collect();
-                        next = Some(start(jobs, *method));
+                        match build_items(doc, &items, mode) {
+                            Ok(jobs) => next = Some(start(jobs, *method)),
+                            Err(error) => { ui.colored_label(Color32::from_rgb(230, 90, 80), error); }
+                        }
                     }
                     if ui.button("취소").clicked() {
                         open = false;
@@ -144,6 +145,30 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode
     open
 }
 
+/// 실제 파일 작업 직전에 목록 전체의 보호 정책을 다시 검사한다.
+fn build_items(doc: &Doc, ids: &[NodeId], mode: SizeMode) -> Result<Vec<Item>, String> {
+    ids.iter()
+        .map(|&id| {
+            if id as usize >= doc.tree.len() {
+                return Err("삭제할 항목이 현재 문서에 없습니다".into());
+            }
+            if doc.tree.node(id).has(darak_core::flags::REMOVED) {
+                return Err("이미 삭제된 항목입니다".into());
+            }
+            if let Some(reason) = protected_reason(&doc.tree, id) {
+                return Err(format!("보호된 항목: {reason}"));
+            }
+            let n = doc.tree.node(id);
+            Ok(Item {
+                node: id,
+                path: doc.tree.path(id),
+                is_dir: n.kind == Kind::Dir,
+                size: n.size(mode),
+            })
+        })
+        .collect()
+}
+
 fn start(items: Vec<Item>, method: Method) -> Stage {
     let total = items.len();
     let done = Arc::new(AtomicUsize::new(0));
@@ -164,4 +189,29 @@ fn start(items: Vec<Item>, method: Method) -> Stage {
         });
     }
     Stage::Running { total, done, rx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::tests::fixture;
+    use darak_core::Tree;
+
+    #[test]
+    fn refuses_protected_jobs() {
+        let mut doc = fixture(1);
+        assert_eq!(
+            build_items(&doc, &[2, 3], SizeMode::Allocated)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(build_items(&doc, &[2, Tree::ROOT], SizeMode::Allocated).is_err());
+        assert!(build_items(&doc, &[2, u32::MAX], SizeMode::Allocated).is_err());
+        doc.tree.nodes[1].flags |= darak_core::flags::LOSSY_NAME;
+        assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
+        doc.tree.nodes[1].flags &= !darak_core::flags::LOSSY_NAME;
+        doc.tree.nodes[3].flags |= darak_core::flags::REMOVED;
+        assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
+    }
 }
