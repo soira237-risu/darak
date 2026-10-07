@@ -9,6 +9,9 @@ pub fn controls(ui: &mut egui::Ui, doc: &mut Doc) -> bool {
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         changed = ui.checkbox(&mut doc.search.in_focus_only, "현재 폴더 안에서만").changed();
+        if changed && doc.focus != darak_core::Tree::ROOT {
+            doc.search.note_edit(std::time::Instant::now());
+        }
         ui.checkbox(&mut doc.search.highlight, "treemap에 강조");
     });
     changed

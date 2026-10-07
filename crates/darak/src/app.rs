@@ -257,6 +257,7 @@ impl App {
     fn poll_scan(&mut self) {
         let Some(s) = &self.scanning else { return };
         let result = s.rx.try_recv();
+        let resumed_at = Instant::now();
         if !matches!(result, Err(mpsc::TryRecvError::Empty)) {
             self.preview.invalidate(s.scan_id);
             self.morph.invalidate();
@@ -284,6 +285,10 @@ impl App {
                 self.scanning = None;
             }
         }
+        // Fresh resume event excludes suspension but includes subsequent UI work.
+        if self.scanning.is_none() && let Some(doc) = &mut self.doc {
+            doc.search.note_edit(resumed_at);
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -308,6 +313,7 @@ impl App {
         self.search_key = None;
         if let Some(doc) = &mut self.doc {
             doc.clear_search();
+            doc.search.pending_edit_at = None;
         }
     }
 
@@ -316,6 +322,10 @@ impl App {
         if self.scanning.is_some() {
             return;
         }
+        let observed_at = Instant::now();
+        let edited_at = self.doc.as_mut()
+            .and_then(|doc| doc.search.pending_edit_at.take())
+            .unwrap_or(observed_at);
         let key = self.doc.as_ref().map(|doc| doc.search_key(self.mode));
         if self.search_key == key {
             return;
@@ -326,7 +336,7 @@ impl App {
         self.search_key = key;
         if let Some(doc) = &mut self.doc {
             doc.clear_search();
-            doc.search.edited_at = Some(Instant::now());
+            doc.search.edited_at = Some(edited_at);
         }
         #[cfg(feature = "perf")]
         self.perf_observe_input();
@@ -615,6 +625,7 @@ impl App {
                 .on_hover_text("디스크에서 실제로 차지하는 크기 (삭제하면 비는 공간)");
             ui.selectable_value(&mut self.mode, SizeMode::Logical, "논리 크기").on_hover_text("파일 내용의 바이트 수");
             if before != self.mode {
+                if let Some(doc) = &mut self.doc { doc.search.note_edit(Instant::now()); }
                 self.layout.invalidate();
             }
             ui.separator();
@@ -646,9 +657,10 @@ impl App {
                     self.focus_search = false;
                 }
                 if resp.changed() {
-                    doc.search.edited_at = Some(Instant::now());
+                    doc.search.note_edit(Instant::now());
                 }
-                if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) {
+                if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) && !doc.search.query.is_empty() {
+                    doc.search.note_edit(Instant::now());
                     doc.search.query.clear();
                 }
                 resp.on_hover_text(
@@ -2239,8 +2251,8 @@ mod tests {
             );
             scan.send(Err(io::Error::other("injected scan failure")))
                 .unwrap();
-            app.poll_scan();
             let resumed_at = Instant::now();
+            app.poll_scan();
             pump_until(&mut app, &wake, |app| {
                 app.doc.as_ref().unwrap().search.result.is_some()
             });
@@ -2640,4 +2652,125 @@ mod tests {
         assert_eq!(trace.samples("build"), vec![(scan_id, 3, Duration::from_micros(11))]);
     }
 
+    #[cfg(feature = "perf")]
+    #[test]
+    fn input_timestamp_survives_query_mode_scope_dispatch() {
+        for input in ["query", "mode", "scope"] {
+            let (mut app, runtime, wake) = running_app(|_| {});
+            enable_trace(&mut app);
+            app.doc.as_mut().unwrap().search.query = "file:".into();
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            let generation = app.search_generation;
+            // Model preceding UI/status work without sleeping. This exact event
+            // timestamp must survive observation, invalidation and worker dispatch.
+            let event_at = Instant::now() - Duration::from_secs(3);
+            match input {
+                "query" => app.doc.as_mut().unwrap().search.query = "child".into(),
+                "mode" => app.mode = SizeMode::Logical,
+                "scope" => {
+                    let doc = app.doc.as_mut().unwrap();
+                    doc.navigate(1);
+                    doc.search.in_focus_only = true;
+                }
+                _ => unreachable!(),
+            }
+            app.doc.as_mut().unwrap().search.note_edit(event_at);
+            app.update_search();
+            assert_eq!(app.search_generation, generation + 1);
+            assert_eq!(app.doc.as_ref().unwrap().search.edited_at, Some(event_at));
+            assert_eq!(app.perf_measurement.as_ref().unwrap().input_at, event_at);
+            pump_until(&mut app, &wake, |app| {
+                app.doc.as_ref().unwrap().search.result.is_some()
+            });
+            // accept_search restores completion.edited_at, proving the request
+            // carried the event timestamp through the actual worker as well.
+            assert_eq!(app.doc.as_ref().unwrap().search.edited_at, Some(event_at));
+            assert_eq!(app.perf_measurement.as_ref().unwrap().input_at, event_at);
+            assert!(app.doc.as_ref().unwrap().search.pending_edit_at.is_none());
+            let before_version_change = Instant::now();
+            Arc::get_mut(&mut app.doc.as_mut().unwrap().tree)
+                .unwrap()
+                .version += 1;
+            app.observe_search_input();
+            assert!(
+                app.doc.as_ref().unwrap().search.edited_at.unwrap() >= before_version_change,
+                "non-input generation inherited a previous input timestamp"
+            );
+            shutdown(runtime);
+        }
+    }
+
+    #[test]
+    fn input_timestamp_tracks_only_effective_navigation_changes() {
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().search.in_focus_only = true;
+        app.observe_search_input();
+        let navigation: [fn(&mut Doc); 5] = [
+            |doc| doc.navigate(1),
+            Doc::go_up,
+            Doc::go_back,
+            Doc::go_forward,
+            |doc| doc.reveal(3),
+        ];
+        for navigate in navigation {
+            let generation = app.search_generation;
+            navigate(app.doc.as_mut().unwrap());
+            let event_at = app
+                .doc
+                .as_ref()
+                .unwrap()
+                .search
+                .pending_edit_at
+                .expect("focus-only navigation did not stamp input");
+            app.observe_search_input();
+            assert_eq!(app.search_generation, generation + 1);
+            assert_eq!(app.doc.as_ref().unwrap().search.edited_at, Some(event_at));
+        }
+        app.doc.as_mut().unwrap().search.in_focus_only = false;
+        app.observe_search_input();
+        let generation = app.search_generation;
+        let event_at = app.doc.as_ref().unwrap().search.edited_at;
+        app.doc.as_mut().unwrap().go_up();
+        app.observe_search_input();
+        assert_eq!(app.search_generation, generation);
+        assert_eq!(app.doc.as_ref().unwrap().search.edited_at, event_at);
+        assert!(app.doc.as_ref().unwrap().search.pending_edit_at.is_none());
+    }
+
+    #[cfg(feature = "perf")]
+    #[test]
+    fn input_timestamp_scan_resume_is_fresh_at_receipt() {
+        for disconnected in [false, true] {
+            let mut app = app(fixture(1));
+            enable_trace(&mut app);
+            let old_event = Instant::now() - Duration::from_secs(10);
+            let doc = app.doc.as_mut().unwrap();
+            doc.search.query = "file:".into();
+            doc.search.note_edit(old_event);
+            app.observe_search_input();
+            let generation = app.search_generation;
+            let scan = install_scan(&mut app);
+            let suspended_edit = Instant::now() - Duration::from_secs(5);
+            app.doc.as_mut().unwrap().search.note_edit(suspended_edit);
+            if !disconnected {
+                scan.send(Err(io::Error::other("injected scan failure")))
+                    .unwrap();
+            }
+            drop(scan);
+            let before_receipt = Instant::now();
+            app.poll_scan();
+            let resumed_at = app.doc.as_ref().unwrap().search.pending_edit_at.unwrap();
+            assert!(resumed_at >= before_receipt);
+            assert_ne!(resumed_at, suspended_edit);
+            app.observe_search_input();
+            assert_eq!(app.search_generation, generation + 1);
+            assert_eq!(app.doc.as_ref().unwrap().search.edited_at, Some(resumed_at));
+            assert_eq!(app.perf_measurement.as_ref().unwrap().input_at, resumed_at);
+            app.observe_search_input();
+            assert_eq!(app.search_generation, generation + 1);
+            assert_eq!(app.perf_measurement.as_ref().unwrap().input_at, resumed_at);
+        }
+    }
 }

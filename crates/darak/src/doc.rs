@@ -33,6 +33,8 @@ pub struct SearchState {
     pub query: String,
     pub applied: Option<SearchKey>,
     pub edited_at: Option<std::time::Instant>,
+    /// Input-handler timestamp awaiting key observation.
+    pub(crate) pending_edit_at: Option<std::time::Instant>,
     pub result: Option<SearchResult>,
     pub error: Option<String>,
     pub elapsed_ms: f64,
@@ -40,6 +42,12 @@ pub struct SearchState {
     pub highlight: bool,
     /// 노드별: 1 = 일치, 2 = 일치 항목을 포함, 4 = 일치 항목 안에 있음
     pub bits: Vec<u8>,
+}
+
+impl SearchState {
+    pub fn note_edit(&mut self, at: std::time::Instant) {
+        self.pending_edit_at = Some(at);
+    }
 }
 
 impl Doc {
@@ -62,6 +70,9 @@ impl Doc {
 
     pub fn navigate(&mut self, to: NodeId) {
         if to != self.focus && self.tree.node(to).kind == Kind::Dir {
+            if self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.back.push(self.focus);
             self.forward.clear();
             self.focus = to;
@@ -78,6 +89,9 @@ impl Doc {
 
     pub fn go_back(&mut self) {
         if let Some(b) = self.back.pop() {
+            if b != self.focus && self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.forward.push(self.focus);
             self.focus = b;
         }
@@ -85,6 +99,9 @@ impl Doc {
 
     pub fn go_forward(&mut self) {
         if let Some(f) = self.forward.pop() {
+            if f != self.focus && self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.back.push(self.focus);
             self.focus = f;
         }
