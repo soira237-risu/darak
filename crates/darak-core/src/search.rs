@@ -18,7 +18,7 @@ use crate::tree::{Kind, NodeId, SizeMode, Tree, flags};
 #[derive(Debug, Clone)]
 enum Term {
     Contains(String, bool),
-    Wildcard(Vec<u8>),
+    Wildcard(String),
     Ext(Vec<String>),
     SizeGt(u64),
     SizeLt(u64),
@@ -38,10 +38,11 @@ impl Query {
     pub fn parse(s: &str, now_secs2000: u32) -> Result<Query, String> {
         let mut terms = Vec::new();
         for tok in s.split_whitespace() {
-            let lower = tok.to_lowercase();
-            let t = if let Some(v) = lower.strip_prefix("ext:") {
-                Term::Ext(v.split([';', ',']).filter(|e| !e.is_empty()).map(|e| e.trim_start_matches('.').to_string()).collect())
-            } else if let Some(v) = lower.strip_prefix("size:") {
+            // 문법은 ASCII로 인식하고, Unicode lowercase는 분리한 피연산자에 적용한다.
+            let syntax = tok.to_ascii_lowercase();
+            let t = if let Some(v) = syntax.strip_prefix("ext:") {
+                Term::Ext(v.split([';', ',']).filter(|e| !e.is_empty()).map(|e| e.trim_start_matches('.').to_lowercase()).collect())
+            } else if let Some(v) = syntax.strip_prefix("size:") {
                 if let Some(n) = v.strip_prefix('>') {
                     Term::SizeGt(parse_size(n).ok_or(format!("크기를 알 수 없음: {n}"))?)
                 } else if let Some(n) = v.strip_prefix('<') {
@@ -49,7 +50,7 @@ impl Query {
                 } else {
                     Term::SizeGt(parse_size(v).ok_or(format!("크기를 알 수 없음: {v}"))?)
                 }
-            } else if let Some(v) = lower.strip_prefix("dm:") {
+            } else if let Some(v) = syntax.strip_prefix("dm:") {
                 let (newer, n) = if let Some(n) = v.strip_prefix('<') {
                     (true, n)
                 } else if let Some(n) = v.strip_prefix('>') {
@@ -60,21 +61,21 @@ impl Query {
                 let secs = parse_age(n).ok_or(format!("기간을 알 수 없음: {n} (예: 7d, 2w, 3m, 1y)"))?;
                 let cutoff = now_secs2000.saturating_sub(secs);
                 if newer { Term::NewerThan(cutoff) } else { Term::OlderThan(cutoff) }
-            } else if let Some(v) = lower.strip_prefix("path:") {
-                Term::Path(v.to_string())
-            } else if lower == "file:" {
+            } else if let Some(v) = syntax.strip_prefix("path:") {
+                Term::Path(v.to_lowercase())
+            } else if syntax == "file:" {
                 Term::FilesOnly
-            } else if lower == "folder:" || lower == "dir:" {
+            } else if syntax == "folder:" || syntax == "dir:" {
                 Term::FoldersOnly
-            } else if let Some(v) = lower.strip_prefix('!') {
+            } else if let Some(v) = syntax.strip_prefix('!') {
                 if v.is_empty() {
                     continue;
                 }
-                Term::Contains(v.to_string(), true)
-            } else if lower.contains(['*', '?']) {
-                Term::Wildcard(lower.into_bytes())
+                Term::Contains(v.to_lowercase(), true)
+            } else if syntax.contains(['*', '?']) {
+                Term::Wildcard(tok.to_string())
             } else {
-                Term::Contains(lower, false)
+                Term::Contains(tok.to_lowercase(), false)
             };
             terms.push(t);
         }
@@ -118,18 +119,49 @@ fn parse_age(s: &str) -> Option<u32> {
     Some(v.saturating_mul(mul))
 }
 
-/// `*`, `?` 와일드카드 (바이트 단위, ASCII 소문자로 비교)
-fn wildcard(pat: &[u8], s: &[u8]) -> bool {
+/// `?`는 원본 Unicode scalar 하나, `*`는 0개 이상을 소비한다.
+/// 리터럴은 scalar별 lowercase 결과를 비교하며 정규화하지 않는다.
+fn wildcard(pat: &str, name: &str) -> bool {
+    if pat.is_ascii() && name.is_ascii() {
+        return wildcard_ascii(pat.as_bytes(), name.as_bytes());
+    }
+    let (mut p, mut i) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while i < name.len() {
+        let current = name[i..].chars().next().unwrap();
+        let literal = pat[p..].chars().next();
+        if literal == Some('*') {
+            p += 1;
+            star = Some(p);
+            mark = i;
+        } else if let Some(c) = literal
+            && (c == '?' || c.to_lowercase().eq(current.to_lowercase()))
+        {
+            p += c.len_utf8();
+            i += current.len_utf8();
+        } else if let Some(after_star) = star {
+            mark += name[mark..].chars().next().unwrap().len_utf8();
+            i = mark;
+            p = after_star;
+        } else {
+            return false;
+        }
+    }
+    pat[p..].chars().all(|c| c == '*')
+}
+
+/// ASCII 경로는 할당 없이 원본 패턴과 이름을 대소문자 무시로 비교한다.
+fn wildcard_ascii(pat: &[u8], s: &[u8]) -> bool {
     let (mut p, mut i) = (0, 0);
     let (mut star, mut mark) = (usize::MAX, 0);
     while i < s.len() {
-        if p < pat.len() && (pat[p] == b'?' || pat[p] == s[i].to_ascii_lowercase()) {
-            p += 1;
-            i += 1;
-        } else if p < pat.len() && pat[p] == b'*' {
+        if p < pat.len() && pat[p] == b'*' {
             star = p;
             mark = i;
             p += 1;
+        } else if p < pat.len() && (pat[p] == b'?' || pat[p].eq_ignore_ascii_case(&s[i])) {
+            p += 1;
+            i += 1;
         } else if star != usize::MAX {
             p = star + 1;
             mark += 1;
@@ -144,9 +176,14 @@ fn wildcard(pat: &[u8], s: &[u8]) -> bool {
     p == pat.len()
 }
 
-fn ascii_lower_into<'a>(s: &str, buf: &'a mut Vec<u8>) -> &'a [u8] {
+fn lower_into<'a>(s: &str, buf: &'a mut Vec<u8>) -> &'a [u8] {
     buf.clear();
-    buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+    if s.is_ascii() {
+        buf.extend(s.bytes().map(|b| b.to_ascii_lowercase()));
+    } else {
+        // 쿼리와 동일한 문자열 lowercase 규칙 (확장 및 문맥 의존 변환 포함).
+        buf.extend_from_slice(s.to_lowercase().as_bytes());
+    }
     buf
 }
 
@@ -158,7 +195,7 @@ pub struct SearchResult {
     pub total_size: u64,
 }
 
-/// `scope` 아래(포함)에서 검색한다. 비-ASCII 문자는 대소문자를 그대로 비교한다.
+/// `scope` 아래(포함)에서 검색한다. 이름·확장자·경로는 Unicode lowercase로 비교한다.
 pub fn search(tree: &Tree, q: &Query, mode: SizeMode, scope: NodeId, limit: usize) -> SearchResult {
     let finders: Vec<(memmem::Finder<'_>, bool)> = q
         .terms
@@ -174,7 +211,7 @@ pub fn search(tree: &Tree, q: &Query, mode: SizeMode, scope: NodeId, limit: usiz
         if n.has(flags::REMOVED) || id == Tree::ROOT {
             return false;
         }
-        let name = ascii_lower_into(tree.name(id), buf);
+        let name = lower_into(tree.name(id), buf);
         for (f, neg) in &finders {
             if f.find(name).is_some() == *neg {
                 return false;
@@ -183,9 +220,16 @@ pub fn search(tree: &Tree, q: &Query, mode: SizeMode, scope: NodeId, limit: usiz
         for t in &q.terms {
             let ok = match t {
                 Term::Contains(..) => true,
-                Term::Wildcard(p) => wildcard(p, name),
-                Term::Ext(exts) => match name.iter().rposition(|&c| c == b'.') {
-                    Some(dot) if n.kind == Kind::File => exts.iter().any(|e| e.as_bytes() == &name[dot + 1..]),
+                Term::Wildcard(p) => wildcard(p, tree.name(id)),
+                Term::Ext(exts) => match tree.name(id).rsplit_once('.') {
+                    Some((_, ext)) if n.kind == Kind::File => {
+                        if ext.is_ascii() {
+                            exts.iter().any(|e| ext.eq_ignore_ascii_case(e))
+                        } else {
+                            // 파일 본문·점이 Sigma의 문맥에 영향을 주지 않도록 확장자만 변환한다.
+                            exts.contains(&ext.to_lowercase())
+                        }
+                    }
                     _ => false,
                 },
                 Term::SizeGt(v) => n.size(mode) > *v,
@@ -253,10 +297,34 @@ mod tests {
 
     #[test]
     fn wildcards() {
-        assert!(wildcard(b"*.mp4", b"Movie.MP4"));
-        assert!(wildcard(b"a?c*", b"abcdef"));
-        assert!(!wildcard(b"*.mp4", b"movie.mkv"));
-        assert!(wildcard(b"*", b""));
+        assert!(wildcard("*.mp4", "Movie.MP4"));
+        assert!(wildcard("a?c*", "abcdef"));
+        assert!(!wildcard("*.mp4", "movie.mkv"));
+        assert!(wildcard("*", ""));
+    }
+
+    #[test]
+    fn wildcards_consume_original_scalars() {
+        for (pattern, name, expected) in [
+            ("A*.TXT", "abc.txt", true),
+            ("?.txt", "가.txt", true),
+            ("??.txt", "가.txt", false),
+            ("?.txt", "😀.txt", true),
+            ("?.txt", "e\u{301}.txt", false),
+            ("??.txt", "e\u{301}.txt", true),
+            ("*가?.txt", "앞가나.txt", true),
+            ("?.txt", "İ.txt", true),
+            ("İ*.txt", "İ.txt", true),
+            ("i\u{307}*.txt", "İ.txt", false),
+        ] {
+            assert_eq!(wildcard(pattern, name), expected, "{pattern:?} / {name:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_stars_are_operators() {
+        assert!(wildcard("*?", "*"));
+        assert!(wildcard("*?", "*가"));
     }
 
     #[test]
