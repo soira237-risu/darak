@@ -8,18 +8,81 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   windows:
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install Rust
         run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
       - name: Select Rust
         run: rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
       - name: Check
         run: cargo check --locked --workspace --all-targets
       - name: Test
         run: cargo test --locked --workspace
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Check all features
+        run: cargo check --locked --workspace --all-targets --all-features
+      - name: Test all features
+        run: cargo test --locked --workspace --all-features
+      - name: Clippy all features
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  native-diagnostics:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Select Rust
+        run: rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-diagnostics
+      - name: Build native release CLI
+        id: build_cli
+        run: cargo build --locked --release -p darak-cli
+      - name: Native runner smoke (Windows PowerShell 5.1)
+        if: ${{ !cancelled() && steps.build_cli.outcome == 'success' }}
+        shell: powershell
+        run: ./scripts/ci-perf-smoke.ps1 -Binary ./target/release/darak-cli.exe -OutDir ./ci-diagnostics/powershell5
+      - name: Native runner smoke (PowerShell 7)
+        if: ${{ !cancelled() && steps.build_cli.outcome == 'success' }}
+        shell: pwsh
+        run: ./scripts/ci-perf-smoke.ps1 -Binary ./target/release/darak-cli.exe -OutDir ./ci-diagnostics/powershell7
+      - name: Capture failure smoke (Windows PowerShell 5.1)
+        if: ${{ !cancelled() }}
+        shell: powershell
+        timeout-minutes: 4
+        run: ./scripts/ci-perf-fault-smoke.ps1 -OutDir ./ci-diagnostics/powershell5-faults
+      - name: Capture failure smoke (PowerShell 7)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        timeout-minutes: 4
+        run: ./scripts/ci-perf-fault-smoke.ps1 -OutDir ./ci-diagnostics/powershell7-faults
+      - name: Baseline and candidate search smoke
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        timeout-minutes: 30
+        run: ./scripts/ci-search-smoke.ps1 -OutDir ./ci-diagnostics/search
+      - name: Upload native diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-native-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
