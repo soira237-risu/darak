@@ -1,5 +1,8 @@
 //! darak 핵심 로직: 스캔, 트리, 레이아웃. UI에 의존하지 않는다.
 
+#[cfg(feature = "perf")]
+pub mod perf;
+
 pub mod category;
 pub mod layout;
 pub mod mft;
