@@ -7,6 +7,8 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2,
     text::{LayoutJob, TextFormat, TextWrapping},
 };
+use std::collections::HashMap;
+use std::time::Instant;
 
 /// 디렉터리 제목 바 높이
 pub const HEADER_H: f32 = 16.0;
@@ -93,11 +95,37 @@ struct Key {
 struct Plan {
     order: Vec<u64>,
     rows: Vec<usize>,
+    ranks: HashMap<u64, usize>,
+    row_by_key: HashMap<u64, usize>,
+    duplicates: bool,
+}
+
+impl Plan {
+    fn new(order: Vec<u64>, rows: Vec<usize>) -> Self {
+        let mut ranks = HashMap::with_capacity(order.len());
+        let mut duplicates = false;
+        for (rank, &key) in order.iter().enumerate() {
+            match ranks.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(rank); }
+                std::collections::hash_map::Entry::Occupied(_) => duplicates = true,
+            }
+        }
+        let mut row_by_key = HashMap::with_capacity(order.len());
+        let mut start = 0;
+        for (row, &len) in rows.iter().enumerate() {
+            for &key in &order[start.min(order.len())..(start + len).min(order.len())] {
+                row_by_key.entry(key).or_insert(row);
+            }
+            start += len;
+        }
+        Self { order, rows, ranks, row_by_key, duplicates }
+    }
 }
 
 #[derive(Default)]
 pub struct Layout {
     key: Option<Key>,
+    generation: u64,
     pub items: Vec<Item>,
     /// true면 폴더마다 줄 구성을 기억해 두고, 크기가 바뀌어도 자리를 유지한다 (스캔 중 미리 보기)
     pub stable: bool,
@@ -117,6 +145,7 @@ impl Layout {
             return;
         }
         self.key = Some(key);
+        self.generation = self.generation.wrapping_add(1);
         self.items.clear();
         let (min_w, min_h, min_area, max_depth) = detail.params();
         let mut b = Builder {
@@ -134,6 +163,11 @@ impl Layout {
 
     pub fn invalidate(&mut self) {
         self.key = None;
+    }
+
+    /// 실제 레이아웃 재계산마다 바뀌는 번호.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// 가장 깊은 항목
@@ -285,18 +319,30 @@ impl Builder<'_> {
 
         if let Some(plan) = plans.get(&dir_key) {
             // 기억해 둔 순서대로 놓고, 처음 보는 항목은 마지막 줄로
-            let pos = |k: u64| plan.order.iter().position(|&o| o == k).unwrap_or(usize::MAX);
-            entries.sort_by_key(|e| pos(e.key));
-            let mut rows = Vec::with_capacity(plan.rows.len() + 1);
-            let mut start = 0;
-            for &len in &plan.rows {
-                let row_keys = &plan.order[start.min(plan.order.len())..(start + len).min(plan.order.len())];
-                let present = entries.iter().filter(|e| row_keys.contains(&e.key)).count();
-                if present > 0 {
-                    rows.push(present);
+            entries.sort_by_key(|e| plan.ranks.get(&e.key).copied().unwrap_or(usize::MAX));
+            let mut rows = if plan.duplicates {
+                // 같은 키가 여러 줄에 있으면 이전 membership 집계를 그대로 쓴다.
+                let mut rows = Vec::with_capacity(plan.rows.len() + 1);
+                let mut start = 0;
+                for &len in &plan.rows {
+                    let row_keys = &plan.order[start.min(plan.order.len())..(start + len).min(plan.order.len())];
+                    let present = entries.iter().filter(|e| row_keys.contains(&e.key)).count();
+                    if present > 0 {
+                        rows.push(present);
+                    }
+                    start += len;
                 }
-                start += len;
-            }
+                rows
+            } else {
+                let mut rows = vec![0; plan.rows.len()];
+                for entry in entries.iter() {
+                    if let Some(&row) = plan.row_by_key.get(&entry.key) {
+                        rows[row] += 1;
+                    }
+                }
+                rows.retain(|&count| count > 0);
+                rows
+            };
             let placed: usize = rows.iter().sum();
             if placed < entries.len() {
                 rows.push(entries.len() - placed);
@@ -304,7 +350,7 @@ impl Builder<'_> {
             let values: Vec<f64> = entries.iter().map(|e| e.value).collect();
             layout::layout_rows(&values, &rows, area, &mut rects);
             if layout::worst_aspect(&rects) <= MAX_STABLE_ASPECT {
-                plans.insert(dir_key, Plan { order: entries.iter().map(|e| e.key).collect(), rows });
+                plans.insert(dir_key, Plan::new(entries.iter().map(|e| e.key).collect(), rows));
                 return rects;
             }
             rects.clear();
@@ -315,7 +361,7 @@ impl Builder<'_> {
         let values: Vec<f64> = entries.iter().map(|e| e.value).collect();
         let mut rows = Vec::new();
         layout::squarify_with_rows(&values, area, &mut rects, &mut rows);
-        plans.insert(dir_key, Plan { order: entries.iter().map(|e| e.key).collect(), rows });
+        plans.insert(dir_key, Plan::new(entries.iter().map(|e| e.key).collect(), rows));
         rects
     }
 }
@@ -408,6 +454,7 @@ fn ease_in_out(t: f32) -> f32 {
     if t < 0.5 { 4.0 * t * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(3) / 2.0 }
 }
 
+#[derive(Clone, Copy)]
 struct Tween {
     from: Rect,
     to: Rect,
@@ -422,52 +469,110 @@ impl Tween {
     }
 }
 
-/// 레이아웃이 바뀔 때: 작은 변화는 짧게 미끄러지고, 새 박스는 서서히 나타나고, 큰 재배치는 바로 바꾼다.
-/// 화면 전체를 겹치지 않으므로 깜빡이지 않는다.
+/// 스캔 번호와 문서 번호가 같아도 서로 다른 레이아웃 소스다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutSource {
+    Preview(u64),
+    Document(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MorphKey {
+    pub layout_id: LayoutSource,
+    pub generation: u64,
+}
+
+/// 작은 변화는 짧게 미끄러지고, 새 박스는 서서히 나타나고, 큰 재배치는 바로 바꾼다.
 #[derive(Default)]
 pub struct Morph {
-    tweens: std::collections::HashMap<u64, Tween>,
+    tweens: HashMap<u64, Tween>,
+    scratch: HashMap<u64, Tween>,
+    settled: Option<MorphKey>,
 }
 
 impl Morph {
     pub fn reset(&mut self) {
         self.tweens.clear();
+        self.scratch.clear();
+        self.invalidate();
     }
 
-    /// 이번 프레임에 그릴 항목들. 아직 바뀌는 중이면 true도 함께 돌려준다.
+    /// 문서/미리 보기 전환 시 기존 보간은 유지하고 완료 캐시만 지운다.
+    pub fn invalidate(&mut self) {
+        self.settled = None;
+    }
+
+    pub fn is_settled(&self, key: MorphKey) -> bool {
+        self.settled == Some(key)
+    }
+
+    // Temporary compatibility for App until it supplies the real layout key.
+    // An unkeyed caller must check targets every frame, including after settling.
     pub fn step(&mut self, items: &[Item]) -> (Vec<Item>, bool) {
-        let now = std::time::Instant::now();
+        self.invalidate();
+        let mut out = Vec::with_capacity(items.len());
+        let moving = self.step_into(items, MorphKey { layout_id: LayoutSource::Preview(0), generation: 0 }, &mut out);
+        (out, moving)
+    }
+
+    /// `out`을 현재 항목/metadata로 채운다. 아직 보간 중이면 true.
+    /// 완료된 같은 키는 Layout.items를 직접 사용하면 복사도 생략할 수 있다.
+    pub fn step_into(&mut self, items: &[Item], key: MorphKey, out: &mut Vec<Item>) -> bool {
+        self.step_into_at(items, key, out, Instant::now())
+    }
+
+    fn step_into_at(&mut self, items: &[Item], key: MorphKey, out: &mut Vec<Item>, now: Instant) -> bool {
+        out.clear();
+        if self.is_settled(key) {
+            out.extend_from_slice(items);
+            return false;
+        }
+        self.invalidate();
         let first = self.tweens.is_empty();
         let long_ago = now - std::time::Duration::from_secs(5);
         let mut moving = false;
-        let mut next = std::collections::HashMap::with_capacity(items.len());
-        let out = items
-            .iter()
-            .map(|it| {
-                let target = it.rect;
-                let tw = match self.tweens.remove(&it.key) {
-                    Some(t) if t.to == target => t,
-                    Some(t) => {
-                        let (cur, _) = t.rect(now);
-                        let dist = (cur.min - target.min).length().max((cur.max - target.max).length());
-                        if dist <= MAX_SLIDE_PX {
-                            Tween { from: cur, to: target, start: now, born: t.born }
-                        } else {
-                            Tween { from: target, to: target, start: long_ago, born: t.born }
-                        }
+        let mut duplicates = false;
+        self.scratch.clear();
+        self.scratch.reserve(items.len());
+        out.reserve(items.len());
+        for it in items {
+            let target = it.rect;
+            let next = self.scratch.entry(it.key);
+            let previous = match &next {
+                std::collections::hash_map::Entry::Vacant(_) => self.tweens.get(&it.key).copied(),
+                // The old remove-based loop consumed the previous tween only
+                // once per key; preserve that behavior for hash collisions.
+                std::collections::hash_map::Entry::Occupied(_) => { duplicates = true; None }
+            };
+            let tw = match previous {
+                Some(t) if t.to == target => t,
+                Some(t) => {
+                    let (cur, _) = t.rect(now);
+                    let dist = (cur.min - target.min).length().max((cur.max - target.max).length());
+                    if dist <= MAX_SLIDE_PX {
+                        Tween { from: cur, to: target, start: now, born: t.born }
+                    } else {
+                        Tween { from: target, to: target, start: long_ago, born: t.born }
                     }
-                    // 첫 화면은 바로, 그 뒤 새로 생긴 박스는 제자리에서 서서히
-                    None => Tween { from: target, to: target, start: long_ago, born: if first { long_ago } else { now } },
-                };
-                let (rect, t) = tw.rect(now);
-                let fade = ease_in_out((now - tw.born).as_secs_f32() / FADE_SECS);
-                moving |= t < 1.0 || fade < 1.0;
-                next.insert(it.key, tw);
-                Item { rect, fade, ..*it }
-            })
-            .collect();
-        self.tweens = next;
-        (out, moving)
+                }
+                // 첫 화면은 바로, 그 뒤 새로 생긴 박스는 제자리에서 서서히
+                None => Tween { from: target, to: target, start: long_ago, born: if first { long_ago } else { now } },
+            };
+            let (rect, t) = tw.rect(now);
+            let fade = ease_in_out((now - tw.born).as_secs_f32() / FADE_SECS);
+            moving |= t < 1.0 || fade < 1.0;
+            match next {
+                std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(tw); }
+                std::collections::hash_map::Entry::Occupied(mut entry) => { entry.insert(tw); }
+            }
+            out.push(Item { rect, fade, ..*it });
+        }
+        std::mem::swap(&mut self.tweens, &mut self.scratch);
+        self.scratch.clear();
+        if !moving && !duplicates {
+            self.settled = Some(key);
+        }
+        moving
     }
 }
 
@@ -729,4 +834,317 @@ fn hatch(painter: &Painter, r: Rect, color: Color32, step: f32, width: f32) {
 pub fn canvas(ui: &mut egui::Ui) -> (egui::Response, Painter) {
     let size = ui.available_size();
     ui.allocate_painter(size, egui::Sense::click())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    // The original membership-based implementation is deliberately independent
+    // of Plan's indices, so it catches order and row-topology regressions.
+    fn reference_arrange(plan: &mut Option<(Vec<u64>, Vec<usize>)>, entries: &mut [Entry], area: layout::Rect) -> Vec<layout::Rect> {
+        let mut rects = Vec::with_capacity(entries.len());
+        if let Some((order, old_rows)) = plan {
+            let pos = |k: u64| order.iter().position(|&o| o == k).unwrap_or(usize::MAX);
+            entries.sort_by_key(|e| pos(e.key));
+            let mut rows = Vec::with_capacity(old_rows.len() + 1);
+            let mut start = 0;
+            for &len in old_rows.iter() {
+                let row_keys = &order[start.min(order.len())..(start + len).min(order.len())];
+                let present = entries.iter().filter(|e| row_keys.contains(&e.key)).count();
+                if present > 0 {
+                    rows.push(present);
+                }
+                start += len;
+            }
+            let placed: usize = rows.iter().sum();
+            if placed < entries.len() {
+                rows.push(entries.len() - placed);
+            }
+            let values: Vec<f64> = entries.iter().map(|e| e.value).collect();
+            layout::layout_rows(&values, &rows, area, &mut rects);
+            if layout::worst_aspect(&rects) <= MAX_STABLE_ASPECT {
+                *plan = Some((entries.iter().map(|e| e.key).collect(), rows));
+                return rects;
+            }
+            rects.clear();
+        }
+        entries.sort_by(|a, b| b.value.total_cmp(&a.value));
+        let values: Vec<f64> = entries.iter().map(|e| e.value).collect();
+        let mut rows = Vec::new();
+        layout::squarify_with_rows(&values, area, &mut rects, &mut rows);
+        *plan = Some((entries.iter().map(|e| e.key).collect(), rows));
+        rects
+    }
+
+    fn entries(values: &[(u64, f64)]) -> Vec<Entry> {
+        values.iter().enumerate().map(|(i, &(key, value))| Entry { key, value, node: Some(i as NodeId) }).collect()
+    }
+
+    #[test]
+    fn indexed_rows_match_reference_with_ties_and_duplicates() {
+        let seeds = [
+            (vec![1, 2, 3, 4], vec![2, 2]),
+            (vec![1, 2, 3, 4], vec![0, 2, 0, 2, 0]),
+            (vec![1, 2, 3, 4], vec![1]),
+            (vec![1, 2, 3, 4], vec![0, 0]),
+            (vec![1, 2, 1, 4], vec![2, 2]),
+            (vec![1, 1, 3, 4], vec![2, 2]),
+            (vec![1, 2, 3, 4], vec![2, 8]),
+            (vec![], vec![]),
+        ];
+        let inputs = [
+            vec![(4, 10.0), (2, 10.0), (1, 10.0), (3, 10.0)],
+            vec![(9, 10.0), (4, 10.0), (8, 10.0), (1, 10.0), (7, 10.0)],
+            vec![(9, 1.0), (4, 1.0), (8, 1.0)],
+            vec![(2, 10.0), (2, 10.0), (1, 10.0), (1, 10.0)],
+            vec![(1, 10000.0), (3, 1.0), (4, 1.0), (2, 1.0)],
+            // A size-mode change alters sizes but retains the path keys.
+            vec![(4, 300.0), (2, 80.0), (3, 40.0), (1, 20.0)],
+            vec![],
+        ];
+        let tree = Tree::default();
+        let mut out = Vec::new();
+        for (order, rows) in seeds {
+            for area in [layout::Rect::new(5.0, 9.0, 400.0, 300.0), layout::Rect::new(0.0, 0.0, 2000.0, 10.0)] {
+                // Each input also starts from the seeded topology; suffixes test
+                // rebuilding the indices through successive layout changes.
+                for start in 0..inputs.len() {
+                    let mut plans = HashMap::from([(42, Plan::new(order.clone(), rows.clone()))]);
+                    let mut reference = Some((order.clone(), rows.clone()));
+                    let mut builder = Builder { tree: &tree, mode: SizeMode::Allocated, out: &mut out,
+                        min_w: 0.0, min_h: 0.0, min_area: 0.0, max_depth: 8, plans: Some(&mut plans) };
+                    for input in &inputs[start..] {
+                        let mut actual = entries(input);
+                        let mut expected = entries(input);
+                        let expected_rects = reference_arrange(&mut reference, &mut expected, area);
+                        let actual_rects = builder.arrange(42, &mut actual, area);
+                        assert_eq!(actual_rects, expected_rects);
+                        assert_eq!(actual.iter().map(|e| (e.key, e.node)).collect::<Vec<_>>(),
+                            expected.iter().map(|e| (e.key, e.node)).collect::<Vec<_>>());
+                        let stored = builder.plans.as_ref().unwrap().get(&42).unwrap();
+                        let (expected_order, expected_rows) = reference.as_ref().unwrap();
+                        assert_eq!(&stored.order, expected_order);
+                        assert_eq!(&stored.rows, expected_rows);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_wide_rows_match_reference() {
+        let tree = Tree::default();
+        let mut out = Vec::new();
+        let order: Vec<u64> = (0..MAX_CHILDREN as u64).collect();
+        let rows = vec![50; MAX_CHILDREN / 50];
+        let mut reference = Some((order.clone(), rows.clone()));
+        let mut plans = HashMap::from([(42, Plan::new(order, rows))]);
+        let mut builder = Builder { tree: &tree, mode: SizeMode::Allocated, out: &mut out,
+            min_w: 0.0, min_h: 0.0, min_area: 0.0, max_depth: 8, plans: Some(&mut plans) };
+        let area = layout::Rect::new(0.0, 0.0, 1600.0, 1200.0);
+        for round in 0..3 {
+            let input: Vec<_> = (0..MAX_CHILDREN as u64).rev().filter(|i| (i + round) % 7 != 0)
+                .chain(4000..4050).map(|key| (key, (key % 5 + 1) as f64)).collect();
+            let mut actual = entries(&input);
+            let mut expected = entries(&input);
+            assert_eq!(builder.arrange(42, &mut actual, area), reference_arrange(&mut reference, &mut expected, area));
+            assert_eq!(actual.iter().map(|e| (e.key, e.node)).collect::<Vec<_>>(),
+                expected.iter().map(|e| (e.key, e.node)).collect::<Vec<_>>());
+            let stored = builder.plans.as_ref().unwrap().get(&42).unwrap();
+            assert_eq!((&stored.order, &stored.rows), {
+                let (order, rows) = reference.as_ref().unwrap(); (order, rows)
+            });
+        }
+    }
+
+    fn item(key: u64, x: f32) -> Item {
+        Item { node: key as NodeId, rect: Rect::from_min_size(Pos2::new(x, 0.0), Vec2::new(100.0, 100.0)),
+            depth: 1, kind: ItemKind::File, key, fade: 1.0 }
+    }
+
+    fn morph_key(generation: u64) -> MorphKey {
+        MorphKey { layout_id: LayoutSource::Preview(7), generation }
+    }
+
+    fn assert_item(actual: &Item, expected: &Item) {
+        assert_eq!(actual.node, expected.node);
+        assert_eq!(actual.rect, expected.rect);
+        assert_eq!(actual.depth, expected.depth);
+        assert_eq!(actual.kind, expected.kind);
+        assert_eq!(actual.key, expected.key);
+        assert_eq!(actual.fade, expected.fade);
+    }
+
+    #[test]
+    fn settled_morph_refreshes_metadata() {
+        let now = Instant::now();
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        let original = item(1, 0.0);
+        assert!(!morph.step_into_at(&[original], morph_key(1), &mut out, now));
+        assert!(morph.is_settled(morph_key(1)));
+        for (generation, kind) in [(2, ItemKind::ClosedDir), (3, ItemKind::Group { count: 99, size: 12345 }),
+            (4, ItemKind::Group { count: 3, size: 4 })] {
+            let fresh = Item { node: 700 + generation as NodeId, depth: 8, kind, ..original };
+            assert!(!morph.step_into_at(&[fresh], morph_key(generation), &mut out, now));
+            assert_item(&out[0], &fresh);
+            assert!(morph.is_settled(morph_key(generation)));
+            assert!(!morph.is_settled(morph_key(generation - 1)));
+            // Even a repeated caller-owned key must never return old metadata.
+            let newer = Item { node: fresh.node + 1, depth: 9, ..fresh };
+            assert!(!morph.step_into_at(&[newer], morph_key(generation), &mut out, now));
+            assert_item(&out[0], &newer);
+        }
+        let final_key = MorphKey { layout_id: LayoutSource::Document(7), generation: 4 };
+        assert!(!morph.is_settled(final_key));
+        morph.invalidate();
+        assert!(!morph.is_settled(morph_key(4)));
+        assert!(!morph.step_into_at(&[original], final_key, &mut out, now));
+        assert!(morph.is_settled(final_key));
+    }
+
+    #[test]
+    fn morph_preserves_move_fade_and_reset() {
+        let now = Instant::now();
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        assert!(!morph.step_into_at(&[item(1, 0.0)], morph_key(1), &mut out, now));
+        let target = [item(1, 20.0), item(2, 120.0)];
+        assert!(morph.step_into_at(&target, morph_key(2), &mut out, now));
+        assert_eq!(out[0].rect.min.x, 0.0);
+        assert_eq!(out[0].fade, 1.0);
+        assert_eq!(out[1].fade, 0.0);
+        let half_move = now + Duration::from_millis(150);
+        assert!(morph.step_into_at(&target, morph_key(2), &mut out, half_move));
+        assert!((out[0].rect.min.x - 10.0).abs() < 1e-4);
+        assert!((out[1].fade - ease_in_out(0.375)).abs() < 1e-4);
+        let final_key = MorphKey { layout_id: LayoutSource::Document(8), generation: 1 };
+        morph.invalidate();
+        assert!(morph.step_into_at(&target, final_key, &mut out, half_move));
+        assert!((out[0].rect.min.x - 10.0).abs() < 1e-4);
+        let done = now + Duration::from_millis(401);
+        assert!(!morph.step_into_at(&target, final_key, &mut out, done));
+        assert!(morph.is_settled(final_key));
+        for (actual, expected) in out.iter().zip(&target) { assert_item(actual, expected); }
+        // Reorder and removal follow the new layout; large movement snaps.
+        assert!(!morph.step_into_at(&[item(2, 300.0), item(1, 20.0)], morph_key(3), &mut out, done));
+        assert_eq!(out[0].key, 2);
+        assert_eq!(out[0].rect.min.x, 300.0);
+        assert!(!morph.step_into_at(&[item(2, 300.0)], morph_key(4), &mut out, done));
+        assert_eq!(out.len(), 1);
+        assert!(!morph.tweens.contains_key(&1));
+        morph.reset();
+        assert!(!morph.is_settled(morph_key(4)));
+        assert!(!morph.step_into_at(&[item(99, 0.0)], morph_key(4), &mut out, done));
+        assert_eq!(out[0].fade, 1.0);
+    }
+
+    #[test]
+    fn duplicate_morph_keys_never_take_settled_fast_path() {
+        let now = Instant::now();
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        let duplicates = [item(1, 0.0), Item { node: 9, ..item(1, 100.0) }];
+        assert!(!morph.step_into_at(&duplicates, morph_key(1), &mut out, now));
+        assert!(!morph.is_settled(morph_key(1)));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].node, 9);
+        assert!(morph.step_into_at(&duplicates, morph_key(1), &mut out, now + Duration::from_secs(1)));
+        assert!(!morph.is_settled(morph_key(1)));
+        assert_eq!(out[1].fade, 0.0);
+    }
+
+    #[test]
+    fn morph_retargets_from_current_rect_and_respects_slide_limit() {
+        let now = Instant::now();
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        morph.step_into_at(&[item(1, 0.0)], morph_key(1), &mut out, now);
+        morph.step_into_at(&[item(1, 20.0)], morph_key(2), &mut out, now);
+        let halfway = now + Duration::from_millis(150);
+        assert!(morph.step_into_at(&[item(1, 30.0)], morph_key(3), &mut out, halfway));
+        assert!((out[0].rect.min.x - 10.0).abs() < 1e-4);
+        assert!(morph.step_into_at(&[item(1, 30.0)], morph_key(3), &mut out, now + Duration::from_millis(300)));
+        assert!((out[0].rect.min.x - 20.0).abs() < 1e-4);
+        let done = now + Duration::from_millis(451);
+        assert!(!morph.step_into_at(&[item(1, 30.0)], morph_key(3), &mut out, done));
+        assert!(morph.step_into_at(&[item(1, 70.0)], morph_key(4), &mut out, done));
+        assert_eq!(out[0].rect.min.x, 30.0);
+        let done = done + Duration::from_millis(301);
+        assert!(!morph.step_into_at(&[item(1, 70.0)], morph_key(4), &mut out, done));
+        assert!(!morph.step_into_at(&[item(1, 110.01)], morph_key(5), &mut out, done));
+        assert_eq!(out[0].rect.min.x, 110.01);
+        assert_eq!(out[0].fade, 1.0);
+    }
+
+    #[test]
+    fn unkeyed_compatibility_step_checks_new_targets_after_settling() {
+        let mut morph = Morph::default();
+        assert!(!morph.step(&[item(1, 0.0)]).1);
+        assert!(morph.step(&[item(1, 20.0)]).1);
+    }
+
+    #[test]
+    fn morph_reuses_buffers_after_warmup() {
+        let now = Instant::now();
+        let mut morph = Morph::default();
+        let mut out = Vec::new();
+        let items: Vec<_> = (0..3000).map(|i| item(i, i as f32)).collect();
+        for generation in 0..2 { morph.step_into_at(&items, morph_key(generation), &mut out, now); }
+        let capacities = (morph.tweens.capacity(), morph.scratch.capacity(), out.capacity());
+        let pointer = out.as_ptr();
+        for generation in 2..20 {
+            let n = if generation % 2 == 0 { items.len() } else { 1500 };
+            morph.step_into_at(&items[..n], morph_key(generation), &mut out, now + Duration::from_secs(generation));
+            assert_eq!(out.capacity(), capacities.2);
+            assert_eq!(out.as_ptr(), pointer);
+            assert_eq!(morph.tweens.capacity(), capacities.0);
+            assert_eq!(morph.scratch.capacity(), capacities.1);
+        }
+        morph.reset();
+        assert!(morph.tweens.capacity() >= items.len());
+        assert!(morph.scratch.capacity() >= items.len());
+        morph.step_into_at(&items, morph_key(22), &mut out, now + Duration::from_secs(30));
+        assert_eq!(out.capacity(), capacities.2);
+    }
+
+    #[test]
+    fn layout_generation_only_advances_on_recompute() {
+        let mut tree = Tree { nodes: vec![darak_core::Node { alloc: 1, logical: 1, name_off: 0,
+            parent: darak_core::NO_NODE, first_child: 0, child_count: 0, files: 1, mtime: 0,
+            name_len: 0, kind: Kind::File, flags: 0 }], ..Tree::default() };
+        let mut layout = Layout::default();
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 300.0));
+        assert_eq!(layout.generation(), 0);
+        layout.update(&tree, 1, 0, area, SizeMode::Allocated, Detail::default());
+        assert_eq!(layout.generation(), 1);
+        layout.update(&tree, 1, 0, area, SizeMode::Allocated, Detail::default());
+        assert_eq!(layout.generation(), 1);
+        tree.version += 1;
+        layout.update(&tree, 1, 0, area, SizeMode::Allocated, Detail::default());
+        assert_eq!(layout.generation(), 2);
+        layout.invalidate();
+        assert_eq!(layout.generation(), 2);
+        layout.update(&tree, 1, 0, area, SizeMode::Allocated, Detail::default());
+        assert_eq!(layout.generation(), 3);
+        tree.nodes.push(tree.nodes[0]);
+        let shifted = area.translate(Vec2::new(1.0, 0.0));
+        let resized = Rect::from_min_size(shifted.min, Vec2::new(401.0, 300.0));
+        for (generation, tree_id, focus, area, mode, detail) in [
+            (4, 1, 0, shifted, SizeMode::Allocated, Detail::default()),
+            (5, 1, 0, resized, SizeMode::Allocated, Detail::default()),
+            (6, 2, 0, resized, SizeMode::Allocated, Detail::default()),
+            (7, 2, 1, resized, SizeMode::Allocated, Detail::default()),
+            (8, 2, 1, resized, SizeMode::Logical, Detail::default()),
+            (9, 2, 1, resized, SizeMode::Logical, Detail::default().more()),
+        ] {
+            layout.update(&tree, tree_id, focus, area, mode, detail);
+            assert_eq!(layout.generation(), generation);
+            layout.update(&tree, tree_id, focus, area, mode, detail);
+            assert_eq!(layout.generation(), generation);
+        }
+    }
 }
