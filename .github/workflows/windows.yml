@@ -1,0 +1,25 @@
+name: Windows regression checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0 --profile minimal --component clippy,rustfmt
+      - name: Select Rust
+        run: rustup default 1.99.0
+      - name: Check
+        run: cargo check --locked --workspace --all-targets
+      - name: Test
+        run: cargo test --locked --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
