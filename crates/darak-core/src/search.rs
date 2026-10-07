@@ -234,6 +234,14 @@ fn lower_into<'a>(s: &str, buf: &'a mut Vec<u8>) -> &'a [u8] {
     buf
 }
 
+// Reused within one 4096-node matching run, retaining only its longest path.
+#[derive(Default)]
+struct MatchScratch {
+    lower: Vec<u8>,
+    chain: Vec<NodeId>,
+    path: String,
+}
+
 pub struct SearchResult {
     /// 크기 내림차순, 최대 `limit`개
     pub hits: Vec<NodeId>,
@@ -278,7 +286,8 @@ pub fn search_with_cancel(
             _ => None,
         })
         .collect();
-    let matches = |id: NodeId, buf: &mut Vec<u8>| -> Result<bool, SearchCancelled> {
+    let matches = |id: NodeId, scratch: &mut MatchScratch| -> Result<bool, SearchCancelled> {
+        let MatchScratch { lower, chain, path } = scratch;
         let n = tree.node(id);
         if n.has(flags::REMOVED) || id == Tree::ROOT {
             return Ok(false);
@@ -300,7 +309,7 @@ pub fn search_with_cancel(
             }
         }
         if !finders.is_empty() {
-            let name = lower_into(tree.name(id), buf);
+            let name = lower_into(tree.name(id), lower);
             for (f, neg) in &finders {
                 if f.find(name).is_some() == *neg {
                     return Ok(false);
@@ -328,8 +337,9 @@ pub fn search_with_cancel(
             }
         }
         if !path_terms.is_empty() {
-            // Build the full path once, then fold the complete operand for every path term.
-            let mut chain = vec![id];
+            // Reuse storage, but fold the complete path once to preserve contextual lowercase.
+            chain.clear();
+            chain.push(id);
             let mut cur = id;
             let mut steps = 0;
             while let Some(parent) = tree.parent(cur) {
@@ -337,7 +347,8 @@ pub fn search_with_cancel(
                 chain.push(parent);
                 cur = parent;
             }
-            let mut path = String::from(tree.name(*chain.last().unwrap()));
+            path.clear();
+            path.push_str(tree.name(*chain.last().unwrap()));
             for &part in chain.iter().rev().skip(1) {
                 checkpoint(&mut steps, cancelled)?;
                 if !path.ends_with('\\') {
@@ -345,8 +356,11 @@ pub fn search_with_cancel(
                 }
                 path.push_str(tree.name(part));
             }
-            let path = path.to_lowercase();
-            if path_terms.iter().any(|term| !path.contains(term)) {
+            let folded = lower_into(path, lower);
+            if path_terms
+                .iter()
+                .any(|term| memmem::find(folded, term.as_bytes()).is_none())
+            {
                 return Ok(false);
             }
         }
@@ -439,15 +453,15 @@ pub fn search_with_cancel(
 
 fn collect_matches(
     ids: impl Iterator<Item = NodeId>,
-    matches: &impl Fn(NodeId, &mut Vec<u8>) -> Result<bool, SearchCancelled>,
+    matches: &impl Fn(NodeId, &mut MatchScratch) -> Result<bool, SearchCancelled>,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<NodeId>, SearchCancelled> {
     let mut hits = Vec::new();
-    let mut buf = Vec::new();
+    let mut scratch = MatchScratch::default();
     let mut steps = 0;
     for id in ids {
         checkpoint(&mut steps, cancelled)?;
-        if matches(id, &mut buf)? {
+        if matches(id, &mut scratch)? {
             hits.push(id);
         }
     }
@@ -481,23 +495,50 @@ fn sort_hits_with_cancel(
     let mut buffer = vec![0; hits.len()];
     let mut width = 4096;
     while width < hits.len() {
+        // Partition by output position so even the last merge uses the whole pool.
         buffer
-            .par_chunks_mut(width * 2)
+            .par_chunks_mut(4096)
             .enumerate()
-            .try_for_each(|(run, outputs)| {
-                let start = run * width * 2;
+            .try_for_each(|(chunk, outputs)| {
+                if cancelled() {
+                    return Err(SearchCancelled);
+                }
+                let offset = chunk * 4096;
+                let start = offset / (width * 2) * (width * 2);
                 let middle = (start + width).min(hits.len());
-                let end = start + outputs.len();
-                let (mut left, mut right) = (start, middle);
+                let end = (start + width * 2).min(hits.len());
+                let diagonal = offset - start;
+                // Find how many elements each input contributes before this output chunk.
+                // Unique (size, ID) keys make the partition unambiguous, including ties.
+                let mut low = diagonal.saturating_sub(end - middle);
+                let mut high = diagonal.min(middle - start);
+                while low < high {
+                    let left = low + (high - low) / 2;
+                    let right = diagonal - left;
+                    if right > 0
+                        && left < middle - start
+                        && key(hits[middle + right - 1]) > key(hits[start + left])
+                    {
+                        low = left + 1;
+                    } else {
+                        high = left;
+                    }
+                }
+                let (mut left, mut right) = (start + low, middle + diagonal - low);
+                // Cache the two frontiers instead of repeatedly fetching 48-byte tree nodes.
+                let mut left_key = (left < middle).then(|| key(hits[left]));
+                let mut right_key = (right < end).then(|| key(hits[right]));
                 let mut steps = 0;
                 for output in outputs {
                     checkpoint(&mut steps, cancelled)?;
-                    if left < middle && (right == end || key(hits[left]) <= key(hits[right])) {
+                    if left_key.is_some() && (right_key.is_none() || left_key <= right_key) {
                         *output = hits[left];
                         left += 1;
+                        left_key = (left < middle).then(|| key(hits[left]));
                     } else {
                         *output = hits[right];
                         right += 1;
+                        right_key = (right < end).then(|| key(hits[right]));
                     }
                 }
                 Ok(())
@@ -742,5 +783,86 @@ mod tests {
         let mut expected: Vec<NodeId> = (1..=10000).collect();
         expected.sort_unstable_by_key(|&id| (std::cmp::Reverse(tree.node(id).logical), id));
         assert_eq!(hits, expected);
+    }
+    #[test]
+    fn reused_path_buffers_preserve_long_unicode_operands() {
+        use crate::tree::NO_NODE;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let names = ["AΣİ😀e\u{301}".repeat(64), "leafΣ".repeat(48)];
+        let mut rows = vec![("C:\\", Kind::Dir, NO_NODE, 1, 1, 0)];
+        rows.extend(
+            (1..=300).map(|id| (names[id as usize % 2].as_str(), Kind::Dir, id - 1, 1, 1, 0)),
+        );
+        let tree = fixture(&rows);
+        for text in ["path:AΣİ😀e\u{301} path:leafΣ", "path:Σ", "path:C:"] {
+            let query = Query::parse(text, 0).unwrap();
+            let expected: Vec<NodeId> = (1..=300)
+                .filter(|&id| {
+                    let path = tree.path(id).to_lowercase();
+                    query.terms.iter().all(|term| match term {
+                        Term::Path(needle) => path.contains(needle),
+                        _ => unreachable!(),
+                    })
+                })
+                .collect();
+            let result = search(&tree, &query, SizeMode::Logical, Tree::ROOT, usize::MAX);
+            assert_eq!(result.hits, expected, "{text}");
+        }
+        let query = Query::parse("path:C:", 0).unwrap();
+        let calls = AtomicUsize::new(0);
+        assert!(matches!(
+            search_with_cancel(&tree, &query, SizeMode::Logical, 300, usize::MAX, &|| {
+                calls.fetch_add(1, Ordering::Relaxed) >= 3
+            }),
+            Err(SearchCancelled)
+        ));
+    }
+
+    #[test]
+    fn parallel_merge_partitions_cover_ties_and_short_runs() {
+        use crate::tree::NO_NODE;
+        let mut rows = vec![("C:\\", Kind::Dir, NO_NODE, 0, 0, 0)];
+        rows.extend((1..=65539).map(|id| ("x", Kind::File, 0, 1, id % 17, 0)));
+        let tree = fixture(&rows);
+        for threads in [1, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            for count in [4095, 4096, 4097, 8191, 8192, 8193, 16385, 65539] {
+                for mode in [SizeMode::Allocated, SizeMode::Logical] {
+                    let mut hits: Vec<NodeId> = (1..=count).rev().collect();
+                    let mut expected = hits.clone();
+                    expected.sort_unstable_by_key(|&id| {
+                        (std::cmp::Reverse(tree.node(id).size(mode)), id)
+                    });
+                    pool.install(|| sort_hits_with_cancel(&tree, &mut hits, mode, &|| false))
+                        .unwrap();
+                    assert_eq!(hits, expected, "{threads} threads, {count} hits, {mode:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_scope_includes_its_matching_ancestor_before_limit() {
+        use crate::tree::NO_NODE;
+        let mut rows = vec![
+            ("C:\\", Kind::Dir, NO_NODE, 20001, 40002, 0),
+            ("match", Kind::Dir, 0, 20000, 40000, 0),
+            ("match-outside", Kind::File, 0, 1, 2, 0),
+        ];
+        rows.extend((0..20000).map(|_| ("match", Kind::File, 1, 1, 2, 0)));
+        let tree = fixture(&rows);
+        let query = Query::parse("match", 0).unwrap();
+        for mode in [SizeMode::Allocated, SizeMode::Logical] {
+            for limit in [0, 1, usize::MAX] {
+                let result = search(&tree, &query, mode, 1, limit);
+                let expected: Vec<_> = std::iter::once(1).chain(3..20003).take(limit).collect();
+                assert_eq!(result.hits, expected);
+                assert_eq!(result.total, 20001);
+                assert_eq!(result.total_size, tree.node(1).size(mode));
+            }
+        }
     }
 }
