@@ -57,7 +57,9 @@ try {
         Assert-True ($metadata.exit_code -eq 0 -and $null -eq $metadata.error) 'Successful scan metadata differs'
         Assert-True ($metadata.rayon_num_threads -eq 2 -and @($metadata.cleanup_errors).Count -eq 0) 'Unexpected runner environment or cleanup errors'
         $stderr = Get-Content -Raw -Encoding utf8 (Join-Path $directory 'run-001.stderr.txt')
-        Assert-True (-not [string]::IsNullOrWhiteSpace($stderr)) 'Native progress stderr was not retained'
+        # A tiny scan may cancel the ticker before it starts; the CLI still emits
+        # a final newline that capture must retain.
+        Assert-True (-not [string]::IsNullOrEmpty($stderr)) 'Native stderr bytes were not retained'
         if ($method -eq 'fallback') {
             Assert-True ($metadata.requested_method -eq 'Mft' -and @($metadata.fallback).Count -eq 1) 'Drive-root MFT fallback was not recorded'
             $fallbackLines = @(Get-Content -Encoding utf8 (Join-Path $directory 'run-001.stderr.txt') | Where-Object { $_ -like 'fallback:*' })
