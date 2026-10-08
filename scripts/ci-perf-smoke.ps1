@@ -8,8 +8,10 @@ $binaryPath = (Resolve-Path $Binary).Path
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outPath = (Resolve-Path $OutDir).Path
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('darak CI fixture ' + [Guid]::NewGuid().ToString('N'))
+$substExecutable = Join-Path $env:SystemRoot 'System32/subst.exe'
+$substDrive = $null
 $priorThreads = $env:RAYON_NUM_THREADS
-$summary = [ordered]@{ powershell = $PSVersionTable.PSVersion.ToString(); walk = $false; fallback = $false; missing_root = $false }
+$summary = [ordered]@{ powershell = $PSVersionTable.PSVersion.ToString(); walk = $false; default_subdirectory = $false; fallback = $false; missing_root = $false }
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -28,10 +30,19 @@ try {
     New-Item -ItemType Directory -Path (Join-Path $fixture 'nested directory') -Force | Out-Null
     [IO.File]::WriteAllBytes((Join-Path $fixture 'one file.bin'), (New-Object byte[] 17))
     [IO.File]::WriteAllBytes((Join-Path $fixture 'nested directory/two file.bin'), (New-Object byte[] 31))
-    foreach ($method in @('walk', 'fallback')) {
+    # Subdirectories select Walk without attempting MFT. A SUBST root reaches
+    # MFT selection, but its directory alias cannot be opened as a raw volume.
+    $usedDrives = [IO.Directory]::GetLogicalDrives()
+    $availableRoot = 90..68 | ForEach-Object { '{0}:\' -f [char]$_ } | Where-Object { $usedDrives -notcontains $_ } | Select-Object -First 1
+    Assert-True (-not [string]::IsNullOrWhiteSpace($availableRoot)) 'No unused drive letter for MFT fallback fixture'
+    & $substExecutable $availableRoot.Substring(0, 2) $fixture
+    Assert-True ($LASTEXITCODE -eq 0) 'Could not create MFT fallback fixture drive'
+    $substDrive = $availableRoot.Substring(0, 2)
+    foreach ($method in @('walk', 'default_subdirectory', 'fallback')) {
         $directory = Join-Path $outPath $method
         $env:RAYON_NUM_THREADS = 'ci-parent-sentinel'
-        $parameters = @{ Binary = $binaryPath; Root = $fixture; Threads = 2; Runs = 1; OutDir = $directory }
+        $scanRoot = if ($method -eq 'fallback') { $availableRoot } else { $fixture }
+        $parameters = @{ Binary = $binaryPath; Root = $scanRoot; Threads = 2; Runs = 1; OutDir = $directory }
         if ($method -eq 'walk') { $parameters.Walk = $true }
         & $runner @parameters
         Assert-True ($env:RAYON_NUM_THREADS -eq 'ci-parent-sentinel') 'Runner did not restore Rayon environment after success'
@@ -48,10 +59,13 @@ try {
         $stderr = Get-Content -Raw -Encoding utf8 (Join-Path $directory 'run-001.stderr.txt')
         Assert-True (-not [string]::IsNullOrWhiteSpace($stderr)) 'Native progress stderr was not retained'
         if ($method -eq 'fallback') {
-            Assert-True ($metadata.requested_method -eq 'Mft' -and @($metadata.fallback).Count -gt 0) 'Subdirectory MFT fallback was not recorded'
-            Assert-True ($stderr -match '(?m)^fallback:') 'Raw fallback message was not retained'
+            Assert-True ($metadata.requested_method -eq 'Mft' -and @($metadata.fallback).Count -eq 1) 'Drive-root MFT fallback was not recorded'
+            $fallbackLines = @(Get-Content -Encoding utf8 (Join-Path $directory 'run-001.stderr.txt') | Where-Object { $_ -like 'fallback:*' })
+            Assert-True ($fallbackLines.Count -eq 1 -and $fallbackLines[0] -match '^fallback:\s+\S' -and $metadata.fallback[0] -eq $fallbackLines[0]) 'Raw fallback reason and metadata differ'
         } else {
-            Assert-True ($metadata.requested_method -eq 'Walk') 'Walk request metadata differs'
+            $requestedMethod = if ($method -eq 'walk') { 'Walk' } else { 'Mft' }
+            Assert-True ($metadata.requested_method -eq $requestedMethod) 'Scan request metadata differs'
+            Assert-True (@($metadata.fallback).Count -eq 0 -and $stderr -notmatch '(?m)^fallback:') 'Subdirectory scan unexpectedly reported MFT fallback'
         }
         $summary[$method] = $true
     }
@@ -70,6 +84,13 @@ try {
     $summary.missing_root = $true
 } finally {
     $env:RAYON_NUM_THREADS = $priorThreads
-    if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }
-    $summary | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $outPath 'summary.json')
+    try {
+        if ($null -ne $substDrive) {
+            & $substExecutable $substDrive /D
+            Assert-True ($LASTEXITCODE -eq 0 -and [IO.Directory]::GetLogicalDrives() -notcontains ($substDrive + '\')) 'Could not remove owned MFT fallback fixture drive'
+        }
+    } finally {
+        if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }
+        $summary | ConvertTo-Json | Set-Content -Encoding utf8 (Join-Path $outPath 'summary.json')
+    }
 }

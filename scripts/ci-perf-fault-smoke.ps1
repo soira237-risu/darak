@@ -119,7 +119,7 @@ public sealed class DarakCiCaptureStream : Stream {
         Assert-True ($stderr -match '(?m)^owned-child-pid:(\d+)') 'Owned child PID was not retained'
         $childId = [int]$Matches[1]
         Assert-True ($null -eq (Get-Process -Id $childId -ErrorAction SilentlyContinue)) 'Owned native child survived capture failure'
-        Assert-True ($stderr -match '(?m)^fallback: injected fixture' -and @($metadata.fallback).Count -eq 1) 'Fallback bytes/metadata were lost during capture cleanup'
+        Assert-True ($stderr -match '(?m)^fallback: injected fixture' -and @($metadata.fallback).Count -eq 1 -and $metadata.fallback[0] -eq 'fallback: injected fixture') 'Fallback bytes/metadata were lost during capture cleanup'
         if ($FaultCase -eq 'exit-race') {
             Assert-True ($metadata.exit_code -eq 0) 'Finite child did not exit before the delayed capture fault'
             Assert-True ($stderr.EndsWith("finite-stderr-complete`n")) 'Healthy stream was not completely drained after child exit'
@@ -177,6 +177,9 @@ try {
         $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -OutDir "' + $directory + '" -FaultCase ' + $case + ' -FixtureBinary "' + $fixtureExe + '"'
         $hostProcess = Start-Process -FilePath $hostBinary -ArgumentList $arguments -PassThru -NoNewWindow -RedirectStandardOutput (Join-Path $directory 'host.stdout.txt') -RedirectStandardError (Join-Path $directory 'host.stderr.txt')
         $hosts += $hostProcess
+        # Windows PowerShell 5.1 returns an uncached Process handle. Retain it
+        # before the host exits so ExitCode remains available after the wait.
+        $null = $hostProcess.Handle
         Assert-True ($hostProcess.WaitForExit(30000)) "Fault case exceeded its 30-second outer bound: $case"
         $hostProcess.Refresh()
         Assert-True ($hostProcess.ExitCode -eq 0) "Fault case failed: $case; see host.stderr.txt"

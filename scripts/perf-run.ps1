@@ -105,7 +105,8 @@ try {
             $stdoutFile = $null
             $stderrFile.Dispose()
             $stderrFile = $null
-            $metadata.fallback = @(Get-Content -Encoding utf8 "$prefix.stderr.txt" | Where-Object { $_ -like 'fallback:*' })
+            # PS5.1 otherwise serializes Get-Content provider properties alongside each line.
+            $metadata.fallback = @(Get-Content -Encoding utf8 "$prefix.stderr.txt" | Where-Object { $_ -like 'fallback:*' } | ForEach-Object { $_.ToString() })
             if ($metadata.exit_code -ne 0) {
                 throw "Scan run $run failed with exit code $($metadata.exit_code); raw output retained"
             }
@@ -166,7 +167,7 @@ try {
                 }
                 # Even a failed stdout copy leaves independently retained stderr.
                 if (Test-Path "$prefix.stderr.txt") {
-                    try { $metadata.fallback = @(Get-Content -Encoding utf8 "$prefix.stderr.txt" | Where-Object { $_ -like 'fallback:*' }) }
+                    try { $metadata.fallback = @(Get-Content -Encoding utf8 "$prefix.stderr.txt" | Where-Object { $_ -like 'fallback:*' } | ForEach-Object { $_.ToString() }) }
                     catch { $metadata.cleanup_errors += $_.Exception.Message }
                 }
             }
