@@ -29,30 +29,33 @@ const RECORD_IN_USE: u16 = 0x01;
 const RECORD_IS_DIR: u16 = 0x02;
 
 /// `root`가 `X:\` 형태의 NTFS 볼륨 루트일 때만 쓴다.
-pub fn scan_volume(root: &str, progress: &ScanProgress) -> io::Result<(Tree, ScanStats)> {
+pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) -> io::Result<(Tree, ScanStats)> {
     let start = Instant::now();
     let letter = root.chars().next().filter(|c| c.is_ascii_alphabetic()).ok_or_else(|| invalid("드라이브 루트가 아님"))?;
     let vol = open_volume(letter)?;
     let vd = volume_data(&vol)?;
     let rec_size = vd.BytesPerFileRecordSegment as usize;
     let cluster = vd.BytesPerCluster as u64;
-    if !(512..=65536).contains(&rec_size) || !rec_size.is_multiple_of(512) || cluster == 0 {
+    if !(512..=65536).contains(&rec_size) || !rec_size.is_power_of_two() || !cluster.is_power_of_two() || cluster < 512 || cluster > CHUNK_BYTES as u64 {
         return Err(invalid("지원하지 않는 NTFS 레코드 크기"));
     }
 
     // 레코드 0 = $MFT 자신. 클러스터 단위로 읽어 정렬 조건을 맞춘다.
     let mut first = AlignedBuf::new(rec_size.max(cluster as usize));
-    read_at(&vol, vd.MftStartLcn as u64 * cluster, first.as_mut())?;
+    let first_offset = u64::try_from(vd.MftStartLcn).ok().and_then(|lcn| lcn.checked_mul(cluster))
+        .ok_or_else(|| invalid("$MFT 시작 위치가 잘못됨"))?;
+    first_offset.checked_add(first.len as u64).ok_or_else(|| invalid("$MFT 시작 읽기 위치 오버플로"))?;
+    read_at(&vol, first_offset, first.as_mut())?;
     let rec0 = &mut first.as_mut()[..rec_size];
     if !apply_fixup(rec0) {
         return Err(invalid("$MFT 레코드 0 손상"));
     }
     let runs = mft_runs(rec0).ok_or_else(|| invalid("$MFT data run을 찾지 못함 (조각이 너무 많을 수 있음)"))?;
-    let mft_bytes = vd.MftValidDataLength as u64;
-    let total_records = (mft_bytes / rec_size as u64) as usize;
-    let run_bytes: u64 = runs.iter().map(|r| r.1 * cluster).sum();
-    if run_bytes < mft_bytes {
-        return Err(invalid("$MFT가 여러 레코드에 걸쳐 있음 (attribute list 미지원)"));
+    let mft_bytes = u64::try_from(vd.MftValidDataLength).map_err(|_| invalid("$MFT 유효 길이가 잘못됨"))?;
+    validate_run_alignment(&runs, cluster, rec_size, mft_bytes)?;
+    let total_records = usize::try_from(mft_bytes / rec_size as u64).map_err(|_| invalid("$MFT 레코드 수가 너무 큼"))?;
+    if total_records <= ROOT_RECORD as usize || total_records > u32::MAX as usize {
+        return Err(invalid("지원하지 않는 $MFT 레코드 수"));
     }
 
     let mut recs = Records::new(total_records);
@@ -67,6 +70,9 @@ pub fn scan_volume(root: &str, progress: &ScanProgress) -> io::Result<(Tree, Sca
             let mut rec_no = 0usize;
             let mut remaining = mft_bytes;
             'runs: for &(lcn, clusters) in &runs {
+                if remaining == 0 {
+                    break;
+                }
                 let mut off = lcn * cluster;
                 let mut left = (clusters * cluster).min(remaining);
                 while left > 0 {
@@ -120,7 +126,7 @@ pub fn scan_volume(root: &str, progress: &ScanProgress) -> io::Result<(Tree, Sca
 
     *progress.current.lock().unwrap() = format!("{root} 트리 구성 중");
     let display = format!("{}:\\", letter.to_ascii_uppercase());
-    let (tree, orphans, dups) = recs.build_tree(&display);
+    let (tree, orphans, dups) = recs.build_tree(&display, dedupe_hardlinks);
     let root_node = tree.node(Tree::ROOT);
     let stats = ScanStats {
         elapsed: start.elapsed(),
@@ -133,6 +139,39 @@ pub fn scan_volume(root: &str, progress: &ScanProgress) -> io::Result<(Tree, Sca
         fallback_reason: None,
     };
     Ok((tree, stats))
+}
+
+/// The reader parses each run independently; reject boundaries that split FILE records.
+fn validate_run_alignment(runs: &[(u64, u64)], cluster: u64, rec_size: usize, mft_bytes: u64) -> io::Result<()> {
+    if !(512..=65536).contains(&rec_size) || !rec_size.is_power_of_two() {
+        return Err(invalid("지원하지 않는 NTFS 레코드 크기"));
+    }
+    if !cluster.is_power_of_two() || cluster < 512 || cluster > CHUNK_BYTES as u64
+        || !CHUNK_BYTES.is_multiple_of(rec_size) || !(CHUNK_BYTES as u64).is_multiple_of(cluster) {
+        return Err(invalid("지원하지 않는 NTFS 읽기 chunk 정렬"));
+    }
+    if !mft_bytes.is_multiple_of(rec_size as u64) {
+        return Err(invalid("$MFT 유효 길이가 레코드 경계에 맞지 않음"));
+    }
+    let mut remaining = mft_bytes;
+    for &(lcn, clusters) in runs {
+        if remaining == 0 {
+            break; // Unused allocation is not read or parsed.
+        }
+        let offset = lcn.checked_mul(cluster).ok_or_else(|| invalid("$MFT run 위치 오버플로"))?;
+        let bytes = clusters.checked_mul(cluster).ok_or_else(|| invalid("$MFT run 길이 오버플로"))?;
+        let used = bytes.min(remaining);
+        if !used.is_multiple_of(rec_size as u64) {
+            return Err(invalid("$MFT run 경계가 FILE 레코드를 나눔"));
+        }
+        let read_bytes = used.checked_next_multiple_of(cluster).ok_or_else(|| invalid("$MFT 읽기 길이 오버플로"))?;
+        offset.checked_add(read_bytes).ok_or_else(|| invalid("$MFT 읽기 위치 오버플로"))?;
+        remaining -= used;
+    }
+    if remaining != 0 {
+        return Err(invalid("$MFT가 여러 레코드에 걸쳐 있음 (attribute list 미지원)"));
+    }
+    Ok(())
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -325,7 +364,11 @@ fn data_runs(a: &[u8]) -> impl Iterator<Item = Option<(Option<u64>, u64)>> + '_ 
         let shift = 64 - 8 * on as u32;
         delta = (delta << shift) >> shift; // 부호 확장
         off += on;
-        lcn += delta;
+        let Some(next) = lcn.checked_add(delta).filter(|&lcn| lcn >= 0) else {
+            broken = true;
+            return Some(None);
+        };
+        lcn = next;
         Some(Some((Some(lcn as u64), len)))
     })
 }
@@ -365,6 +408,7 @@ struct NameFact {
     parent_seq: u16,
     name_off: u32,
     name_len: u16,
+    flags: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -416,8 +460,15 @@ fn parse_batch(chunk: &mut [u8], rec_size: usize, first_rec: u32, cluster: u64) 
                     let parent_ref = u64_at(v, 0);
                     let name_off = b.names.len() as u32;
                     let units = raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]]));
+                    let mut name_flags = 0;
                     for c in char::decode_utf16(units) {
-                        b.names.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
+                        match c {
+                            Ok(c) => b.names.push(c),
+                            Err(_) => {
+                                b.names.push(char::REPLACEMENT_CHARACTER);
+                                name_flags |= flags::LOSSY_NAME;
+                            }
+                        }
                     }
                     b.name_facts.push(NameFact {
                         record: owner,
@@ -425,6 +476,7 @@ fn parse_batch(chunk: &mut [u8], rec_size: usize, first_rec: u32, cluster: u64) 
                         parent_seq: (parent_ref >> 48) as u16,
                         name_off,
                         name_len: (b.names.len() as u32 - name_off) as u16,
+                        flags: name_flags,
                     });
                 }
                 ATTR_DATA => {
@@ -470,9 +522,11 @@ struct Records {
     parent_seq: Vec<u16>,
     name_off: Vec<u32>,
     name_len: Vec<u16>,
+    name_flags: Vec<u8>,
     names: String,
     /// 하드링크의 추가 이름들
     links: Vec<NameFact>,
+    link_indices: std::collections::HashMap<u32, Vec<usize>>,
     files: u64,
     dirs: u64,
     bytes: u64,
@@ -492,8 +546,10 @@ impl Records {
             parent_seq: vec![0; n],
             name_off: vec![NO_NAME; n],
             name_len: vec![0; n],
+            name_flags: vec![0; n],
             names: String::new(),
             links: Vec::new(),
+            link_indices: std::collections::HashMap::new(),
             files: 0,
             dirs: 0,
             bytes: 0,
@@ -528,14 +584,30 @@ impl Records {
                 continue;
             }
             let name = &b.names[f.name_off as usize..][..f.name_len as usize];
+            if self.name_off[i] != NO_NAME {
+                if self.parent[i] == f.parent && &self.names[self.name_off[i] as usize..][..self.name_len[i] as usize] == name {
+                    self.name_flags[i] |= f.flags;
+                    continue;
+                }
+                let existing = self.link_indices.get(&f.record).and_then(|indices| indices.iter().copied().find(|&j| {
+                    let link = &self.links[j];
+                    link.parent == f.parent && &self.names[link.name_off as usize..][..link.name_len as usize] == name
+                }));
+                if let Some(j) = existing {
+                    self.links[j].flags |= f.flags;
+                    continue;
+                }
+            }
             let off = self.names.len() as u32;
             self.names.push_str(name);
             if self.name_off[i] == NO_NAME {
                 self.name_off[i] = off;
                 self.name_len[i] = f.name_len;
+                self.name_flags[i] = f.flags;
                 self.parent[i] = f.parent;
                 self.parent_seq[i] = f.parent_seq;
-            } else if !(self.parent[i] == f.parent && &self.names[self.name_off[i] as usize..][..self.name_len[i] as usize] == name) {
+            } else {
+                self.link_indices.entry(f.record).or_default().push(self.links.len());
                 self.links.push(NameFact { name_off: off, ..*f });
             }
         }
@@ -547,13 +619,14 @@ impl Records {
     }
 
     /// (트리, 고아 수, 하드링크 중복 수)
-    fn build_tree(mut self, root_name: &str) -> (Tree, u64, u64) {
+    fn build_tree(mut self, root_name: &str, dedupe_hardlinks: bool) -> (Tree, u64, u64) {
         let n = self.in_use.len();
         // 항목: 기본 이름 + 하드링크 추가 이름. (레코드, 부모, 이름 위치, 하드링크 중복 여부)
         struct Entry {
             record: u32,
             name_off: u32,
             name_len: u16,
+            name_flags: u8,
             dup: bool,
         }
         let mut entries: Vec<Entry> = Vec::with_capacity(n);
@@ -567,17 +640,18 @@ impl Records {
                 orphans += 1;
                 continue;
             }
-            entries.push(Entry { record: i as u32, name_off: self.name_off[i], name_len: self.name_len[i], dup: false });
+            entries.push(Entry { record: i as u32, name_off: self.name_off[i], name_len: self.name_len[i], name_flags: self.name_flags[i], dup: false });
             entry_parent.push(self.parent[i]);
         }
         let mut dups = 0u64;
         for l in std::mem::take(&mut self.links) {
             if self.in_use[l.record as usize] && self.valid_parent(l.parent, l.parent_seq) && !self.is_dir[l.record as usize] {
-                entries.push(Entry { record: l.record, name_off: l.name_off, name_len: l.name_len, dup: true });
+                entries.push(Entry { record: l.record, name_off: l.name_off, name_len: l.name_len, name_flags: l.flags, dup: false });
                 entry_parent.push(l.parent);
-                dups += 1;
             }
         }
+
+        drop(self.link_indices);
 
         // 디렉터리 레코드별 자식 항목 (CSR)
         let mut start = vec![0u32; n + 1];
@@ -606,18 +680,25 @@ impl Records {
             }
         }
         let mut visited = vec![false; n];
+        let mut seen_files = vec![false; n];
         let mut stack: Vec<(u32, u32)> = vec![(ROOT_RECORD, start[ROOT_RECORD as usize])];
         visited[ROOT_RECORD as usize] = true;
         self.alloc[ROOT_RECORD as usize] = 0;
         self.logical[ROOT_RECORD as usize] = 0;
         while let Some(&mut (dir, ref mut pos)) = stack.last_mut() {
             if *pos < start[dir as usize + 1] {
-                let e = &entries[kids[*pos as usize] as usize];
+                let e = &mut entries[kids[*pos as usize] as usize];
                 *pos += 1;
                 let r = e.record as usize;
-                if self.is_dir[r] && !e.dup && !visited[r] {
-                    visited[r] = true;
-                    stack.push((e.record, start[r]));
+                if self.is_dir[r] {
+                    if self.attrs[r] & FILE_ATTRIBUTE_REPARSE_POINT == 0 && !visited[r] {
+                        visited[r] = true;
+                        stack.push((e.record, start[r]));
+                    }
+                } else {
+                    e.dup = dedupe_hardlinks && seen_files[r];
+                    seen_files[r] = true;
+                    dups += u64::from(e.dup);
                 }
             } else {
                 stack.pop();
@@ -626,16 +707,15 @@ impl Records {
                 for k in start[d]..start[d + 1] {
                     let e = &entries[kids[k as usize] as usize];
                     let r = e.record as usize;
-                    if e.dup {
-                        continue;
-                    }
                     if self.is_dir[r] {
                         a += self.alloc[r];
                         l += self.logical[r];
                         f += files[r] as u64;
                     } else {
-                        a += self.alloc[r];
-                        l += self.logical[r];
+                        if !e.dup {
+                            a += self.alloc[r];
+                            l += self.logical[r];
+                        }
                         f += 1;
                     }
                 }
@@ -678,7 +758,7 @@ impl Records {
                 let size = if e.dup { 0 } else { self.alloc[e.record as usize] };
                 order.push((size, ei));
             }
-            order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            order.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
             let first = tree.nodes.len() as u32;
             tree.nodes[node_id as usize].first_child = first;
             tree.nodes[node_id as usize].child_count = order.len() as u32;
@@ -695,7 +775,7 @@ impl Records {
                 } else {
                     Kind::File
                 };
-                let mut fl = 0u8;
+                let mut fl = e.name_flags;
                 if !is_dir && reparse {
                     fl |= flags::REPARSE;
                 }
@@ -706,7 +786,7 @@ impl Records {
                 let name_off = tree.names.len() as u32;
                 tree.names.push_str(name);
                 let (alloc, logical, nfiles) = if e.dup {
-                    (0, 0, 0)
+                    (0, 0, 1)
                 } else if is_dir {
                     (self.alloc[r], self.logical[r], files[r])
                 } else {
@@ -740,6 +820,182 @@ impl Records {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(name: &[u16], parent: u32) -> Vec<u8> {
+        let mut rec = vec![0u8; 1024];
+        rec[..4].copy_from_slice(b"FILE");
+        rec[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        rec[6..8].copy_from_slice(&3u16.to_le_bytes());
+        rec[0x10..0x12].copy_from_slice(&1u16.to_le_bytes());
+        rec[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        rec[0x16..0x18].copy_from_slice(&1u16.to_le_bytes());
+        let mut a = vec![0u8; (24 + 66 + name.len()*2).next_multiple_of(8)];
+        a[..4].copy_from_slice(&ATTR_FILE_NAME.to_le_bytes());
+        let alen = a.len() as u32; a[4..8].copy_from_slice(&alen.to_le_bytes());
+        a[0x10..0x14].copy_from_slice(&((66 + name.len()*2) as u32).to_le_bytes());
+        a[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
+        a[24..32].copy_from_slice(&((1u64 << 48) | parent as u64).to_le_bytes());
+        a[24+64] = name.len() as u8; a[24+65] = 3;
+        for (i, &u) in name.iter().enumerate() { a[24+66+i*2..24+68+i*2].copy_from_slice(&u.to_le_bytes()); }
+        let end = 0x38 + a.len(); rec[0x38..end].copy_from_slice(&a);
+        rec[end..end+4].copy_from_slice(&ATTR_END.to_le_bytes());
+        rec[0x18..0x1c].copy_from_slice(&((end+4) as u32).to_le_bytes());
+        rec[0x30..0x32].copy_from_slice(&0xcafeu16.to_le_bytes());
+        rec[510..512].copy_from_slice(&0xcafeu16.to_le_bytes());
+        rec[1022..1024].copy_from_slice(&0xcafeu16.to_le_bytes()); rec
+    }
+
+    fn root_records(n: usize) -> Records {
+        let mut r = Records::new(n);
+        r.in_use[ROOT_RECORD as usize] = true;
+        r.seq[ROOT_RECORD as usize] = 1;
+        r.is_dir[ROOT_RECORD as usize] = true;
+        r
+    }
+
+    fn add_name(r: &mut Records, id: u32, parent: u32, name: &str, is_dir: bool, attrs: u32) {
+        let mut rec = record(&name.encode_utf16().collect::<Vec<_>>(), parent);
+        if is_dir {
+            rec[0x16..0x18].copy_from_slice(&(RECORD_IN_USE | RECORD_IS_DIR).to_le_bytes());
+        }
+        r.merge(parse_batch(&mut rec, 1024, id, 4096));
+        r.attrs[id as usize] = attrs;
+    }
+
+    #[test]
+    fn preserves_name_flags_per_hardlink() {
+        let mut r = root_records(8);
+        for name in [vec![0xD83D, 0xDE00], vec![0xD800], vec![0xFFFD], vec![b'o' as u16, b'k' as u16]] {
+            let mut rec = record(&name, ROOT_RECORD);
+            r.merge(parse_batch(&mut rec, 1024, 6, 4096));
+        }
+        let (tree, _, _) = r.build_tree("C:\\", true);
+        assert_eq!(tree.nodes.len(), 4, "equal converted names merge once");
+        for id in tree.children(Tree::ROOT) {
+            let lossy = tree.node(id).flags & flags::LOSSY_NAME != 0;
+            assert_eq!(lossy, tree.name(id) == "\u{FFFD}", "{}", tree.name(id));
+        }
+        let mut r = root_records(8);
+        add_name(&mut r, 6, ROOT_RECORD, "\u{FFFD}", false, 0);
+        let (tree, _, _) = r.build_tree("C:\\", true);
+        assert_eq!(tree.node(1).flags & flags::LOSSY_NAME, 0, "valid replacement character");
+    }
+
+    #[test]
+    fn merges_lossy_flags_for_additional_names() {
+        let mut r = root_records(8);
+        for name in [vec![b'o' as u16, b'k' as u16], vec![0xFFFD], vec![0xD800]] {
+            let mut rec = record(&name, ROOT_RECORD);
+            r.merge(parse_batch(&mut rec, 1024, 6, 4096));
+        }
+        let (tree, _, dups) = r.build_tree("C:\\", true);
+        assert_eq!(tree.nodes.len(), 3);
+        assert_eq!(dups, 1);
+        let id = tree.children(0).find(|&id| tree.name(id) == "\u{FFFD}").unwrap();
+        assert_ne!(tree.node(id).flags & flags::LOSSY_NAME, 0);
+    }
+
+    #[test]
+    fn excludes_reparse_descendants_from_all_totals() {
+        for dedupe in [true, false] {
+            let mut r = root_records(9);
+            add_name(&mut r, 6, ROOT_RECORD, "cloud", true, FILE_ATTRIBUTE_REPARSE_POINT);
+            add_name(&mut r, 7, 6, "hidden.bin", false, 0);
+            r.alloc[7] = 4096; r.logical[7] = 1000;
+            let (tree, _, dups) = r.build_tree("C:\\", dedupe);
+            assert_eq!(tree.nodes.len(), 2);
+            assert_eq!(tree.node(1).kind, Kind::Link);
+            for node in &tree.nodes {
+                assert_eq!((node.alloc, node.logical, node.files), (0, 0, 0));
+            }
+            assert_eq!(dups, 0);
+        }
+    }
+
+    #[test]
+    fn honors_hardlink_dedupe_option() {
+        for dedupe in [true, false] {
+            let mut r = root_records(9);
+            add_name(&mut r, 6, ROOT_RECORD, "folder", true, 0);
+            add_name(&mut r, 7, 6, "first.bin", false, 0);
+            add_name(&mut r, 7, 6, "second.bin", false, 0);
+            r.alloc[7] = 4096; r.logical[7] = 1000;
+            let (tree, _, dups) = r.build_tree("C:\\", dedupe);
+            let copies = if dedupe { 1 } else { 2 };
+            assert_eq!((tree.node(0).alloc, tree.node(0).logical, tree.node(0).files), (4096 * copies, 1000 * copies, 2));
+            assert_eq!(dups, u64::from(dedupe));
+            let file_nodes: Vec<_> = tree.nodes.iter().filter(|n| n.kind == Kind::File).collect();
+            assert!(file_nodes.iter().all(|n| n.files == 1));
+            assert_eq!(file_nodes.iter().filter(|n| n.flags & flags::HARDLINK_DUP != 0).count(), usize::from(dedupe));
+        }
+    }
+
+    #[test]
+    fn chooses_reachable_hardlink_owner() {
+        for dedupe in [true, false] {
+            let mut r = root_records(9);
+            add_name(&mut r, 6, ROOT_RECORD, "cloud", true, FILE_ATTRIBUTE_REPARSE_POINT);
+            add_name(&mut r, 7, 6, "hidden.bin", false, 0);
+            add_name(&mut r, 7, ROOT_RECORD, "visible.bin", false, 0);
+            r.alloc[7] = 4096; r.logical[7] = 1000;
+            let (tree, _, dups) = r.build_tree("C:\\", dedupe);
+            assert_eq!((tree.node(0).alloc, tree.node(0).logical, tree.node(0).files), (4096, 1000, 1));
+            let id = tree.children(0).find(|&id| tree.name(id) == "visible.bin").unwrap();
+            assert_eq!((tree.node(id).alloc, tree.node(id).logical, tree.node(id).files), (4096, 1000, 1));
+            assert_eq!(tree.node(id).flags & flags::HARDLINK_DUP, 0);
+            assert_eq!(dups, 0);
+        }
+    }
+
+    #[test]
+    fn rejects_split_record_runs() {
+        let error = validate_run_alignment(&[(20, 3), (100, 1)], 512, 1024, 2048).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(validate_run_alignment(&[(20, 2)], 512, 1024, 512).is_err());
+        assert!(validate_run_alignment(&[(20, 2)], 512, 1024, 2048).is_err());
+        assert!(validate_run_alignment(&[(u64::MAX, 2)], 512, 1024, 1024).is_err());
+        assert!(validate_run_alignment(&[(u64::MAX / 512, 2)], 512, 1024, 1024).is_err());
+        assert!(validate_run_alignment(&[(20, u64::MAX)], 512, 1024, 1024).is_err());
+        assert!(validate_run_alignment(&[(20, 8)], 512, 1536, 3072).is_err());
+        assert!(validate_run_alignment(&[(20, 2)], 0, 1024, 1024).is_err());
+    }
+
+    #[test]
+    fn accepts_aligned_runs_and_unused_tail() {
+        for (runs, cluster, bytes) in [
+            (vec![(20, 2), (100, 2)], 512, 2048),
+            (vec![(20, 1), (100, 1)], 4096, 8192),
+            (vec![(20, 3)], 512, 1024),
+            (vec![(20, 2), (100, 3)], 512, 2048),
+            (vec![(20, 2), (u64::MAX, u64::MAX)], 512, 1024),
+        ] {
+            validate_run_alignment(&runs, cluster, 1024, bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn split_run_fixture_loses_second_record_without_preflight() {
+        let mut data = Vec::new();
+        for name in ["first.bin", "second.bin"] {
+            data.extend(record(&name.encode_utf16().collect::<Vec<_>>(), ROOT_RECORD));
+        }
+        let mut contiguous = data.clone();
+        assert_eq!(parse_batch(&mut contiguous, 1024, 6, 512).recs.len(), 2);
+        let mut record_no = 6;
+        let mut observed = Vec::new();
+        let mut names = String::new();
+        for run in [&data[..1536], &data[1536..]] {
+            let n = run.len() / 1024;
+            let mut parsed_bytes = run[..n * 1024].to_vec();
+            let batch = parse_batch(&mut parsed_bytes, 1024, record_no, 512);
+            observed.extend(batch.recs.iter().map(|r| r.record));
+            names.push_str(&batch.names);
+            record_no += n as u32;
+        }
+        assert_eq!(observed, [6], "old reader floors each run independently");
+        assert_eq!(names, "first.bin");
+        assert!(validate_run_alignment(&[(20, 3), (100, 1)], 512, 1024, 2048).is_err());
+    }
 
     #[test]
     fn decodes_runs_with_sparse() {

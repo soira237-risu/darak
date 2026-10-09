@@ -151,29 +151,52 @@ impl Doc {
         let first = *self.marks.iter().next().unwrap() as usize;
         for i in first.max(1)..n {
             let p = self.tree.nodes[i].parent as usize;
-            if self.mark_bits[i] == 0 && self.mark_bits[p] != 0 {
+            if !self.tree.nodes[i].has(darak_core::flags::REMOVED) && self.mark_bits[i] == 0 && self.mark_bits[p] != 0 {
                 self.mark_bits[i] = 2;
             }
         }
     }
 
-    /// 삭제가 끝난 노드를 트리에서 빼고 표시를 정리한다
+    /// 다른 문서의 결과는 NodeId를 읽기 전에 거부한다.
+    pub fn apply_removed_for(&mut self, doc_id: u64, removed: &[NodeId]) -> bool {
+        if self.id != doc_id || removed.iter().any(|&id| id as usize >= self.tree.len()) {
+            return false;
+        }
+        self.apply_removed(removed);
+        true
+    }
+
+    /// 삭제가 끝난 서브트리를 트리와 탐색·검색 상태에서 뺀다.
     pub fn apply_removed(&mut self, removed: &[NodeId]) {
+        let version = self.tree.version;
         for &id in removed {
-            self.tree.remove(id);
-            self.marks.remove(&id);
-            if self.selected.is_some_and(|s| self.tree.is_ancestor(id, s)) {
-                self.selected = None;
-            }
-            if self.tree.is_ancestor(id, self.focus) {
-                self.focus = self.tree.parent(id).unwrap_or(Tree::ROOT);
+            if (id as usize) < self.tree.len() {
+                self.tree.remove(id);
             }
         }
+        if version == self.tree.version {
+            return;
+        }
         let tree = &self.tree;
-        self.back.retain(|&b| !tree.node(b).has(darak_core::flags::REMOVED));
-        self.forward.retain(|&f| !tree.node(f).has(darak_core::flags::REMOVED));
+        let live = |id: NodeId| {
+            tree.nodes
+                .get(id as usize)
+                .is_some_and(|n| !n.has(darak_core::flags::REMOVED))
+        };
+        while !live(self.focus) {
+            self.focus = tree.parent(self.focus).unwrap_or(Tree::ROOT);
+        }
+        self.selected = self.selected.filter(|&id| live(id));
+        self.hovered = self.hovered.filter(|&id| live(id));
+        self.back.retain(|&id| live(id));
+        self.forward.retain(|&id| live(id));
+        self.marks.retain(|&id| live(id));
         self.rebuild_mark_bits();
-        self.search.applied = None; // 결과 다시 계산
+        self.search.applied = None;
+        self.search.result = None;
+        self.search.bits.clear();
+        self.search.error = None;
+        self.search.elapsed_ms = 0.0;
     }
 
     // ---- 검색 강조 ----
@@ -207,5 +230,132 @@ impl Doc {
 
     pub fn search_active(&self) -> bool {
         self.search.highlight && self.search.result.is_some() && !self.search.bits.is_empty()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use darak_core::{NO_NODE, Node, ScanMethod, flags};
+    use std::time::Duration;
+
+    pub(crate) fn node(
+        tree: &mut Tree,
+        name: &str,
+        parent: NodeId,
+        kind: Kind,
+        size: u64,
+        first: NodeId,
+        count: u32,
+    ) {
+        let name_off = tree.names.len() as u32;
+        tree.names.push_str(name);
+        tree.nodes.push(Node {
+            alloc: size,
+            logical: size,
+            name_off,
+            parent,
+            first_child: first,
+            child_count: count,
+            files: if kind == Kind::File { 1 } else { count },
+            mtime: 0,
+            name_len: name.len() as u16,
+            kind,
+            flags: 0,
+        });
+    }
+
+    pub(crate) fn doc(id: u64, tree: Tree) -> Doc {
+        Doc::new(
+            id,
+            tree,
+            ScanStats {
+                elapsed: Duration::ZERO,
+                files: 2,
+                dirs: 2,
+                errors: 0,
+                hardlink_dups: 0,
+                cancelled: false,
+                method: ScanMethod::Walk,
+                fallback_reason: None,
+            },
+        )
+    }
+
+    pub(crate) fn fixture(id: u64) -> Doc {
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 100, 1, 2);
+        node(&mut tree, "folder", 0, Kind::Dir, 60, 3, 1);
+        node(&mut tree, "sibling", 0, Kind::File, 40, 0, 0);
+        node(&mut tree, "child", 1, Kind::File, 60, 0, 0);
+        doc(id, tree)
+    }
+
+    #[test]
+    fn clears_removed_navigation_state() {
+        let mut doc = fixture(1);
+        doc.focus = 1;
+        doc.selected = Some(3);
+        doc.hovered = Some(3);
+        doc.back = vec![0, 1];
+        doc.forward = vec![1];
+        doc.toggle_mark(3).unwrap();
+        doc.search.applied = Some(("file:".into(), 0, SizeMode::Allocated, 0));
+        doc.search.result = Some(darak_core::search::search(
+            &doc.tree,
+            &darak_core::search::Query::parse("file:", 0).unwrap(),
+            SizeMode::Allocated,
+            Tree::ROOT,
+            100,
+        ));
+        doc.set_search_bits();
+        doc.apply_removed(&[1]);
+        assert_eq!(doc.focus, Tree::ROOT);
+        assert_eq!(doc.selected, None);
+        assert_eq!(doc.hovered, None);
+        assert_eq!(doc.back, vec![0]);
+        assert!(doc.forward.is_empty());
+        assert!(doc.marks.is_empty());
+        assert_eq!(doc.marked_size(SizeMode::Allocated), 0);
+        assert!(doc.search.applied.is_none());
+        assert!(doc.search.result.is_none());
+        assert!(doc.search.bits.is_empty());
+        assert!(doc.tree.node(3).has(flags::REMOVED));
+    }
+
+    fn unchanged(doc: &Doc) {
+        assert_eq!(doc.tree.node(0).alloc, 100);
+        assert_eq!(doc.tree.version, 0);
+        assert_eq!(doc.selected, Some(3));
+        assert_eq!(doc.marks.iter().copied().collect::<Vec<_>>(), vec![3]);
+        assert!(doc.tree.nodes.iter().all(|n| !n.has(flags::REMOVED)));
+    }
+
+    #[test]
+    fn rejects_foreign_document_results() {
+        let mut other = fixture(2);
+        other.selected = Some(3);
+        other.toggle_mark(3).unwrap();
+        assert!(!other.apply_removed_for(1, &[1]));
+        unchanged(&other);
+    }
+
+    #[test]
+    fn rejects_foreign_out_of_range_ids() {
+        let mut other = fixture(2);
+        other.selected = Some(3);
+        other.toggle_mark(3).unwrap();
+        assert!(!other.apply_removed_for(1, &[u32::MAX]));
+        unchanged(&other);
+        assert!(!other.apply_removed_for(2, &[1, u32::MAX]));
+        unchanged(&other);
+    }
+
+    #[test]
+    fn applies_matching_document_results() {
+        let mut doc = fixture(1);
+        assert!(doc.apply_removed_for(1, &[1]));
+        assert_eq!(doc.tree.node(0).alloc, 40);
+        assert!(doc.tree.node(1).has(flags::REMOVED));
     }
 }

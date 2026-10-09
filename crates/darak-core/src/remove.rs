@@ -3,7 +3,35 @@
 use std::io;
 
 use crate::sys::wide;
-use crate::tree::{Kind, NodeId, Tree};
+use crate::tree::{Kind, NodeId, Tree, flags};
+
+/// 보호 비교에만 쓰는 키. 실행 경로는 바꾸지 않는다.
+fn protection_key(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' || bytes[2] != b'\\' {
+        return None;
+    }
+    let tail = path[3..].trim_end_matches('\\');
+    if !tail.is_empty()
+        && tail.split('\\').any(|part| {
+            part.is_empty()
+                || matches!(part, "." | "..")
+                || part.ends_with(['.', ' '])
+                || part.chars().any(|c| {
+                    c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '/' | '|' | '?' | '*')
+                })
+        })
+    {
+        return None;
+    }
+    let key = if tail.is_empty() {
+        &path[..3]
+    } else {
+        path.trim_end_matches('\\')
+    };
+    Some(key.to_lowercase())
+}
 
 /// 이 노드를 지우면 안 되는 이유. 지워도 되면 None.
 pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
@@ -14,23 +42,51 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
     if n.kind == Kind::Link {
         return Some("junction/심볼릭 링크 (대상 폴더가 지워질 수 있음)");
     }
-    let path = tree.path(id);
-    let lower = path.to_lowercase();
-    let lower = lower.trim_end_matches('\\');
-    if lower.len() <= 3 {
+    let mut cur = Some(id);
+    while let Some(ancestor) = cur {
+        if tree.node(ancestor).has(flags::LOSSY_NAME) {
+            return Some("이름을 정확히 복원할 수 없는 항목 또는 상위 폴더");
+        }
+        cur = tree.parent(ancestor);
+    }
+    let Some(lower) = protection_key(&tree.path(id)) else {
+        return Some("삭제 보호를 확인할 수 없는 경로 (UNC/장치/상대 경로 등)");
+    };
+    if lower.len() == 3 {
         return Some("드라이브 루트");
     }
 
-    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()).to_lowercase();
-    let windir = std::env::var("WINDIR").unwrap_or_else(|_| format!("{sys_drive}\\windows")).to_lowercase();
-    let home = std::env::var("USERPROFILE").unwrap_or_default().to_lowercase();
+    let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let Some(sys_root) = protection_key(&format!("{}\\", sys_drive.trim_end_matches('\\'))) else {
+        return Some("시스템 경로의 삭제 보호를 확인할 수 없음");
+    };
+    let sys_drive = &sys_root[..2];
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| format!("{sys_drive}\\windows"));
+    let Some(windir) = protection_key(&windir) else {
+        return Some("시스템 경로의 삭제 보호를 확인할 수 없음");
+    };
+    let home = match std::env::var("USERPROFILE") {
+        Ok(home) if !home.is_empty() => match protection_key(&home) {
+            Some(home) => home,
+            None => return Some("사용자 경로의 삭제 보호를 확인할 수 없음"),
+        },
+        _ => String::new(),
+    };
 
-    let inside = |base: &str| !base.is_empty() && (lower == base || lower.starts_with(&format!("{base}\\")));
+    let inside =
+        |base: &str| !base.is_empty() && (lower == base || lower.starts_with(&format!("{base}\\")));
     if inside(&windir) {
         return Some("Windows 시스템 폴더");
     }
-    for name in ["system volume information", "$recycle.bin", "recovery", "boot", "$windows.~bt", "$windows.~ws"] {
-        if lower.len() > 3 && inside(&format!("{}\\{name}", &lower[..2])) {
+    for name in [
+        "system volume information",
+        "$recycle.bin",
+        "recovery",
+        "boot",
+        "$windows.~bt",
+        "$windows.~ws",
+    ] {
+        if inside(&format!("{}\\{name}", &lower[..2])) {
             return Some("시스템 보호 폴더");
         }
     }
@@ -49,13 +105,20 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
         format!("{home}\\desktop"),
         format!("{home}\\downloads"),
     ];
-    if exact.iter().any(|e| !e.is_empty() && lower == e) {
+    if exact.iter().any(|e| !e.is_empty() && lower == *e) {
         return Some("시스템/사용자 기본 폴더");
     }
     // 드라이브 바로 아래의 시스템 파일과 NTFS 메타 파일
-    if tree.parent(id) == Some(Tree::ROOT) && tree.name(Tree::ROOT).len() <= 3 {
+    if tree.parent(id) == Some(Tree::ROOT)
+        && protection_key(tree.name(Tree::ROOT)).is_some_and(|root| root.len() == 3)
+    {
         let name = tree.name(id).to_lowercase();
-        if name.starts_with('$') || matches!(name.as_str(), "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "dumpstack.log") {
+        if name.starts_with('$')
+            || matches!(
+                name.as_str(),
+                "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "dumpstack.log"
+            )
+        {
             return Some("시스템 파일");
         }
     }
@@ -64,6 +127,7 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
 
 #[repr(C)]
 #[allow(non_snake_case)]
+#[allow(clippy::upper_case_acronyms, reason = "Win32 ABI structure name")]
 struct SHFILEOPSTRUCTW {
     hwnd: *mut std::ffi::c_void,
     wFunc: u32,

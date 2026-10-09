@@ -93,6 +93,9 @@ impl App {
     }
 
     fn start_scan(&mut self, root: String) {
+        if self.delete_dialog.is_some() {
+            return;
+        }
         if let Some(s) = &self.scanning {
             s.progress.cancel();
         }
@@ -128,6 +131,24 @@ impl App {
             preview_layout: Layout::stable(),
             last_preview: Instant::now(),
         });
+    }
+
+    fn open_delete_review(&mut self) {
+        if self.scanning.is_some() || self.delete_dialog.is_some() {
+            return;
+        }
+        if let Some(doc) = &self.doc
+            && !doc.marks.is_empty()
+        {
+            self.delete_dialog = Some(Dialog {
+                doc_id: doc.id,
+                stage: Stage::Review {
+                    method: Method::Recycle,
+                    confirmed: false,
+                    error: None,
+                },
+            });
+        }
     }
 
     fn poll_scan(&mut self) {
@@ -227,8 +248,9 @@ impl eframe::App for App {
 impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
+        let mut review = false;
         ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
+            ui.add_enabled_ui(self.delete_dialog.is_none(), |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
                 let mut chosen = None;
                 for d in &self.drives {
                     let txt = format!(
@@ -245,12 +267,12 @@ impl App {
                 if let Some(r) = chosen {
                     self.start_scan(r);
                 }
-            });
+            }));
 
-            let edit = ui.add(egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
+            let edit = ui.add_enabled(self.delete_dialog.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
-            if ui.button("📁 폴더…").clicked()
+            if ui.add_enabled(self.delete_dialog.is_none(), egui::Button::new("📁 폴더…")).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.start_scan(dir.display().to_string());
                 }
@@ -258,7 +280,7 @@ impl App {
                 if ui.button("⏹ 중지").clicked() {
                     s.progress.cancel();
                 }
-            } else if ui.button("🔍 스캔").clicked() || enter {
+            } else if ui.add_enabled(self.delete_dialog.is_none(), egui::Button::new("🔍 스캔")).clicked() || enter {
                 self.start_scan(self.root_input.clone());
             }
 
@@ -324,8 +346,8 @@ impl App {
                 if !doc.marks.is_empty() {
                     ui.separator();
                     let txt = format!("🗑 표시 {}개 · {}  검토…", doc.marks.len(), human_size(doc.marked_size(self.mode)));
-                    if ui.add(egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 45))).clicked() {
-                        self.delete_dialog = Some(Dialog { stage: Stage::Review { method: Method::Recycle, confirmed: false } });
+                    if ui.add_enabled(self.scanning.is_none() && self.delete_dialog.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 45))).clicked() {
+                        review = true;
                     }
                     if ui.small_button("표시 모두 해제").clicked() {
                         doc.clear_marks();
@@ -333,6 +355,9 @@ impl App {
                 }
             }
         });
+        if review {
+            self.open_delete_review();
+        }
 
         if let Some(doc) = &mut self.doc {
             ui.add_space(2.0);
@@ -651,7 +676,7 @@ impl App {
         }
 
         if resp.clicked() {
-            doc.selected = hit.map(|it| it.node);
+            doc.selected = selectable_node(hit.as_ref());
         }
         if resp.double_clicked()
             && let Some(it) = hit
@@ -664,7 +689,7 @@ impl App {
             }
         }
         if resp.secondary_clicked() {
-            self.context_node = hit.filter(|it| !matches!(it.kind, ItemKind::Group { .. })).map(|it| it.node);
+            self.context_node = selectable_node(hit.as_ref());
             doc.selected = self.context_node;
         }
 
@@ -710,11 +735,17 @@ impl App {
     }
 
     fn delete_dialog_ui(&mut self, ctx: &egui::Context) {
-        let (Some(dlg), Some(doc)) = (&mut self.delete_dialog, &mut self.doc) else { return };
+        let Some(dlg) = &mut self.delete_dialog else { return };
         let mut removed = Vec::new();
-        let open = delete::show(ctx, dlg, doc, self.mode, &mut removed);
-        if !removed.is_empty() {
-            doc.apply_removed(&removed);
+        let open = delete::show(ctx, dlg, self.doc.as_mut(), self.mode, &mut removed);
+        if !removed.is_empty()
+            && let Some(doc) = &mut self.doc
+            && doc.apply_removed_for(dlg.doc_id, &removed)
+        {
+            self.layout.invalidate();
+            self.anim = None;
+            self.morph.reset();
+            self.context_node = None;
             self.drives = list_drives();
         }
         if !open {
@@ -741,7 +772,7 @@ impl App {
         if ctrl_f || (!ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Slash))) {
             self.focus_search = true;
         }
-        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() {
+        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() || self.scanning.is_some() {
             return;
         }
         let mut toggle = None;
@@ -779,6 +810,12 @@ impl App {
             None => {}
         }
     }
+}
+
+/// 묶음은 소유 폴더를 가리키지만 실제 선택 가능한 노드는 아니다.
+fn selectable_node(item: Option<&treemap::Item>) -> Option<NodeId> {
+    item.filter(|it| !matches!(it.kind, ItemKind::Group { .. }))
+        .map(|it| it.node)
 }
 
 /// 오른쪽 클릭 메뉴. 삭제 표시를 바꿔야 하면 true.
@@ -931,4 +968,328 @@ fn open_item(doc: &Doc, id: NodeId) {
 
 fn reveal_in_explorer(path: &str) {
     let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{path}\"")).spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::tests::{doc, fixture, node};
+    use darak_core::NO_NODE;
+
+    fn app(doc: Doc) -> App {
+        App {
+            drives: Vec::new(),
+            root_input: "C:\\Data".into(),
+            scanning: None,
+            doc: Some(doc),
+            error: None,
+            toast: None,
+            mode: SizeMode::Allocated,
+            layout: Layout::default(),
+            wheel_acc: 0.0,
+            context_node: None,
+            next_doc_id: 2,
+            elevated: false,
+            delete_dialog: None,
+            focus_search: false,
+            detail: Detail::default(),
+            anim: None,
+            last_focus: None,
+            morph: Morph::default(),
+            morph_until: None,
+        }
+    }
+
+    fn group_fixture() -> Doc {
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 11_000_000, 1, 1);
+        node(&mut tree, "owner", 0, Kind::Dir, 11_000_000, 2, 1001);
+        node(&mut tree, "large", 1, Kind::File, 10_000_000, 0, 0);
+        for i in 0..1000 {
+            node(&mut tree, &format!("small{i}"), 1, Kind::File, 1000, 0, 0);
+        }
+        doc(1, tree)
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>, time: f64) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.treemap_view(ui));
+            app.keyboard(ui.ctx());
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn group_click_then_delete_does_not_mark_owner() {
+        for key in [Key::Delete, Key::Space, Key::X] {
+            let ctx = egui::Context::default();
+            let mut app = app(group_fixture());
+            app.doc.as_mut().unwrap().selected = Some(2);
+            frame(&ctx, &mut app, vec![], 0.0);
+            let group = app
+                .layout
+                .items
+                .iter()
+                .find(|it| matches!(it.kind, ItemKind::Group { .. }))
+                .unwrap();
+            assert_eq!(group.node, 1);
+            let pos = group.rect.center();
+            frame(
+                &ctx,
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                0.1,
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                0.2,
+            );
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                0.3,
+            );
+            let doc = app.doc.as_ref().unwrap();
+            assert_eq!(
+                doc.selected, None,
+                "group click selected owner before {key:?}"
+            );
+            assert!(
+                doc.marks.is_empty(),
+                "group click marked owner with {key:?}"
+            );
+            assert_eq!(doc.marked_size(SizeMode::Allocated), 0);
+        }
+    }
+
+    fn click(ctx: &egui::Context, app: &mut App, pos: egui::Pos2, button: PointerButton) {
+        frame(
+            ctx,
+            app,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            0.1,
+        );
+        frame(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            0.2,
+        );
+    }
+
+    #[test]
+    fn excludes_groups_from_node_selection() {
+        let ctx = egui::Context::default();
+        let mut app = app(group_fixture());
+        app.doc.as_mut().unwrap().selected = Some(2);
+        frame(&ctx, &mut app, vec![], 0.0);
+        let group = app
+            .layout
+            .items
+            .iter()
+            .find(|it| matches!(it.kind, ItemKind::Group { .. }))
+            .unwrap();
+        assert_eq!(selectable_node(app.layout.hit(group.rect.center())), None);
+        for id in [1, 2] {
+            let item = app
+                .layout
+                .items
+                .iter()
+                .find(|it| it.node == id && !matches!(it.kind, ItemKind::Group { .. }))
+                .unwrap();
+            assert_eq!(selectable_node(Some(item)), Some(id));
+        }
+        let pos = group.rect.center();
+        click(&ctx, &mut app, pos, PointerButton::Secondary);
+        assert_eq!(app.context_node, None);
+        assert_eq!(app.doc.as_ref().unwrap().selected, None);
+    }
+
+    #[test]
+    fn real_file_and_folder_clicks_still_mark() {
+        for id in [1, 2] {
+            let ctx = egui::Context::default();
+            let mut app = app(group_fixture());
+            frame(&ctx, &mut app, vec![], 0.0);
+            let rect = app.layout.rect_of(id).unwrap();
+            let pos = if id == 1 {
+                egui::pos2(rect.center().x, rect.min.y + 8.0)
+            } else {
+                rect.center()
+            };
+            click(&ctx, &mut app, pos, PointerButton::Primary);
+            frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::Key {
+                    key: Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                0.3,
+            );
+            let doc = app.doc.as_ref().unwrap();
+            assert_eq!(doc.selected, Some(id));
+            assert_eq!(doc.marks.iter().copied().collect::<Vec<_>>(), vec![id]);
+            assert_eq!(
+                doc.marked_size(SizeMode::Allocated),
+                doc.tree.node(id).alloc
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_conflicting_operation_starts() {
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
+        let (_tx, rx) = mpsc::channel();
+        app.scanning = Some(Scanning {
+            root: "C:\\Data".into(),
+            progress: Arc::new(ScanProgress::default()),
+            rx,
+            started: Instant::now(),
+            used: None,
+            eta: None,
+            preview: None,
+            preview_version: 0,
+            preview_layout: Layout::stable(),
+            last_preview: Instant::now(),
+        });
+        let progress = app.scanning.as_ref().unwrap().progress.clone();
+        app.open_delete_review();
+        assert!(app.delete_dialog.is_none());
+        assert!(Arc::ptr_eq(
+            &progress,
+            &app.scanning.as_ref().unwrap().progress
+        ));
+        assert!(!progress.is_cancelled());
+        app.scanning = None;
+        app.open_delete_review();
+        assert_eq!(app.delete_dialog.as_ref().unwrap().doc_id, 1);
+        let original = app.root_input.clone();
+        app.start_scan("C:\\does-not-exist".into());
+        assert!(app.scanning.is_none());
+        assert_eq!(app.root_input, original);
+        let (_tx, rx) = mpsc::channel();
+        app.delete_dialog.as_mut().unwrap().stage = Stage::Running {
+            total: 1,
+            done: Arc::default(),
+            rx,
+        };
+        app.start_scan("C:\\does-not-exist".into());
+        assert!(app.scanning.is_none());
+        assert_eq!(app.root_input, original);
+        assert_eq!(app.doc.as_ref().unwrap().id, 1);
+    }
+
+    #[test]
+    fn handles_document_change_during_review() {
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
+        app.open_delete_review();
+        app.doc = Some(fixture(2));
+        let ctx = egui::Context::default();
+        app.delete_dialog_ui(&ctx);
+        assert!(app.delete_dialog.is_none());
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
+        assert!(app.doc.as_ref().unwrap().marks.is_empty());
+    }
+
+    #[test]
+    fn preserves_foreign_running_outcomes_without_reading_new_nodes() {
+        for no_doc in [false, true] {
+            let mut app = app(fixture(2));
+            let (tx, rx) = mpsc::channel();
+            tx.send(vec![delete::Outcome {
+                node: u32::MAX,
+                path: "C:\\original-source".into(),
+                size: 60,
+                error: None,
+            }])
+            .unwrap();
+            app.delete_dialog = Some(Dialog {
+                doc_id: 1,
+                stage: Stage::Running {
+                    total: 1,
+                    done: Arc::default(),
+                    rx,
+                },
+            });
+            if no_doc {
+                app.doc = None;
+            }
+            let ctx = egui::Context::default();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.delete_dialog_ui(ui.ctx())
+            });
+            output.textures_delta.clear();
+            let dlg = app.delete_dialog.as_ref().unwrap();
+            assert_eq!(dlg.doc_id, 1);
+            let Stage::Report { outcomes } = &dlg.stage else {
+                panic!("source outcome report missing")
+            };
+            assert_eq!(outcomes[0].path, "C:\\original-source");
+            assert_eq!(outcomes[0].node, u32::MAX);
+            if let Some(doc) = &app.doc {
+                assert_eq!(doc.id, 2);
+                assert_eq!(doc.tree.version, 0);
+                assert_eq!(doc.tree.node(0).alloc, 100);
+                assert!(doc.marks.is_empty());
+            }
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.delete_dialog_ui(ui.ctx())
+            });
+            output.textures_delta.clear();
+            assert!(matches!(
+                app.delete_dialog.as_ref().unwrap().stage,
+                Stage::Report { .. }
+            ));
+        }
+    }
 }

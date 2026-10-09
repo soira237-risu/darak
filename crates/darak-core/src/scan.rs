@@ -87,7 +87,7 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
     let display = normalize_root(root);
     let mut fallback_reason = None;
     if opts.use_mft && is_drive_root(&display) {
-        match crate::mft::scan_volume(&display, progress) {
+        match crate::mft::scan_volume(&display, progress, opts.dedupe_hardlinks) {
             Ok((tree, stats)) => return Ok(ScanResult { tree, stats }),
             Err(e) => {
                 fallback_reason = Some(if e.kind() == io::ErrorKind::PermissionDenied {
@@ -170,13 +170,16 @@ pub fn relaunch_as_admin(args: &str) -> bool {
 /// `c:` → `C:\`, 끝의 `\` 정리
 pub fn normalize_root(root: &str) -> String {
     let mut s = root.trim().replace('/', "\\");
-    if s.len() == 2 && s.as_bytes()[1] == b':' {
-        s.push('\\');
+    let drive_offset = if s.starts_with(r"\\?\") { 4 } else { 0 };
+    let drive = s.as_bytes().get(drive_offset..).is_some_and(|b| b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
+    if drive {
+        if s.len() == drive_offset + 2 {
+            s.push('\\');
+        }
+        s[drive_offset..drive_offset + 1].make_ascii_uppercase();
     }
-    if s.len() >= 2 && s.as_bytes()[1] == b':' {
-        s[..1].make_ascii_uppercase();
-    }
-    while s.len() > 3 && s.ends_with('\\') {
+    let min_len = if drive { drive_offset + 3 } else { 3 };
+    while s.len() > min_len && s.ends_with('\\') {
         s.pop();
     }
     s
@@ -335,7 +338,13 @@ fn push_entry(info: &FILE_ID_BOTH_DIR_INFO, name: &[u16], d: &mut DirBuf, subdir
             d.files.push(e);
         } else {
             e.kind = Kind::Dir;
-            subdirs.push(e);
+            if e.flags & flags::LOSSY_NAME != 0 {
+                ctx.progress.errors.fetch_add(1, Relaxed);
+                ctx.progress.dirs.fetch_add(1, Relaxed);
+                d.dirs.push((e, DirBuf { denied: true, ..DirBuf::default() }));
+            } else {
+                subdirs.push(e);
+            }
         }
         return;
     }
@@ -393,7 +402,7 @@ fn scan_dir(path: Vec<u16>, name: &str, live_parent: u32, depth: u16, ctx: &Ctx)
         d.logical += c.logical;
         d.file_count += c.file_count;
     }
-    d.dirs = subdirs.into_iter().zip(children).collect();
+    d.dirs.extend(subdirs.into_iter().zip(children));
     d
 }
 
@@ -493,7 +502,7 @@ impl LiveTree {
             if d.direct_files > 0 {
                 order.push((d.direct_alloc, None));
             }
-            order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+            order.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
             let first = tree.nodes.len() as u32;
             tree.nodes[node_id as usize].first_child = first;
             tree.nodes[node_id as usize].child_count = order.len() as u32;
@@ -574,7 +583,7 @@ fn build_tree(root_name: &str, root: DirBuf) -> Tree {
         order.clear();
         order.extend(d.files.iter().enumerate().map(|(i, e)| (e.alloc, i as u32)));
         order.extend(d.dirs.iter().enumerate().map(|(i, (_, b))| (b.alloc, (nf + i) as u32)));
-        order.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        order.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
 
         let first = tree.nodes.len() as u32;
         tree.nodes[id as usize].first_child = first;
@@ -685,4 +694,34 @@ pub fn process_memory() -> (usize, usize) {
     let mut c = PROCESS_MEMORY_COUNTERS { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
     unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
     (c.WorkingSetSize, c.PeakWorkingSetSize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_extended_drive_root() {
+        for (input, expected) in [("c:", "C:\\"), ("c:\\", "C:\\"), ("c:\\\\", "C:\\"),
+            (r"\\?\c:\", r"\\?\C:\"), (r"\\?\c:\\", r"\\?\C:\"), (r"\\?\c:\folder\", r"\\?\C:\folder")] {
+            assert_eq!(normalize_root(input), expected);
+        }
+    }
+
+    #[test]
+    fn does_not_recurse_into_lossy_directory() {
+        let progress = ScanProgress::default();
+        let ctx = Ctx { progress: &progress, dedupe: None, hardlink_dups: AtomicU64::new(0) };
+        let mut d = DirBuf::default();
+        let mut subdirs = Vec::new();
+        let info = FILE_ID_BOTH_DIR_INFO { FileAttributes: FILE_ATTRIBUTE_DIRECTORY, ..unsafe { std::mem::zeroed() } };
+        push_entry(&info, &[0xD800], &mut d, &mut subdirs, &ctx);
+        assert!(subdirs.is_empty(), "lossy directory must not be reconstructed and opened");
+        assert_eq!(d.dirs.len(), 1);
+        assert!(d.dirs[0].1.denied);
+        assert_eq!(progress.errors.load(Relaxed), 1);
+        let tree = build_tree("C:\\", d);
+        assert_eq!(tree.node(1).flags & (flags::LOSSY_NAME | flags::DENIED), flags::LOSSY_NAME | flags::DENIED);
+        assert_eq!(tree.node(1).child_count, 0);
+    }
 }

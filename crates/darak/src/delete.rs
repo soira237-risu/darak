@@ -31,23 +31,28 @@ pub struct Outcome {
 }
 
 pub enum Stage {
-    Review { method: Method, confirmed: bool },
+    Review { method: Method, confirmed: bool, error: Option<String> },
     Running { total: usize, done: Arc<AtomicUsize>, rx: mpsc::Receiver<Vec<Outcome>> },
     Report { outcomes: Vec<Outcome> },
 }
 
 pub struct Dialog {
+    pub doc_id: u64,
     pub stage: Stage,
 }
 
 /// 창이 닫혀야 하면 false. 삭제된 노드는 `removed`에 넣는다.
-pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode, removed: &mut Vec<NodeId>) -> bool {
+pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mode: SizeMode, removed: &mut Vec<NodeId>) -> bool {
+    if matches!(dlg.stage, Stage::Review { .. }) && doc.as_ref().is_none_or(|doc| doc.id != dlg.doc_id) {
+        return false;
+    }
     let mut open = true;
     let mut next: Option<Stage> = None;
     let modal = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
         ui.set_width(640.0);
         match &mut dlg.stage {
-            Stage::Review { method, confirmed } => {
+            Stage::Review { method, confirmed, error } => {
+                let doc = doc.as_mut().expect("review document identity checked");
                 let items: Vec<NodeId> = top_level_marks(&doc.tree, &doc.marks.iter().copied().collect::<Vec<_>>());
                 let total: u64 = items.iter().map(|&i| doc.tree.node(i).size(mode)).sum();
                 let files: u64 = items.iter().map(|&i| doc.tree.node(i).files as u64).sum();
@@ -71,14 +76,20 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode
                         });
                     }
                 });
-                if let Some(u) = unmark {
-                    let _ = doc.toggle_mark(u);
+                if let Some(u) = unmark
+                    && doc.toggle_mark(u).is_ok() {
+                    *error = None;
                 }
                 ui.separator();
-                ui.radio_value(method, Method::Recycle, "휴지통으로 이동 (되돌릴 수 있음)");
-                ui.radio_value(method, Method::Permanent, "영구 삭제 (되돌릴 수 없음)");
-                if *method == Method::Permanent {
-                    ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(Color32::from_rgb(230, 90, 80)));
+                if ui.radio_value(method, Method::Recycle, "휴지통으로 이동 (되돌릴 수 있음)").changed() {
+                    *error = None;
+                }
+                if ui.radio_value(method, Method::Permanent, "영구 삭제 (되돌릴 수 없음)").changed() {
+                    *error = None;
+                }
+                if *method == Method::Permanent
+                    && ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(Color32::from_rgb(230, 90, 80))).changed() {
+                    *error = None;
                 }
                 ui.add_space(6.0);
                 let any_protected = items.iter().any(|&i| protected_reason(&doc.tree, i).is_some());
@@ -90,19 +101,18 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode
                     };
                     let btn = egui::Button::new(RichText::new(label).strong()).fill(Color32::from_rgb(170, 50, 45));
                     if ui.add_enabled(can_run, btn).clicked() {
-                        let jobs: Vec<Item> = items
-                            .iter()
-                            .map(|&id| {
-                                let n = doc.tree.node(id);
-                                Item { node: id, path: doc.tree.path(id), is_dir: n.kind == Kind::Dir, size: n.size(mode) }
-                            })
-                            .collect();
-                        next = Some(start(jobs, *method));
+                        match build_items(doc, &items, mode) {
+                            Ok(jobs) => next = Some(start(jobs, *method)),
+                            Err(message) => *error = Some(message),
+                        }
                     }
                     if ui.button("취소").clicked() {
                         open = false;
                     }
                 });
+                if let Some(message) = error.as_deref() {
+                    ui.colored_label(Color32::from_rgb(230, 90, 80), message);
+                }
             }
             Stage::Running { total, done, rx } => {
                 ui.heading("삭제 중…");
@@ -144,6 +154,30 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, doc: &mut Doc, mode: SizeMode
     open
 }
 
+/// 실제 파일 작업 직전에 목록 전체의 보호 정책을 다시 검사한다.
+fn build_items(doc: &Doc, ids: &[NodeId], mode: SizeMode) -> Result<Vec<Item>, String> {
+    ids.iter()
+        .map(|&id| {
+            if id as usize >= doc.tree.len() {
+                return Err("삭제할 항목이 현재 문서에 없습니다".into());
+            }
+            if doc.tree.node(id).has(darak_core::flags::REMOVED) {
+                return Err("이미 삭제된 항목입니다".into());
+            }
+            if let Some(reason) = protected_reason(&doc.tree, id) {
+                return Err(format!("보호된 항목: {reason}"));
+            }
+            let n = doc.tree.node(id);
+            Ok(Item {
+                node: id,
+                path: doc.tree.path(id),
+                is_dir: n.kind == Kind::Dir,
+                size: n.size(mode),
+            })
+        })
+        .collect()
+}
+
 fn start(items: Vec<Item>, method: Method) -> Stage {
     let total = items.len();
     let done = Arc::new(AtomicUsize::new(0));
@@ -164,4 +198,138 @@ fn start(items: Vec<Item>, method: Method) -> Stage {
         });
     }
     Stage::Running { total, done, rx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doc::tests::fixture;
+    use darak_core::Tree;
+
+    const REVIEW_ERROR: &str = "보호된 항목: 테스트";
+
+    fn review_dialog(method: Method) -> Dialog {
+        Dialog {
+            doc_id: 1,
+            stage: Stage::Review {
+                method,
+                confirmed: false,
+                error: Some(REVIEW_ERROR.into()),
+            },
+        }
+    }
+
+    fn render_review_frame(
+        ctx: &egui::Context,
+        dlg: &mut Dialog,
+        doc: &mut Doc,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut removed = Vec::new();
+        let mut output = ctx.run_ui(input, |ui| {
+            assert!(show(ui.ctx(), dlg, Some(doc), SizeMode::Allocated, &mut removed));
+        });
+        output.textures_delta.clear();
+        assert!(removed.is_empty());
+        output
+    }
+
+    fn shape_has_text(shape: &egui::epaint::Shape, text: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(shape) => shape.galley.text().contains(text),
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| shape_has_text(shape, text)),
+            _ => false,
+        }
+    }
+
+    fn text_center(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(shape.pos + shape.galley.size() * 0.5)
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_center(shape, text)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn review_error_survives_idle_frames() {
+        let ctx = egui::Context::default();
+        let mut doc = fixture(1);
+        doc.toggle_mark(3).unwrap();
+        let mut dlg = review_dialog(Method::Recycle);
+        for frame in 0..4 {
+            let output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], frame as f64 * 0.1);
+            if frame >= 2 {
+                assert!(output.shapes.iter().any(|shape| shape_has_text(&shape.shape, REVIEW_ERROR)));
+                assert!(matches!(&dlg.stage, Stage::Review { error: Some(error), .. } if error == REVIEW_ERROR));
+            }
+        }
+    }
+
+    #[test]
+    fn review_changes_clear_error() {
+        for (method, label) in [
+            (Method::Recycle, "영구 삭제 (되돌릴 수 없음)"),
+            (Method::Permanent, "휴지통으로 이동 (되돌릴 수 있음)"),
+            (Method::Permanent, "되돌릴 수 없다는 것을 이해했습니다"),
+            (Method::Recycle, "✖"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut doc = fixture(1);
+            doc.toggle_mark(3).unwrap();
+            let mut dlg = review_dialog(method);
+            let mut output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], 0.0);
+            for frame in 1..4 {
+                output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], frame as f64 * 0.1);
+            }
+            let pos = output.shapes.iter().find_map(|shape| text_center(&shape.shape, label))
+                .unwrap_or_else(|| panic!("review control missing: {label}"));
+            for (time, pressed) in [(0.4, true), (0.5, false)] {
+                render_review_frame(&ctx, &mut dlg, &mut doc, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ], time);
+            }
+            let output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], 0.6);
+            assert!(matches!(&dlg.stage, Stage::Review { error: None, .. }), "stale error after {label}");
+            assert!(!output.shapes.iter().any(|shape| shape_has_text(&shape.shape, REVIEW_ERROR)));
+            if label == "✖" {
+                assert!(doc.marks.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn refuses_protected_jobs() {
+        let mut doc = fixture(1);
+        assert_eq!(
+            build_items(&doc, &[2, 3], SizeMode::Allocated)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(build_items(&doc, &[2, Tree::ROOT], SizeMode::Allocated).is_err());
+        assert!(build_items(&doc, &[2, u32::MAX], SizeMode::Allocated).is_err());
+        doc.tree.nodes[1].flags |= darak_core::flags::LOSSY_NAME;
+        assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
+        doc.tree.nodes[1].flags &= !darak_core::flags::LOSSY_NAME;
+        doc.tree.nodes[3].flags |= darak_core::flags::REMOVED;
+        assert!(build_items(&doc, &[2, 3], SizeMode::Allocated).is_err());
+    }
 }

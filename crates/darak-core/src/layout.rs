@@ -99,8 +99,8 @@ fn run(values: &[f64], rect: Rect, out: &mut Vec<Rect>, fixed: Option<&[usize]>,
             // 왼쪽에 세로 열 하나
             let cw = if last { w } else { (sum / h).min(w) };
             let mut yy = y;
-            for k in i..j {
-                let hk = if k + 1 == j { y + h - yy } else { values[k] * scale / cw };
+            for (offset, value) in values[i..j].iter().enumerate() {
+                let hk = if i + offset + 1 == j { y + h - yy } else { value * scale / cw };
                 out.push(Rect::new(x as f32, yy as f32, cw as f32, hk as f32));
                 yy += hk;
             }
@@ -110,8 +110,8 @@ fn run(values: &[f64], rect: Rect, out: &mut Vec<Rect>, fixed: Option<&[usize]>,
             // 위쪽에 가로 행 하나
             let rh = if last { h } else { (sum / w).min(h) };
             let mut xx = x;
-            for k in i..j {
-                let wk = if k + 1 == j { x + w - xx } else { values[k] * scale / rh };
+            for (offset, value) in values[i..j].iter().enumerate() {
+                let wk = if i + offset + 1 == j { x + w - xx } else { value * scale / rh };
                 out.push(Rect::new(xx as f32, y as f32, wk as f32, rh as f32));
                 xx += wk;
             }

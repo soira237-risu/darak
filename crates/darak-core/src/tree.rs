@@ -176,7 +176,7 @@ impl Tree {
         self.nodes.capacity() * std::mem::size_of::<Node>() + self.names.capacity()
     }
 
-    /// 노드를 트리에서 뺀다. 조상의 크기와 파일 수를 줄인다. (자식 구간은 그대로 두고 REMOVED로 표시)
+    /// 서브트리 전체를 REMOVED로 표시하고 값을 0으로 만든다. 조상 합계는 한 번 차감하며 자식 구간은 유지한다.
     pub fn remove(&mut self, id: NodeId) {
         if id == Self::ROOT || self.node(id).has(flags::REMOVED) {
             return;
@@ -185,7 +185,6 @@ impl Tree {
             let n = self.node(id);
             (n.alloc, n.logical, n.files)
         };
-        self.nodes[id as usize].flags |= flags::REMOVED;
         let mut cur = self.node(id).parent;
         while cur != NO_NODE {
             let p = &mut self.nodes[cur as usize];
@@ -193,6 +192,15 @@ impl Tree {
             p.logical = p.logical.saturating_sub(logical);
             p.files = p.files.saturating_sub(files);
             cur = p.parent;
+        }
+        let mut stack = vec![id];
+        while let Some(current) = stack.pop() {
+            stack.extend(self.children(current));
+            let n = &mut self.nodes[current as usize];
+            n.flags |= flags::REMOVED;
+            n.alloc = 0;
+            n.logical = 0;
+            n.files = 0;
         }
         self.version += 1;
     }
