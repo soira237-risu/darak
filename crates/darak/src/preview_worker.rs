@@ -1,4 +1,15 @@
 //! One active capture/build, one latest request, and one completed preview.
+//!
+//! Publication requires the active scan ID and epoch plus a version newer than
+//! the last published packet; cancelled or superseded builds are discarded.
+//! Capture copies live data under a non-blocking scanner lock, then builds the
+//! tree outside that lock with cancellation checks. The active progress lease
+//! is dropped before publication/idle notification; the completed packet owns
+//! a tree rather than the scan progress. Replaced slots are dropped and wakers
+//! are called outside the mailbox lock.
+//!
+//! `scan_cancel_releases_active_and_pending_progress` and
+//! `waker_runs_after_publication_outside_mailbox_lock` pin these boundaries.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};

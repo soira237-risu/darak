@@ -1,4 +1,17 @@
 //! One cancellable search, one latest request, and one completed result.
+//!
+//! Requests are bounded to one active lease and one replaceable pending lease;
+//! the completion slot carries IDs/highlights, never an `Arc<Tree>`. Advancing
+//! the epoch cancels obsolete work before a newer request can publish.
+//! Displaced pending leases are dropped outside the mailbox lock; `retiring`
+//! counts those drops until they finish. A `Released` fence is published only
+//! when active/pending leases are gone and `retiring == 0`, after dropping the
+//! worker-owned tree references. External owners may still make mutation Busy.
+//! Publication precedes the waker call, which always runs outside the lock.
+//!
+//! These boundaries are pinned by `release_waits_for_active_and_pending_leases`,
+//! `failure_and_fence_wait_for_a_displaced_lease_drop`, and
+//! `worker_failure_releases_all_tree_leases` below.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
