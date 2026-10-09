@@ -171,10 +171,10 @@ impl Doc {
         let version = self.tree.version;
         for &id in removed {
             if (id as usize) < self.tree.len() {
-            self.tree.remove(id);
+                self.tree.remove(id);
             }
         }
-            if version == self.tree.version {
+        if version == self.tree.version {
             return;
         }
         let tree = &self.tree;

@@ -31,7 +31,7 @@ pub struct Outcome {
 }
 
 pub enum Stage {
-    Review { method: Method, confirmed: bool },
+    Review { method: Method, confirmed: bool, error: Option<String> },
     Running { total: usize, done: Arc<AtomicUsize>, rx: mpsc::Receiver<Vec<Outcome>> },
     Report { outcomes: Vec<Outcome> },
 }
@@ -51,7 +51,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
     let modal = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
         ui.set_width(640.0);
         match &mut dlg.stage {
-            Stage::Review { method, confirmed } => {
+            Stage::Review { method, confirmed, error } => {
                 let doc = doc.as_mut().expect("review document identity checked");
                 let items: Vec<NodeId> = top_level_marks(&doc.tree, &doc.marks.iter().copied().collect::<Vec<_>>());
                 let total: u64 = items.iter().map(|&i| doc.tree.node(i).size(mode)).sum();
@@ -76,14 +76,20 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                         });
                     }
                 });
-                if let Some(u) = unmark {
-                    let _ = doc.toggle_mark(u);
+                if let Some(u) = unmark
+                    && doc.toggle_mark(u).is_ok() {
+                    *error = None;
                 }
                 ui.separator();
-                ui.radio_value(method, Method::Recycle, "휴지통으로 이동 (되돌릴 수 있음)");
-                ui.radio_value(method, Method::Permanent, "영구 삭제 (되돌릴 수 없음)");
-                if *method == Method::Permanent {
-                    ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(Color32::from_rgb(230, 90, 80)));
+                if ui.radio_value(method, Method::Recycle, "휴지통으로 이동 (되돌릴 수 있음)").changed() {
+                    *error = None;
+                }
+                if ui.radio_value(method, Method::Permanent, "영구 삭제 (되돌릴 수 없음)").changed() {
+                    *error = None;
+                }
+                if *method == Method::Permanent
+                    && ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(Color32::from_rgb(230, 90, 80))).changed() {
+                    *error = None;
                 }
                 ui.add_space(6.0);
                 let any_protected = items.iter().any(|&i| protected_reason(&doc.tree, i).is_some());
@@ -97,13 +103,16 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     if ui.add_enabled(can_run, btn).clicked() {
                         match build_items(doc, &items, mode) {
                             Ok(jobs) => next = Some(start(jobs, *method)),
-                            Err(error) => { ui.colored_label(Color32::from_rgb(230, 90, 80), error); }
+                            Err(message) => *error = Some(message),
                         }
                     }
                     if ui.button("취소").clicked() {
                         open = false;
                     }
                 });
+                if let Some(message) = error.as_deref() {
+                    ui.colored_label(Color32::from_rgb(230, 90, 80), message);
+                }
             }
             Stage::Running { total, done, rx } => {
                 ui.heading("삭제 중…");
@@ -196,6 +205,115 @@ mod tests {
     use super::*;
     use crate::doc::tests::fixture;
     use darak_core::Tree;
+
+    const REVIEW_ERROR: &str = "보호된 항목: 테스트";
+
+    fn review_dialog(method: Method) -> Dialog {
+        Dialog {
+            doc_id: 1,
+            stage: Stage::Review {
+                method,
+                confirmed: false,
+                error: Some(REVIEW_ERROR.into()),
+            },
+        }
+    }
+
+    fn render_review_frame(
+        ctx: &egui::Context,
+        dlg: &mut Dialog,
+        doc: &mut Doc,
+        events: Vec<egui::Event>,
+        time: f64,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 800.0),
+            )),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut removed = Vec::new();
+        let mut output = ctx.run_ui(input, |ui| {
+            assert!(show(ui.ctx(), dlg, Some(doc), SizeMode::Allocated, &mut removed));
+        });
+        output.textures_delta.clear();
+        assert!(removed.is_empty());
+        output
+    }
+
+    fn shape_has_text(shape: &egui::epaint::Shape, text: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(shape) => shape.galley.text().contains(text),
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| shape_has_text(shape, text)),
+            _ => false,
+        }
+    }
+
+    fn text_center(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::epaint::Shape::Text(shape) if shape.galley.text() == text => {
+                Some(shape.pos + shape.galley.size() * 0.5)
+            }
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|shape| text_center(shape, text)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn review_error_survives_idle_frames() {
+        let ctx = egui::Context::default();
+        let mut doc = fixture(1);
+        doc.toggle_mark(3).unwrap();
+        let mut dlg = review_dialog(Method::Recycle);
+        for frame in 0..4 {
+            let output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], frame as f64 * 0.1);
+            if frame >= 2 {
+                assert!(output.shapes.iter().any(|shape| shape_has_text(&shape.shape, REVIEW_ERROR)));
+                assert!(matches!(&dlg.stage, Stage::Review { error: Some(error), .. } if error == REVIEW_ERROR));
+            }
+        }
+    }
+
+    #[test]
+    fn review_changes_clear_error() {
+        for (method, label) in [
+            (Method::Recycle, "영구 삭제 (되돌릴 수 없음)"),
+            (Method::Permanent, "휴지통으로 이동 (되돌릴 수 있음)"),
+            (Method::Permanent, "되돌릴 수 없다는 것을 이해했습니다"),
+            (Method::Recycle, "✖"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut doc = fixture(1);
+            doc.toggle_mark(3).unwrap();
+            let mut dlg = review_dialog(method);
+            let mut output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], 0.0);
+            for frame in 1..4 {
+                output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], frame as f64 * 0.1);
+            }
+            let pos = output.shapes.iter().find_map(|shape| text_center(&shape.shape, label))
+                .unwrap_or_else(|| panic!("review control missing: {label}"));
+            for (time, pressed) in [(0.4, true), (0.5, false)] {
+                render_review_frame(&ctx, &mut dlg, &mut doc, vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ], time);
+            }
+            let output = render_review_frame(&ctx, &mut dlg, &mut doc, vec![], 0.6);
+            assert!(matches!(&dlg.stage, Stage::Review { error: None, .. }), "stale error after {label}");
+            assert!(!output.shapes.iter().any(|shape| shape_has_text(&shape.shape, REVIEW_ERROR)));
+            if label == "✖" {
+                assert!(doc.marks.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn refuses_protected_jobs() {
