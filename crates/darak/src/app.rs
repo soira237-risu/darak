@@ -249,6 +249,7 @@ impl App {
                 stage: Stage::Review {
                     method: Method::Recycle,
                     confirmed: false,
+                    error: None,
                 },
             });
         }
