@@ -80,7 +80,7 @@ pub enum SizeMode {
     Logical,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Tree {
     pub nodes: Vec<Node>,
     pub names: String,

@@ -188,6 +188,11 @@ impl Doc {
         self.apply_removed(removed)
     }
 
+    /// 다른 소유자가 트리를 계속 붙잡고 있을 때만 쓴다. 트리를 복제해 이 문서만 소유한다.
+    pub fn detach_tree(&mut self) {
+        Arc::make_mut(&mut self.tree);
+    }
+
     pub fn apply_removed(&mut self, removed: &[NodeId]) -> RemovalApply {
         if removed.iter().any(|&id| id as usize >= self.tree.len()) {
             return RemovalApply::Rejected;

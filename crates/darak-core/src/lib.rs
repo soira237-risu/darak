@@ -9,6 +9,7 @@ pub mod mft;
 pub mod remove;
 pub mod scan;
 pub mod search;
+mod sort;
 pub mod sys;
 pub mod tree;
 
