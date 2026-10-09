@@ -419,6 +419,7 @@ pub struct LiveTree {
     pub version: u64,
 }
 
+#[derive(Clone)]
 pub struct LiveDir {
     pub parent: u32,
     pub depth: u16,
@@ -432,6 +433,16 @@ pub struct LiveDir {
     pub direct_logical: u64,
     pub direct_files: u64,
 }
+
+/// 잠금 안에서 캡처한 미리 보기 데이터와 그 데이터의 버전.
+/// 트리 구성은 잠금을 풀고 worker에서 수행한다.
+pub struct LiveSnapshot {
+    dirs: Vec<LiveDir>,
+    version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreviewCancelled;
 
 impl LiveTree {
     /// 디렉터리 하나를 다 읽었을 때 호출. 이 디렉터리를 가리키는 인덱스를 돌려준다.
@@ -464,14 +475,38 @@ impl LiveTree {
         idx
     }
 
-    /// 지금까지의 결과를 트리로 만든다. 폴더마다 바로 안의 파일은 "파일 n개" 하나로 묶는다.
+    /// 데이터와 버전을 같은 live 잠금 범위에서 캡처한다. 비용은 O(dirs + names)다.
+    pub fn capture(&self) -> LiveSnapshot {
+        LiveSnapshot { dirs: self.dirs.clone(), version: self.version }
+    }
+
+    /// 기존 동기 미리 보기 API. 비동기 호출자는 capture 후 잠금 밖에서 build한다.
     pub fn snapshot(&self) -> Option<Tree> {
+        self.capture().build_with_cancel(&|| false).expect("never cancelled")
+    }
+}
+
+impl LiveSnapshot {
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// 폴더마다 바로 안의 파일을 "파일 n개" 하나로 묶고 BFS 트리를 만든다.
+    /// 취소되면 중간 트리는 게시하지 않고 버린다.
+    pub fn build_with_cancel(self, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<Option<Tree>, PreviewCancelled> {
+        preview_check(cancelled)?;
         let n = self.dirs.len();
         if n == 0 {
-            return None;
+            return Ok(None);
         }
-        let mut kids: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut work = 0;
+        let mut kids: Vec<Vec<u32>> = Vec::with_capacity(n);
+        for _ in 0..n {
+            preview_step(&mut work, cancelled)?;
+            kids.push(Vec::new());
+        }
         for (i, d) in self.dirs.iter().enumerate().skip(1) {
+            preview_step(&mut work, cancelled)?;
             kids[d.parent as usize].push(i as u32);
         }
         let mut tree = Tree::default();
@@ -493,20 +528,25 @@ impl LiveTree {
         let mut queue = VecDeque::from([(0u32, 0u32)]);
         let mut order: Vec<(u64, Option<u32>)> = Vec::new();
         while let Some((node_id, li)) = queue.pop_front() {
+            preview_step(&mut work, cancelled)?;
             let d = &self.dirs[li as usize];
             if d.depth >= LIVE_DEPTH {
                 continue; // 더 깊은 내용은 크기에만 들어 있다
             }
             order.clear();
-            order.extend(kids[li as usize].iter().map(|&c| (self.dirs[c as usize].alloc, Some(c))));
+            for &c in &kids[li as usize] {
+                preview_step(&mut work, cancelled)?;
+                order.push((self.dirs[c as usize].alloc, Some(c)));
+            }
             if d.direct_files > 0 {
                 order.push((d.direct_alloc, None));
             }
-            order.sort_unstable_by_key(|e| std::cmp::Reverse(e.0));
+            preview_sort_by(&mut order, |a, b| b.0.cmp(&a.0), cancelled)?;
             let first = tree.nodes.len() as u32;
             tree.nodes[node_id as usize].first_child = first;
             tree.nodes[node_id as usize].child_count = order.len() as u32;
             for &(_, c) in &order {
+                preview_step(&mut work, cancelled)?;
                 let id = tree.nodes.len() as u32;
                 let name_off = tree.names.len() as u32;
                 let node = match c {
@@ -549,9 +589,65 @@ impl LiveTree {
                 tree.nodes.push(node);
             }
         }
+        preview_check(cancelled)?;
         tree.version = self.version;
-        Some(tree)
+        Ok(Some(tree))
     }
+}
+
+fn preview_check(cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), PreviewCancelled> {
+    if cancelled() { Err(PreviewCancelled) } else { Ok(()) }
+}
+
+fn preview_checkpoint(i: usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), PreviewCancelled> {
+    if i.is_multiple_of(256) { preview_check(cancelled)?; }
+    Ok(())
+}
+
+fn preview_step(work: &mut usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), PreviewCancelled> {
+    preview_checkpoint(*work, cancelled)?;
+    *work = work.wrapping_add(1);
+    Ok(())
+}
+
+/// Sort bounded runs, then merge with cancellation checks every 256 emitted items.
+/// Only a single <=4,096-item run sort can execute between cancellation checks.
+fn preview_sort_by<T: Copy>(
+    values: &mut Vec<T>,
+    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(), PreviewCancelled> {
+    const RUN: usize = 4_096;
+    preview_check(cancelled)?;
+    for run in values.chunks_mut(RUN) {
+        run.sort_unstable_by(&mut compare);
+        preview_check(cancelled)?;
+    }
+    if values.len() <= RUN { return Ok(()); }
+    let mut scratch = Vec::with_capacity(values.len());
+    let mut width = RUN;
+    while width < values.len() {
+        scratch.clear();
+        for start in (0..values.len()).step_by(width.saturating_mul(2)) {
+            let mid = (start + width).min(values.len());
+            let end = mid.saturating_add(width).min(values.len());
+            let (mut left, mut right) = (start, mid);
+            while left < mid || right < end {
+                preview_checkpoint(scratch.len(), cancelled)?;
+                if right == end || (left < mid && compare(&values[left], &values[right]).is_le()) {
+                    scratch.push(values[left]);
+                    left += 1;
+                } else {
+                    scratch.push(values[right]);
+                    right += 1;
+                }
+            }
+        }
+        std::mem::swap(values, &mut scratch);
+        width = width.saturating_mul(2);
+        preview_check(cancelled)?;
+    }
+    Ok(())
 }
 
 /// DirBuf 트리를 BFS로 아레나에 펼친다. 자식은 할당 크기 내림차순.
@@ -699,6 +795,155 @@ pub fn process_memory() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_bytes(alloc: u64, logical: u64, files: u64) -> DirBuf {
+        DirBuf { alloc, logical, file_count: files, ..Default::default() }
+    }
+
+    #[test]
+    fn snapshot_preserves_synthetic_groups() {
+        assert!(LiveTree::default().snapshot().is_none());
+        let mut live = LiveTree::default();
+        let root = live.add(NO_NODE, 0, "root", &live_bytes(10, 7, 2));
+        let big = live.add(root, 1, "big", &live_bytes(40, 30, 3));
+        live.add(root, 1, "small", &live_bytes(20, 12, 1));
+        let mut parent = big;
+        for depth in 2..=LIVE_DEPTH {
+            parent = live.add(parent, depth, &format!("level{depth}"), &DirBuf::default());
+        }
+        assert_eq!(live.add(parent, LIVE_DEPTH + 1, "hidden", &live_bytes(90, 70, 4)), parent);
+        let tree = live.snapshot().unwrap();
+        let names: Vec<_> = (0..tree.len() as u32).map(|id| tree.name(id)).collect();
+        assert_eq!(names, ["root", "big", "small", "파일 2개", "level2", "파일 3개",
+            "파일 1개", "level3", "level4", "level5"]);
+        assert_eq!(tree.names, names.concat(), "name pool follows BFS node order");
+        assert_eq!((tree.node(0).alloc, tree.node(0).logical, tree.node(0).files), (160, 119, 10));
+        assert_eq!(tree.version, live.version);
+        for (id, alloc, logical, files) in [(3, 10, 7, 2), (5, 40, 30, 3), (6, 20, 12, 1)] {
+            let node = tree.node(id);
+            assert_eq!((node.alloc, node.logical, node.files), (alloc, logical, files));
+            assert_eq!(node.kind, Kind::File);
+            assert_eq!(node.flags, flags::SYNTHETIC);
+        }
+        let last = tree.node(9);
+        assert_eq!((last.alloc, last.logical, last.files, last.child_count), (90, 70, 4, 0));
+        assert_eq!(tree.children(0), 1..4);
+        assert_eq!(tree.children(1), 4..6);
+        for parent in 0..tree.len() as u32 {
+            for child in tree.children(parent) {
+                assert_eq!(tree.parent(child), Some(parent));
+            }
+        }
+    }
+
+    #[test]
+    fn captured_version_matches_snapshot_contents() {
+        let live = Mutex::new(LiveTree::default());
+        let captured = {
+            let mut guard = live.lock().unwrap();
+            let root = guard.add(NO_NODE, 0, "root", &live_bytes(10, 7, 2));
+            guard.add(root, 1, "before", &live_bytes(20, 12, 1));
+            guard.capture()
+        };
+        assert_eq!(captured.version(), 2);
+        live.lock().unwrap().add(0, 1, "after", &live_bytes(100, 80, 4));
+        let tree = captured.build_with_cancel(&|| false).unwrap().unwrap();
+        assert_eq!(tree.version, 2);
+        assert_eq!((tree.node(0).alloc, tree.node(0).logical, tree.node(0).files), (30, 19, 3));
+        assert_eq!((0..tree.len() as u32).map(|id| tree.name(id)).collect::<Vec<_>>(),
+            ["root", "before", "파일 2개", "파일 1개"]);
+        assert_eq!(live.lock().unwrap().version, 3);
+    }
+
+    fn wide_live() -> LiveTree {
+        let mut live = LiveTree::default();
+        let root = live.add(NO_NODE, 0, "root", &live_bytes(5, 3, 1));
+        for i in 0..8_193 {
+            live.add(root, 1, &format!("dir{i}"), &live_bytes((i * 37 % 8193) as u64, i as u64, 1));
+        }
+        live
+    }
+
+    #[test]
+    fn cancelled_snapshot_does_not_publish_partial_tree() {
+        use std::sync::atomic::AtomicUsize;
+        let empty = LiveTree::default();
+        assert!(empty.capture().build_with_cancel(&|| false).unwrap().is_none());
+        assert!(matches!(empty.capture().build_with_cancel(&|| true), Err(PreviewCancelled)));
+        let mut live = LiveTree::default();
+        let mut parent = live.add(NO_NODE, 0, "root", &live_bytes(5, 3, 1));
+        for depth in 1..LIVE_DEPTH {
+            parent = live.add(parent, depth, &format!("level{depth}"), &DirBuf::default());
+        }
+        for i in 0..8_193 {
+            live.add(parent, LIVE_DEPTH, &format!("leaf{i}"), &live_bytes((i * 37 % 8193) as u64, i as u64, 1));
+        }
+        let checks = AtomicUsize::new(0);
+        let complete = live.capture().build_with_cancel(&|| {
+            checks.fetch_add(1, Relaxed);
+            false
+        }).unwrap().unwrap();
+        assert_eq!(complete.len(), 8_199);
+        // Cancel at every reachable checkpoint, including children construction,
+        // sibling sort/merge, BFS and the final publication check.
+        for stop in 0..checks.load(Relaxed) {
+            let calls = AtomicUsize::new(0);
+            let result = live.capture().build_with_cancel(&|| calls.fetch_add(1, Relaxed) >= stop);
+            assert!(matches!(result, Err(PreviewCancelled)), "checkpoint {stop} published a partial tree");
+            assert_eq!(calls.load(Relaxed), stop + 1, "build continued after cancellation");
+        }
+    }
+
+    #[test]
+    fn wide_snapshot_sorts_siblings_and_keeps_bfs_names() {
+        let live = wide_live();
+        let tree = live.capture().build_with_cancel(&|| false).unwrap().unwrap();
+        let children: Vec<_> = tree.children(0).collect();
+        assert_eq!(children.len(), 8_194);
+        assert!(children.windows(2).all(|ids| tree.node(ids[0]).alloc >= tree.node(ids[1]).alloc));
+        let expected_alloc: u64 = (0..8193).map(|i| (i * 37 % 8193) as u64).sum::<u64>() + 5;
+        assert_eq!(tree.node(0).alloc, expected_alloc);
+        assert_eq!(tree.names, (0..tree.len() as u32).map(|id| tree.name(id)).collect::<String>());
+        for id in children {
+            if tree.node(id).kind == Kind::Dir {
+                assert_eq!(tree.node(id).child_count, 1);
+                let child = tree.children(id).next().unwrap();
+                assert!(child >= 8_195, "grandchildren follow all root children");
+                assert_eq!(tree.node(child).flags, flags::SYNTHETIC);
+                assert_eq!(tree.parent(child), Some(id));
+            }
+        }
+    }
+
+    #[test]
+    fn sibling_sort_cancellation_stops_after_one_bounded_run() {
+        use std::sync::atomic::AtomicUsize;
+        let cancelled = AtomicBool::new(false);
+        let largest_seen = AtomicUsize::new(0);
+        let mut values: Vec<_> = (0..8_193).map(|i| (8_193 - i, i)).collect();
+        let result = preview_sort_by(&mut values, |a, b| {
+            largest_seen.fetch_max(a.1.max(b.1), Relaxed);
+            cancelled.store(true, Relaxed);
+            a.0.cmp(&b.0)
+        }, &|| cancelled.load(Relaxed));
+        assert_eq!(result, Err(PreviewCancelled));
+        assert!(largest_seen.load(Relaxed) < 4_096, "another sort run started after cancellation");
+    }
+
+    #[test]
+    fn sibling_merge_checks_cancellation_within_256_items() {
+        use std::sync::atomic::AtomicUsize;
+        let cross_run_comparisons = AtomicUsize::new(0);
+        let mut values: Vec<_> = (0..8_192).map(|i| (i % 4_096, i)).collect();
+        let result = preview_sort_by(&mut values, |a, b| {
+            if a.1 / 4_096 != b.1 / 4_096 {
+                cross_run_comparisons.fetch_add(1, Relaxed);
+            }
+            a.0.cmp(&b.0)
+        }, &|| cross_run_comparisons.load(Relaxed) > 0);
+        assert_eq!(result, Err(PreviewCancelled));
+        assert!((1..=256).contains(&cross_run_comparisons.load(Relaxed)));
+    }
 
     #[test]
     fn normalizes_extended_drive_root() {

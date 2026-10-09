@@ -53,6 +53,7 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
     let runs = mft_runs(rec0).ok_or_else(|| invalid("$MFT data run을 찾지 못함 (조각이 너무 많을 수 있음)"))?;
     let mft_bytes = u64::try_from(vd.MftValidDataLength).map_err(|_| invalid("$MFT 유효 길이가 잘못됨"))?;
     validate_run_alignment(&runs, cluster, rec_size, mft_bytes)?;
+    drop(first);
     let total_records = usize::try_from(mft_bytes / rec_size as u64).map_err(|_| invalid("$MFT 레코드 수가 너무 큼"))?;
     if total_records <= ROOT_RECORD as usize || total_records > u32::MAX as usize {
         return Err(invalid("지원하지 않는 $MFT 레코드 수"));
@@ -651,6 +652,13 @@ impl Records {
             }
         }
 
+        drop(self.in_use);
+        drop(self.seq);
+        drop(self.parent);
+        drop(self.parent_seq);
+        drop(self.name_off);
+        drop(self.name_len);
+        drop(self.name_flags);
         drop(self.link_indices);
 
         // 디렉터리 레코드별 자식 항목 (CSR)
@@ -724,6 +732,10 @@ impl Records {
                 files[d] = f.min(u32::MAX as u64) as u32;
             }
         }
+
+        drop(visited);
+        drop(seen_files);
+        drop(stack);
 
         // BFS로 아레나에 펼치기 (자식은 할당 크기 내림차순)
         let mut tree = Tree::default();
@@ -944,6 +956,86 @@ mod tests {
             assert_eq!((tree.node(id).alloc, tree.node(id).logical, tree.node(id).files), (4096, 1000, 1));
             assert_eq!(tree.node(id).flags & flags::HARDLINK_DUP, 0);
             assert_eq!(dups, 0);
+        }
+    }
+
+    #[test]
+    fn mixed_records_preserve_bfs_fields_after_early_release() {
+        for dedupe in [true, false] {
+            let mut r = root_records(15);
+            add_name(&mut r, 6, ROOT_RECORD, "folder", true, 0);
+            add_name(&mut r, 7, ROOT_RECORD, "cloud", true, FILE_ATTRIBUTE_REPARSE_POINT);
+            add_name(&mut r, 8, 6, "nested", true, 0);
+            // The primary name is hidden below a reparse directory; the nested alias owns size.
+            add_name(&mut r, 9, 7, "hidden.bin", false, 0);
+            add_name(&mut r, 9, 8, "owner.bin", false, 0);
+            let mut alias = record(&[b'd' as u16, b'u' as u16, b'p' as u16, 0xD800], 6);
+            r.merge(parse_batch(&mut alias, 1024, 9, 4096));
+            add_name(&mut r, 10, 6, "file-link", false, FILE_ATTRIBUTE_REPARSE_POINT);
+            add_name(&mut r, 11, 8, "😀", false, 0);
+            let mut lossy = record(&[b'b' as u16, b'a' as u16, b'd' as u16, 0xD800], ROOT_RECORD);
+            r.merge(parse_batch(&mut lossy, 1024, 12, 4096));
+            add_name(&mut r, 13, ROOT_RECORD, "stale-parent.bin", false, 0);
+            r.parent_seq[13] = 2;
+            for (id, alloc, logical) in [(9, 8000, 800), (10, 7000, 700), (11, 3000, 300), (12, 5000, 500), (13, 99000, 9900)] {
+                r.alloc[id] = alloc;
+                r.logical[id] = logical;
+            }
+            for (id, mtime) in [(5, 101), (6, 202), (7, 808), (8, 303), (9, 404), (10, 505), (11, 606), (12, 707)] {
+                r.mtime[id] = mtime;
+            }
+            let (tree, orphans, dups) = r.build_tree("C:\\", dedupe);
+            assert_eq!((orphans, dups), (1, u64::from(dedupe)));
+            let extra_alloc = if dedupe { 0 } else { 8000 };
+            let extra_logical = if dedupe { 0 } else { 800 };
+            let duplicate_flags = flags::LOSSY_NAME | if dedupe { flags::HARDLINK_DUP } else { 0 };
+            // name, parent, child range, sizes, files, mtime, kind, flags: every arena field.
+            let mut expected = vec![
+                ("C:\\", NO_NODE, 1, 3, 23000 + extra_alloc, 2300 + extra_logical, 5, 101, Kind::Dir, 0),
+                ("folder", 0, 4, 3, 18000 + extra_alloc, 1800 + extra_logical, 4, 202, Kind::Dir, 0),
+                ("bad�", 0, 0, 0, 5000, 500, 1, 707, Kind::File, flags::LOSSY_NAME),
+                ("cloud", 0, 0, 0, 0, 0, 0, 808, Kind::Link, 0),
+                ("nested", 1, 7, 2, 11000, 1100, 2, 303, Kind::Dir, 0),
+            ];
+            let file_link = ("file-link", 1, 0, 0, 7000, 700, 1, 505, Kind::File, flags::REPARSE);
+            let duplicate = ("dup�", 1, 0, 0, extra_alloc, extra_logical, 1, 404, Kind::File, duplicate_flags);
+            expected.extend(if dedupe { [file_link, duplicate] } else { [duplicate, file_link] });
+            expected.extend([
+                ("owner.bin", 4, 0, 0, 8000, 800, 1, 404, Kind::File, 0),
+                ("😀", 4, 0, 0, 3000, 300, 1, 606, Kind::File, 0),
+            ]);
+            assert_eq!(tree.nodes.len(), expected.len());
+            let mut names = String::new();
+            for (id, &(name, parent, first_child, child_count, alloc, logical, files, mtime, kind, flags)) in expected.iter().enumerate() {
+                let node = tree.node(id as u32);
+                assert_eq!(tree.name(id as u32), name);
+                assert_eq!((node.name_off, node.name_len), (names.len() as u32, name.len() as u16));
+                assert_eq!((node.parent, node.first_child, node.child_count), (parent, first_child, child_count), "{name}");
+                assert_eq!((node.alloc, node.logical, node.files), (alloc, logical, files), "{name}");
+                assert_eq!((node.mtime, node.kind, node.flags), (mtime, kind, flags), "{name}");
+                names.push_str(name);
+            }
+            assert_eq!(tree.names, names);
+        }
+    }
+
+    #[test]
+    fn root_only_preserves_metadata_after_early_release() {
+        for dedupe in [true, false] {
+            let mut r = root_records(6);
+            add_name(&mut r, ROOT_RECORD, ROOT_RECORD, ".", true, 0);
+            r.mtime[ROOT_RECORD as usize] = 123456;
+            r.alloc[ROOT_RECORD as usize] = 4096;
+            r.logical[ROOT_RECORD as usize] = 512;
+            let (tree, orphans, dups) = r.build_tree("Z:\\", dedupe);
+            assert_eq!((orphans, dups), (0, 0));
+            assert_eq!(tree.nodes.len(), 1);
+            assert_eq!(tree.names, "Z:\\");
+            let root = tree.node(Tree::ROOT);
+            assert_eq!((root.alloc, root.logical, root.files), (0, 0, 0));
+            assert_eq!((root.parent, root.first_child, root.child_count), (NO_NODE, 1, 0));
+            assert_eq!((root.name_off, root.name_len), (0, 3));
+            assert_eq!((root.mtime, root.kind, root.flags), (123456, Kind::Dir, 0));
         }
     }
 

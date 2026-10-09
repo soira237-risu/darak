@@ -7,3 +7,10 @@ license.workspace = true
 [dependencies]
 rayon.workspace = true
 memchr = "2.8"
+
+[features]
+perf = []
+
+[[example]]
+name = "search_bench"
+required-features = ["perf"]

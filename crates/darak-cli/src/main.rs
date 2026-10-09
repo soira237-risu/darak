@@ -20,6 +20,7 @@ fn main() {
     let mut mode = SizeMode::Allocated;
     let mut opts = ScanOptions::default();
     let mut compare = false;
+    let mut perf_csv = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--top" => top = args.next().and_then(|v| v.parse().ok()).unwrap_or(top),
@@ -28,12 +29,17 @@ fn main() {
             "--threads" => opts.threads = args.next().and_then(|v| v.parse().ok()),
             "--walk" => opts.use_mft = false,
             "--compare" => compare = true,
+            "--perf-csv" => perf_csv = true,
             "-h" | "--help" => {
-                println!("사용법: darak-cli <경로> [--top N] [--logical] [--no-dedupe] [--threads N] [--walk] [--compare]");
+                println!("사용법: darak-cli <경로> [--top N] [--logical] [--no-dedupe] [--threads N] [--walk] [--compare] [--perf-csv]");
                 return;
             }
             _ => root = Some(a),
         }
+    }
+    if perf_csv && compare {
+        eprintln!("--perf-csv and --compare must run separately");
+        std::process::exit(2);
     }
     let root = root.unwrap_or_else(|| "C:\\".into());
 
@@ -67,6 +73,12 @@ fn main() {
     let tree = &res.tree;
     let s = &res.stats;
     let (ws, peak) = process_memory();
+    if perf_csv {
+        println!("schema,method,elapsed_ms,nodes,files,dirs,errors,hardlink_dups,tree_heap_bytes,working_set_bytes,peak_working_set_bytes,cancelled");
+        println!("1,{:?},{},{},{},{},{},{},{},{},{},{}", s.method, s.elapsed.as_millis(), tree.len(), s.files, s.dirs, s.errors, s.hardlink_dups, tree.heap_bytes(), ws, peak, u8::from(s.cancelled));
+        if let Some(reason) = &s.fallback_reason { eprintln!("fallback: {reason}"); }
+        return;
+    }
     let r = tree.node(Tree::ROOT);
 
     println!("경로          {}", tree.name(Tree::ROOT));

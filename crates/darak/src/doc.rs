@@ -1,6 +1,9 @@
 //! 스캔 결과 하나와 그 위의 탐색·선택·표시 상태
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use crate::search_worker::{SearchCompletion, SearchKey};
 
 use darak_core::remove::protected_reason;
 use darak_core::search::SearchResult;
@@ -8,7 +11,7 @@ use darak_core::{Kind, NodeId, ScanStats, SizeMode, Tree};
 
 pub struct Doc {
     pub id: u64,
-    pub tree: Tree,
+    pub tree: Arc<Tree>,
     pub stats: ScanStats,
     pub focus: NodeId,
     pub selected: Option<NodeId>,
@@ -22,11 +25,16 @@ pub struct Doc {
     pub search: SearchState,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemovalApply { Applied, Rejected, Busy }
+
 #[derive(Default)]
 pub struct SearchState {
     pub query: String,
-    pub applied: Option<(String, NodeId, SizeMode, u64)>,
+    pub applied: Option<SearchKey>,
     pub edited_at: Option<std::time::Instant>,
+    /// Input-handler timestamp awaiting key observation.
+    pub(crate) pending_edit_at: Option<std::time::Instant>,
     pub result: Option<SearchResult>,
     pub error: Option<String>,
     pub elapsed_ms: f64,
@@ -36,12 +44,18 @@ pub struct SearchState {
     pub bits: Vec<u8>,
 }
 
+impl SearchState {
+    pub fn note_edit(&mut self, at: std::time::Instant) {
+        self.pending_edit_at = Some(at);
+    }
+}
+
 impl Doc {
     pub fn new(id: u64, tree: Tree, stats: ScanStats) -> Self {
         let n = tree.len();
         Self {
             id,
-            tree,
+            tree: Arc::new(tree),
             stats,
             focus: Tree::ROOT,
             selected: None,
@@ -56,6 +70,9 @@ impl Doc {
 
     pub fn navigate(&mut self, to: NodeId) {
         if to != self.focus && self.tree.node(to).kind == Kind::Dir {
+            if self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.back.push(self.focus);
             self.forward.clear();
             self.focus = to;
@@ -72,6 +89,9 @@ impl Doc {
 
     pub fn go_back(&mut self) {
         if let Some(b) = self.back.pop() {
+            if b != self.focus && self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.forward.push(self.focus);
             self.focus = b;
         }
@@ -79,6 +99,9 @@ impl Doc {
 
     pub fn go_forward(&mut self) {
         if let Some(f) = self.forward.pop() {
+            if f != self.focus && self.search.in_focus_only {
+                self.search.note_edit(std::time::Instant::now());
+            }
             self.back.push(self.focus);
             self.focus = f;
         }
@@ -157,26 +180,22 @@ impl Doc {
         }
     }
 
-    /// 다른 문서의 결과는 NodeId를 읽기 전에 거부한다.
-    pub fn apply_removed_for(&mut self, doc_id: u64, removed: &[NodeId]) -> bool {
+    /// Reject identity and bounds before accessing any returned node.
+    pub fn apply_removed_for(&mut self, doc_id: u64, removed: &[NodeId]) -> RemovalApply {
         if self.id != doc_id || removed.iter().any(|&id| id as usize >= self.tree.len()) {
-            return false;
+            return RemovalApply::Rejected;
         }
-        self.apply_removed(removed);
-        true
+        self.apply_removed(removed)
     }
 
-    /// 삭제가 끝난 서브트리를 트리와 탐색·검색 상태에서 뺀다.
-    pub fn apply_removed(&mut self, removed: &[NodeId]) {
-        let version = self.tree.version;
-        for &id in removed {
-            if (id as usize) < self.tree.len() {
-                self.tree.remove(id);
-            }
+    pub fn apply_removed(&mut self, removed: &[NodeId]) -> RemovalApply {
+        if removed.iter().any(|&id| id as usize >= self.tree.len()) {
+            return RemovalApply::Rejected;
         }
-        if version == self.tree.version {
-            return;
-        }
+        let Some(tree) = Arc::get_mut(&mut self.tree) else { return RemovalApply::Busy };
+        let version = tree.version;
+        for &id in removed { tree.remove(id); }
+        if version == tree.version { return RemovalApply::Applied; }
         let tree = &self.tree;
         let live = |id: NodeId| {
             tree.nodes
@@ -192,6 +211,11 @@ impl Doc {
         self.forward.retain(|&id| live(id));
         self.marks.retain(|&id| live(id));
         self.rebuild_mark_bits();
+        self.clear_search();
+        RemovalApply::Applied
+    }
+
+    pub fn clear_search(&mut self) {
         self.search.applied = None;
         self.search.result = None;
         self.search.bits.clear();
@@ -199,28 +223,27 @@ impl Doc {
         self.search.elapsed_ms = 0.0;
     }
 
-    // ---- 검색 강조 ----
+    pub fn search_key(&self, mode: SizeMode) -> SearchKey {
+        SearchKey {
+            doc_id: self.id, tree_version: self.tree.version,
+            query: self.search.query.clone(),
+            scope: if self.search.in_focus_only { self.focus } else { Tree::ROOT }, mode,
+        }
+    }
 
-    pub fn set_search_bits(&mut self) {
-        let n = self.tree.len();
-        let bits = &mut self.search.bits;
-        bits.clear();
-        let Some(res) = &self.search.result else { return };
-        bits.resize(n, 0);
-        for &h in &res.hits {
-            bits[h as usize] |= 1;
-            let mut cur = self.tree.node(h).parent;
-            while cur != darak_core::NO_NODE && bits[cur as usize] & 2 == 0 {
-                bits[cur as usize] |= 2;
-                cur = self.tree.node(cur).parent;
-            }
+    pub fn accept_search(&mut self, completion: SearchCompletion, expected: &SearchKey, generation: u64) -> bool {
+        // Never inspect result IDs until identity, version, input and generation agree.
+        if completion.generation != generation || &completion.key != expected
+            || expected != &self.search_key(expected.mode) {
+            return false;
         }
-        for i in 1..n {
-            let p = self.tree.nodes[i].parent as usize;
-            if bits[p] & 5 != 0 {
-                bits[i] |= 4;
-            }
-        }
+        self.search.edited_at = Some(completion.edited_at);
+        self.search.elapsed_ms = completion.timings.search.as_secs_f64() * 1000.0;
+        self.search.applied = Some(completion.key);
+        self.search.result = Some(completion.result);
+        self.search.bits = completion.bits;
+        self.search.error = None;
+        true
     }
 
     /// 검색 강조가 켜져 있을 때, 흐리게 그리지 않을 항목인지
@@ -300,7 +323,7 @@ pub(crate) mod tests {
         doc.back = vec![0, 1];
         doc.forward = vec![1];
         doc.toggle_mark(3).unwrap();
-        doc.search.applied = Some(("file:".into(), 0, SizeMode::Allocated, 0));
+        doc.search.applied = Some(doc.search_key(SizeMode::Allocated));
         doc.search.result = Some(darak_core::search::search(
             &doc.tree,
             &darak_core::search::Query::parse("file:", 0).unwrap(),
@@ -308,7 +331,7 @@ pub(crate) mod tests {
             Tree::ROOT,
             100,
         ));
-        doc.set_search_bits();
+        doc.search.bits = vec![2, 2, 1, 1];
         doc.apply_removed(&[1]);
         assert_eq!(doc.focus, Tree::ROOT);
         assert_eq!(doc.selected, None);
@@ -336,7 +359,7 @@ pub(crate) mod tests {
         let mut other = fixture(2);
         other.selected = Some(3);
         other.toggle_mark(3).unwrap();
-        assert!(!other.apply_removed_for(1, &[1]));
+        assert_eq!(other.apply_removed_for(1, &[1]), RemovalApply::Rejected);
         unchanged(&other);
     }
 
@@ -345,17 +368,81 @@ pub(crate) mod tests {
         let mut other = fixture(2);
         other.selected = Some(3);
         other.toggle_mark(3).unwrap();
-        assert!(!other.apply_removed_for(1, &[u32::MAX]));
+        assert_eq!(other.apply_removed_for(1, &[u32::MAX]), RemovalApply::Rejected);
         unchanged(&other);
-        assert!(!other.apply_removed_for(2, &[1, u32::MAX]));
+        assert_eq!(other.apply_removed_for(2, &[1, u32::MAX]), RemovalApply::Rejected);
         unchanged(&other);
     }
 
     #[test]
     fn applies_matching_document_results() {
         let mut doc = fixture(1);
-        assert!(doc.apply_removed_for(1, &[1]));
+        assert_eq!(doc.apply_removed_for(1, &[1]), RemovalApply::Applied);
         assert_eq!(doc.tree.node(0).alloc, 40);
         assert!(doc.tree.node(1).has(flags::REMOVED));
     }
+    #[test]
+    fn rejects_foreign_completion_before_indexing() {
+        let old = fixture(1);
+        let mut current = fixture(2);
+        let expected = current.search_key(SizeMode::Allocated);
+        let completion = SearchCompletion {
+            key: old.search_key(SizeMode::Allocated), generation: 7,
+            result: SearchResult { hits: vec![u32::MAX], total: 1, total_size: 60 },
+            bits: vec![], timings: Default::default(), edited_at: std::time::Instant::now(),
+        };
+        assert_eq!(old.tree.version, current.tree.version);
+        assert!(!current.accept_search(completion, &expected, 7));
+        assert!(current.search.result.is_none());
+    }
+
+    #[test]
+    fn busy_removal_preserves_all_state() {
+        let mut doc = fixture(1);
+        doc.selected = Some(3);
+        doc.hovered = Some(3);
+        doc.focus = 1;
+        doc.back = vec![0];
+        doc.forward = vec![1];
+        doc.toggle_mark(3).unwrap();
+        doc.search.query = "file:".into();
+        doc.search.applied = Some(doc.search_key(SizeMode::Allocated));
+        doc.search.bits = vec![2, 2, 1, 1];
+        let lease = Arc::clone(&doc.tree);
+        assert_eq!(doc.apply_removed_for(1, &[1]), RemovalApply::Busy);
+        unchanged(&doc);
+        assert_eq!(doc.focus, 1);
+        assert_eq!(doc.hovered, Some(3));
+        assert_eq!(doc.back, [0]);
+        assert_eq!(doc.forward, [1]);
+        assert!(doc.search.applied.is_some());
+        assert_eq!(doc.search.bits, [2, 2, 1, 1]);
+        drop(lease);
+        assert_eq!(doc.apply_removed_for(1, &[1, 3, 1]), RemovalApply::Applied);
+        assert_eq!(doc.tree.node(0).alloc, 40);
+        assert_eq!(doc.tree.version, 1);
+        assert!(doc.search.bits.is_empty());
+    }
+
+    #[test]
+    fn accepts_complete_vectors_only_for_current_generation_and_key() {
+        let mut doc = fixture(1);
+        doc.search.query = "file:".into();
+        let key = doc.search_key(SizeMode::Allocated);
+        let make = |generation, key| SearchCompletion {
+            generation, key, result: SearchResult { hits: vec![3, 2], total: 2, total_size: 100 },
+            bits: vec![2, 2, 1, 1], timings: Default::default(), edited_at: std::time::Instant::now(),
+        };
+        assert!(!doc.accept_search(make(4, key.clone()), &key, 5));
+        let mut stale = key.clone(); stale.tree_version += 1;
+        assert!(!doc.accept_search(make(5, stale), &key, 5));
+        let completion = make(5, key.clone());
+        let hits = completion.result.hits.as_ptr();
+        let bits = completion.bits.as_ptr();
+        assert!(doc.accept_search(completion, &key, 5));
+        assert_eq!(doc.search.result.as_ref().unwrap().hits.as_ptr(), hits);
+        assert_eq!(doc.search.bits.as_ptr(), bits);
+        assert_eq!(doc.search.result.as_ref().unwrap().total_size, 100);
+    }
+
 }

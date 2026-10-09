@@ -1,53 +1,20 @@
 //! 검색 결과 패널 (가상 스크롤 표)
 
-use std::time::{Duration, Instant};
-
-use darak_core::search::{Query, now_secs2000, search};
-use darak_core::{Kind, NodeId, SizeMode, Tree, format_time, human_size, thousands};
+use darak_core::{Kind, NodeId, SizeMode, format_time, human_size, thousands};
 use eframe::egui::{self, Color32, RichText, Sense};
-
 use crate::doc::Doc;
 
-const DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// 입력이 멈추면 검색을 실행한다. 다시 그려야 하면 true.
-pub fn update(doc: &mut Doc, mode: SizeMode) -> bool {
-    let s = &mut doc.search;
-    if s.query.trim().is_empty() {
-        if s.result.is_some() || s.error.is_some() {
-            s.result = None;
-            s.error = None;
-            s.applied = None;
-            s.bits.clear();
+pub fn controls(ui: &mut egui::Ui, doc: &mut Doc) -> bool {
+    let mut changed = false;
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        changed = ui.checkbox(&mut doc.search.in_focus_only, "현재 폴더 안에서만").changed();
+        if changed && doc.focus != darak_core::Tree::ROOT {
+            doc.search.note_edit(std::time::Instant::now());
         }
-        return false;
-    }
-    let scope = if s.in_focus_only { doc.focus } else { Tree::ROOT };
-    let key = (s.query.clone(), scope, mode, doc.tree.version);
-    if s.applied.as_ref() == Some(&key) {
-        return false;
-    }
-    if s.edited_at.is_some_and(|t| t.elapsed() < DEBOUNCE) {
-        return true;
-    }
-    s.applied = Some(key);
-    match Query::parse(&s.query, now_secs2000()) {
-        Ok(q) if !q.is_empty() => {
-            let t = Instant::now();
-            s.result = Some(search(&doc.tree, &q, mode, scope, usize::MAX));
-            s.elapsed_ms = t.elapsed().as_secs_f64() * 1000.0;
-            s.error = None;
-            doc.set_search_bits();
-        }
-        Ok(_) => {
-            s.result = None;
-            s.bits.clear();
-        }
-        Err(e) => {
-            s.error = Some(e);
-        }
-    }
-    false
+        ui.checkbox(&mut doc.search.highlight, "treemap에 강조");
+    });
+    changed
 }
 
 pub enum Action {
@@ -58,16 +25,12 @@ pub enum Action {
     Open(NodeId),
 }
 
-pub fn panel(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
+pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
     let mut action = Action::None;
     let s = &mut doc.search;
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut s.in_focus_only, "현재 폴더 안에서만");
-        ui.checkbox(&mut s.highlight, "treemap에 강조");
-    });
     if let Some(e) = &s.error {
         ui.colored_label(Color32::from_rgb(230, 120, 60), e);
+        return action;
     }
     let Some(res) = &s.result else {
         ui.label(RichText::new("검색 중…").weak());
@@ -139,7 +102,7 @@ pub fn panel(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
             if resp.secondary_clicked() {
                 action = Action::Context(id);
             }
-            resp.on_hover_text(tree.path(id));
+            resp.on_hover_ui(|ui| { ui.label(tree.path(id)); });
         }
     });
     action
