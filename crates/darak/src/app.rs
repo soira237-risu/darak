@@ -68,7 +68,12 @@ pub struct App {
 struct PendingRemoval {
     fence: ReleaseFence,
     ids: Vec<NodeId>,
+    /// 작업자가 트리를 반환했다고 알린 시각
+    released_at: Option<Instant>,
 }
+
+/// 반환 알림 뒤에도 트리를 다른 소유자가 붙잡고 있으면, 이 시간이 지난 뒤 복제해서 반영한다.
+const REMOVAL_DETACH_AFTER: Duration = Duration::from_secs(2);
 
 struct Scanning {
     scan_id: u64,
@@ -430,19 +435,18 @@ impl App {
         doc.clear_search();
         self.search_submitted = false;
         self.removal_released = false;
-        self.pending_removal = Some(PendingRemoval { fence, ids });
+        self.pending_removal = Some(PendingRemoval { fence, ids, released_at: None });
         self.search.release_for_mutation(fence);
     }
 
     fn search_control(&mut self, event: SearchControlEvent) {
         match event {
             SearchControlEvent::Released(fence) => {
-                if self
-                    .pending_removal
-                    .as_ref()
-                    .is_some_and(|p| p.fence == fence)
+                if let Some(pending) = &mut self.pending_removal
+                    && pending.fence == fence
                 {
                     self.removal_released = true;
+                    pending.released_at.get_or_insert_with(Instant::now);
                 }
             }
             SearchControlEvent::WorkerFailed(error) => {
@@ -461,9 +465,17 @@ impl App {
         let Some(pending) = &self.pending_removal else {
             return;
         };
+        let detach = pending.released_at.is_some_and(|at| at.elapsed() >= REMOVAL_DETACH_AFTER);
         let applied = match &mut self.doc {
             Some(doc) if doc.tree.version == pending.fence.tree_version => {
-                doc.apply_removed_for(pending.fence.doc_id, &pending.ids)
+                let applied = doc.apply_removed_for(pending.fence.doc_id, &pending.ids);
+                if applied == RemovalApply::Busy && detach {
+                    // 파일은 이미 지워졌으므로 화면 반영을 무기한 미루지 않는다.
+                    doc.detach_tree();
+                    doc.apply_removed_for(pending.fence.doc_id, &pending.ids)
+                } else {
+                    applied
+                }
             }
             _ => RemovalApply::Rejected,
         };
@@ -2045,6 +2057,35 @@ mod tests {
             assert!(!has_removal_text(&output, REMOVAL_WAIT_TEXT));
             drop(lease);
         }
+    }
+
+    #[test]
+    fn stuck_lease_is_detached_after_timeout() {
+        let mut app = app(fixture(1));
+        let lease = Arc::clone(&app.doc.as_ref().unwrap().tree);
+        app.begin_removal(1, vec![1]);
+        let fence = app.pending_removal.as_ref().unwrap().fence;
+        app.search_control(SearchControlEvent::Released(fence));
+        app.finish_removal();
+        assert!(app.pending_removal.is_some(), "waits before the timeout");
+        let released_at = app.pending_removal.as_ref().unwrap().released_at.unwrap();
+        // 같은 fence가 다시 와도 기다리기 시작한 시각은 바뀌지 않는다.
+        app.search_control(SearchControlEvent::Released(fence));
+        assert_eq!(app.pending_removal.as_ref().unwrap().released_at, Some(released_at));
+        app.pending_removal.as_mut().unwrap().released_at =
+            Some(Instant::now() - REMOVAL_DETACH_AFTER);
+        app.finish_removal();
+        assert!(app.pending_removal.is_none());
+        assert!(!app.removal_released);
+        assert!(app.error.is_none());
+        let doc = app.doc.as_ref().unwrap();
+        assert!(!Arc::ptr_eq(&doc.tree, &lease), "the document owns a detached copy");
+        assert_eq!(doc.tree.version, 1);
+        assert!(doc.tree.node(1).has(flags::REMOVED));
+        assert_eq!(doc.tree.node(0).alloc, 40);
+        // 붙잡고 있던 쪽의 트리는 바뀌지 않는다.
+        assert_eq!(lease.version, 0);
+        assert!(!lease.node(1).has(flags::REMOVED));
     }
 
     #[test]

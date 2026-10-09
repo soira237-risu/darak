@@ -474,82 +474,14 @@ fn sort_hits_with_cancel(
     mode: SizeMode,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), SearchCancelled> {
-    if cancelled() {
-        return Err(SearchCancelled);
-    }
-    let key = |id: NodeId| (std::cmp::Reverse(tree.node(id).size(mode)), id);
-    hits.par_chunks_mut(4096).try_for_each(|run| {
-        if cancelled() {
-            return Err(SearchCancelled);
-        }
-        run.sort_unstable_by_key(|&id| key(id));
-        if cancelled() {
-            return Err(SearchCancelled);
-        }
-        Ok(())
-    })?;
-    if hits.len() <= 4096 {
-        return Ok(());
-    }
-    // One NodeId per hit: approximately 16 MB for four million hits.
-    let mut buffer = vec![0; hits.len()];
-    let mut width = 4096;
-    while width < hits.len() {
-        // Partition by output position so even the last merge uses the whole pool.
-        buffer
-            .par_chunks_mut(4096)
-            .enumerate()
-            .try_for_each(|(chunk, outputs)| {
-                if cancelled() {
-                    return Err(SearchCancelled);
-                }
-                let offset = chunk * 4096;
-                let start = offset / (width * 2) * (width * 2);
-                let middle = (start + width).min(hits.len());
-                let end = (start + width * 2).min(hits.len());
-                let diagonal = offset - start;
-                // Find how many elements each input contributes before this output chunk.
-                // Unique (size, ID) keys make the partition unambiguous, including ties.
-                let mut low = diagonal.saturating_sub(end - middle);
-                let mut high = diagonal.min(middle - start);
-                while low < high {
-                    let left = low + (high - low) / 2;
-                    let right = diagonal - left;
-                    if right > 0
-                        && left < middle - start
-                        && key(hits[middle + right - 1]) > key(hits[start + left])
-                    {
-                        low = left + 1;
-                    } else {
-                        high = left;
-                    }
-                }
-                let (mut left, mut right) = (start + low, middle + diagonal - low);
-                // Cache the two frontiers instead of repeatedly fetching 48-byte tree nodes.
-                let mut left_key = (left < middle).then(|| key(hits[left]));
-                let mut right_key = (right < end).then(|| key(hits[right]));
-                let mut steps = 0;
-                for output in outputs {
-                    checkpoint(&mut steps, cancelled)?;
-                    if left_key.is_some() && (right_key.is_none() || left_key <= right_key) {
-                        *output = hits[left];
-                        left += 1;
-                        left_key = (left < middle).then(|| key(hits[left]));
-                    } else {
-                        *output = hits[right];
-                        right += 1;
-                        right_key = (right < end).then(|| key(hits[right]));
-                    }
-                }
-                Ok(())
-            })?;
-        std::mem::swap(hits, &mut buffer);
-        width *= 2;
-    }
-    if cancelled() {
-        return Err(SearchCancelled);
-    }
-    Ok(())
+    // (크기 내림차순, ID) key는 모두 달라서 결과 순서가 하나로 정해진다.
+    crate::sort::sort_by_key(
+        hits,
+        |&id| (std::cmp::Reverse(tree.node(id).size(mode)), id),
+        crate::sort::Exec::Parallel,
+        cancelled,
+    )
+    .map_err(|_| SearchCancelled)
 }
 
 /// 현재 시각 (2000년 기준 초)

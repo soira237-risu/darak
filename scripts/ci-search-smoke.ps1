@@ -160,16 +160,22 @@ try {
     & tar -xf (Join-Path $scratch 'baseline.tar') -C $baseline
     Assert-True ($LASTEXITCODE -eq 0) 'Baseline extraction failed'
 
-    # Guard the overlay: the lib change must be only the optional perf module,
-    # and the manifest change must be only the perf feature/example registration.
+    # Guard the overlay: the baseline lib gains only the optional perf module
+    # (inserted into the baseline's own lib, so later candidate modules never
+    # leak into it), and the manifest change must be only the perf
+    # feature/example registration.
     $lib = [IO.File]::ReadAllText((Join-Path $repo 'crates/darak-core/src/lib.rs')).Replace("`r`n", "`n")
     $oldLib = [IO.File]::ReadAllText((Join-Path $baseline 'crates/darak-core/src/lib.rs')).Replace("`r`n", "`n")
-    Assert-True ($lib.Replace("#[cfg(feature = `"perf`")]`npub mod perf;`n`n", '') -ceq $oldLib) 'Core lib overlay includes a non-harness change'
+    $perfModule = "#[cfg(feature = `"perf`")]`npub mod perf;`n`n"
+    Assert-True ($lib.Contains($perfModule)) 'Candidate lib does not declare the perf harness module'
+    $firstModule = $oldLib.IndexOf("pub mod ")
+    Assert-True ($firstModule -ge 0 -and -not $oldLib.Contains('mod perf;')) 'Baseline lib has an unexpected layout'
+    $baselineLib = $oldLib.Insert($firstModule, $perfModule)
     $manifest = [IO.File]::ReadAllText((Join-Path $repo 'crates/darak-core/Cargo.toml')).Replace("`r`n", "`n")
     $oldManifest = [IO.File]::ReadAllText((Join-Path $baseline 'crates/darak-core/Cargo.toml')).Replace("`r`n", "`n")
     $registration = "`n[features]`nperf = []`n`n[[example]]`nname = `"search_bench`"`nrequired-features = [`"perf`"]`n"
     Assert-True ($manifest.Replace($registration, '') -ceq $oldManifest) 'Core manifest overlay includes a non-harness change'
-    $overlay = @('crates/darak-core/src/perf.rs', 'crates/darak-core/src/lib.rs', 'crates/darak-core/Cargo.toml', 'crates/darak-core/examples/search_bench.rs')
+    $overlay = @('crates/darak-core/src/perf.rs', 'crates/darak-core/Cargo.toml', 'crates/darak-core/examples/search_bench.rs')
     foreach ($relative in $overlay) {
         $source = Join-Path $repo $relative
         $destination = Join-Path $baseline $relative
@@ -177,6 +183,9 @@ try {
         Copy-Item -LiteralPath $source -Destination $destination
         $metadata.harness += [ordered]@{ path = $relative; sha256 = (Get-FileHash -Algorithm SHA256 $source).Hash }
     }
+    $baselineLibPath = Join-Path $baseline 'crates/darak-core/src/lib.rs'
+    [IO.File]::WriteAllText($baselineLibPath, $baselineLib, [Text.UTF8Encoding]::new($false))
+    $metadata.harness += [ordered]@{ path = 'crates/darak-core/src/lib.rs'; sha256 = (Get-FileHash -Algorithm SHA256 $baselineLibPath).Hash }
     Assert-True ((Get-FileHash (Join-Path $repo 'Cargo.lock')).Hash -eq (Get-FileHash (Join-Path $baseline 'Cargo.lock')).Hash) 'Baseline lockfile differs'
     $metadata.baseline_search_sha256 = (Get-FileHash (Join-Path $baseline 'crates/darak-core/src/search.rs')).Hash
     $metadata.candidate_search_sha256 = (Get-FileHash (Join-Path $repo 'crates/darak-core/src/search.rs')).Hash

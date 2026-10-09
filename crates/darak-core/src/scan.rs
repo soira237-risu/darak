@@ -541,7 +541,9 @@ impl LiveSnapshot {
             if d.direct_files > 0 {
                 order.push((d.direct_alloc, None));
             }
-            preview_sort_by(&mut order, |a, b| b.0.cmp(&a.0), cancelled)?;
+            // 미리 보기 worker는 스캔과 rayon pool을 나눠 쓰지 않도록 순차로 정렬한다.
+            crate::sort::sort_by_key(&mut order, |e| (std::cmp::Reverse(e.0), e.1), crate::sort::Exec::Sequential, cancelled)
+                .map_err(|_| PreviewCancelled)?;
             let first = tree.nodes.len() as u32;
             tree.nodes[node_id as usize].first_child = first;
             tree.nodes[node_id as usize].child_count = order.len() as u32;
@@ -607,46 +609,6 @@ fn preview_checkpoint(i: usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Result
 fn preview_step(work: &mut usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Result<(), PreviewCancelled> {
     preview_checkpoint(*work, cancelled)?;
     *work = work.wrapping_add(1);
-    Ok(())
-}
-
-/// Sort bounded runs, then merge with cancellation checks every 256 emitted items.
-/// Only a single <=4,096-item run sort can execute between cancellation checks.
-fn preview_sort_by<T: Copy>(
-    values: &mut Vec<T>,
-    mut compare: impl FnMut(&T, &T) -> std::cmp::Ordering,
-    cancelled: &(dyn Fn() -> bool + Sync),
-) -> Result<(), PreviewCancelled> {
-    const RUN: usize = 4_096;
-    preview_check(cancelled)?;
-    for run in values.chunks_mut(RUN) {
-        run.sort_unstable_by(&mut compare);
-        preview_check(cancelled)?;
-    }
-    if values.len() <= RUN { return Ok(()); }
-    let mut scratch = Vec::with_capacity(values.len());
-    let mut width = RUN;
-    while width < values.len() {
-        scratch.clear();
-        for start in (0..values.len()).step_by(width.saturating_mul(2)) {
-            let mid = (start + width).min(values.len());
-            let end = mid.saturating_add(width).min(values.len());
-            let (mut left, mut right) = (start, mid);
-            while left < mid || right < end {
-                preview_checkpoint(scratch.len(), cancelled)?;
-                if right == end || (left < mid && compare(&values[left], &values[right]).is_le()) {
-                    scratch.push(values[left]);
-                    left += 1;
-                } else {
-                    scratch.push(values[right]);
-                    right += 1;
-                }
-            }
-        }
-        std::mem::swap(values, &mut scratch);
-        width = width.saturating_mul(2);
-        preview_check(cancelled)?;
-    }
     Ok(())
 }
 
@@ -913,36 +875,6 @@ mod tests {
                 assert_eq!(tree.parent(child), Some(id));
             }
         }
-    }
-
-    #[test]
-    fn sibling_sort_cancellation_stops_after_one_bounded_run() {
-        use std::sync::atomic::AtomicUsize;
-        let cancelled = AtomicBool::new(false);
-        let largest_seen = AtomicUsize::new(0);
-        let mut values: Vec<_> = (0..8_193).map(|i| (8_193 - i, i)).collect();
-        let result = preview_sort_by(&mut values, |a, b| {
-            largest_seen.fetch_max(a.1.max(b.1), Relaxed);
-            cancelled.store(true, Relaxed);
-            a.0.cmp(&b.0)
-        }, &|| cancelled.load(Relaxed));
-        assert_eq!(result, Err(PreviewCancelled));
-        assert!(largest_seen.load(Relaxed) < 4_096, "another sort run started after cancellation");
-    }
-
-    #[test]
-    fn sibling_merge_checks_cancellation_within_256_items() {
-        use std::sync::atomic::AtomicUsize;
-        let cross_run_comparisons = AtomicUsize::new(0);
-        let mut values: Vec<_> = (0..8_192).map(|i| (i % 4_096, i)).collect();
-        let result = preview_sort_by(&mut values, |a, b| {
-            if a.1 / 4_096 != b.1 / 4_096 {
-                cross_run_comparisons.fetch_add(1, Relaxed);
-            }
-            a.0.cmp(&b.0)
-        }, &|| cross_run_comparisons.load(Relaxed) > 0);
-        assert_eq!(result, Err(PreviewCancelled));
-        assert!((1..=256).contains(&cross_run_comparisons.load(Relaxed)));
     }
 
     #[test]
