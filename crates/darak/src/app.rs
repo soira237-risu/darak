@@ -19,6 +19,7 @@ use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
 use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
 use darak_core::search::{Query, now_secs2000};
 use crate::search_panel;
+use crate::theme;
 use crate::treemap::{self, Detail, Highlights, Item, ItemKind, Layout, LayoutSource, Morph, MorphKey, Style, ZoomAnim};
 
 pub struct App {
@@ -98,6 +99,7 @@ impl App {
         #[cfg(feature = "perf")] trace: Option<crate::perf_trace::PerfTrace>,
     ) -> Self {
         crate::fonts::install(&cc.egui_ctx);
+        crate::theme::install(&cc.egui_ctx);
         search.set_waker(cc.egui_ctx.clone());
         preview.set_waker(cc.egui_ctx.clone());
         #[cfg(feature = "perf")]
@@ -546,7 +548,7 @@ impl eframe::App for App {
 
         // Result clicks can change a focus-only scope before the treemap draws.
         if show_results { self.search_pass(false); } else { self.update_search(); }
-        let bg = ui.style().visuals.extreme_bg_color;
+        let bg = theme::of(ui).bg_app;
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(bg)).show(ui, |ui| {
             if self.scanning.is_some() {
                 self.scan_view(ui);
@@ -603,6 +605,7 @@ impl App {
             }));
 
             let edit = ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
+            theme::focus_ring(ui, &edit);
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
 
             if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("📁 폴더…")).clicked()
@@ -643,7 +646,7 @@ impl App {
             ui.separator();
             if ui
                 .add_enabled(self.detail.level() > Detail::MIN, egui::Button::new("－"))
-                .on_hover_text("덜 자세히: 큰 박스만 (-)")
+                .on_hover_text("덜 자세히: 큰 박스만 ([ 또는 -)")
                 .clicked()
             {
                 self.detail = self.detail.less();
@@ -651,7 +654,7 @@ impl App {
             ui.label(format!("상세도 {}/{}", self.detail.level(), Detail::MAX));
             if ui
                 .add_enabled(self.detail.level() < Detail::MAX, egui::Button::new("＋"))
-                .on_hover_text("더 자세히: 작은 폴더와 파일까지 (+)")
+                .on_hover_text("더 자세히: 작은 폴더와 파일까지 (] 또는 +)")
                 .clicked()
             {
                 self.detail = self.detail.more();
@@ -664,6 +667,7 @@ impl App {
                         .desired_width(240.0)
                         .hint_text("🔎 검색  (예: *.mp4 size:>1gb)"),
                 );
+                theme::focus_ring(ui, &resp);
                 if self.focus_search {
                     resp.request_focus();
                     self.focus_search = false;
@@ -682,7 +686,7 @@ impl App {
                 if !doc.marks.is_empty() {
                     ui.separator();
                     let txt = format!("🗑 표시 {}개 · {}  검토…", doc.marks.len(), human_size(doc.marked_size(self.mode)));
-                    if ui.add_enabled(filesystem_actions_enabled(doc) && self.scanning.is_none() && self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(Color32::from_rgb(170, 50, 45))).clicked() {
+                    if ui.add_enabled(filesystem_actions_enabled(doc) && self.scanning.is_none() && self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(theme::of(ui).danger_fill)).clicked() {
                         review = true;
                     }
                     if ui.add_enabled(self.pending_removal.is_none(), egui::Button::new("표시 모두 해제").small()).clicked() {
@@ -707,7 +711,7 @@ impl App {
                 }
                 if ui
                     .add_enabled(doc.focus != Tree::ROOT, egui::Button::new("⬆"))
-                    .on_hover_text("상위 폴더 (Backspace)")
+                    .on_hover_text("상위 폴더 (Alt+↑)")
                     .clicked()
                 {
                     doc.go_up();
@@ -744,7 +748,7 @@ impl App {
         }
         ui.horizontal(|ui| {
             if let Some(e) = &self.error {
-                ui.colored_label(Color32::from_rgb(230, 90, 80), format!("⚠ {e}"));
+                ui.colored_label(theme::of(ui).danger_text, format!("⚠ {e}"));
                 return;
             }
             if self.pending_removal.is_some() {
@@ -804,14 +808,24 @@ impl App {
             for d in &self.drives {
                 let used = d.total.saturating_sub(d.free);
                 let frac = if d.total > 0 { used as f32 / d.total as f32 } else { 0.0 };
-                // 카드 전체가 버튼이다
-                let frame = egui::Frame::group(ui.style()).inner_margin(12.0).show(ui, |ui| {
+                // 카드 전체가 버튼이다. 호버 모양은 지난 프레임의 응답으로 정해서 내용 뒤에 깐다.
+                let card_id = ui.id().with(("drive-card", &d.root));
+                let hovered = ui.ctx().read_response(card_id).is_some_and(|r| r.hovered());
+                let t = theme::of(ui);
+                let (fill, line) = if hovered { (t.surface_raised, t.line_hover) } else { (t.bg_app, t.line) };
+                let frame = egui::Frame::new()
+                    .fill(fill)
+                    .stroke(egui::Stroke::new(1.0, line))
+                    .corner_radius(6)
+                    .inner_margin(16)
+                    .show(ui, |ui| {
                     ui.set_width(420.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&d.root).size(18.0).strong());
                         ui.label(RichText::new(d.kind_label()).weak());
                     });
-                    ui.add(egui::ProgressBar::new(frac).desired_height(8.0));
+                    // 사용량 막대는 회색, 90% 이상이면 warn
+                    ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(if frac >= 0.9 { t.warn } else { t.text_secondary }));
                     ui.label(
                         RichText::new(format!("{} 사용 / {} · {} 여유", human_size(used), human_size(d.total), human_size(d.free)))
                             .weak(),
@@ -819,12 +833,10 @@ impl App {
                 });
                 let rect = frame.response.rect;
                 let resp = ui
-                    .interact(rect, ui.id().with(("drive-card", &d.root)), egui::Sense::click())
+                    .interact(rect, card_id, egui::Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if resp.hovered() {
-                    let v = ui.visuals();
-                    ui.painter().rect_filled(rect, 4.0, v.selection.bg_fill.gamma_multiply(0.15));
-                    ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.5, v.selection.bg_fill), egui::StrokeKind::Inside);
+                if resp.hovered() != hovered {
+                    ui.ctx().request_repaint();
                 }
                 if resp.clicked() {
                     chosen = Some(d.root.clone());
@@ -879,7 +891,7 @@ impl App {
                 ui.add_space(16.0);
                 ui.add(bar().desired_width(420.0));
                 ui.add_space(8.0);
-                ui.label(RichText::new(&eta_text).size(15.0));
+                ui.label(RichText::new(&eta_text).size(16.0));
                 ui.add_space(16.0);
                 if ui.button("중지").clicked() {
                     p.cancel();
@@ -1111,7 +1123,7 @@ impl App {
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
         let Some((msg, at)) = &self.toast else { return };
-        if at.elapsed() > Duration::from_secs(3) {
+        if at.elapsed() > Duration::from_millis(2500) {
             self.toast = None;
             return;
         }
@@ -1141,7 +1153,7 @@ impl App {
                 || i.pointer.button_pressed(PointerButton::Extra2)
             {
                 doc.go_forward();
-            } else if i.key_pressed(Key::Backspace) {
+            } else if i.key_pressed(Key::Backspace) || i.modifiers.alt && i.key_pressed(Key::ArrowUp) {
                 doc.go_up();
             } else if i.key_pressed(Key::Enter) {
                 if let Some(s) = doc.selected {
@@ -1151,9 +1163,9 @@ impl App {
                 doc.selected = None;
             } else if i.key_pressed(Key::Space) || i.key_pressed(Key::X) || i.key_pressed(Key::Delete) {
                 toggle = doc.selected;
-            } else if i.key_pressed(Key::Minus) {
+            } else if i.key_pressed(Key::Minus) || i.key_pressed(Key::OpenBracket) {
                 detail = Some(false);
-            } else if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) {
+            } else if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) || i.key_pressed(Key::CloseBracket) {
                 detail = Some(true);
             }
         });
@@ -1272,15 +1284,15 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
     });
     match doc.mark_state(it.node) {
         1 => {
-            ui.colored_label(Color32::from_rgb(230, 90, 80), "🗑 삭제 표시됨");
+            ui.colored_label(theme::of(ui).danger_text, "🗑 삭제 표시됨");
         }
         2 => {
-            ui.colored_label(Color32::from_rgb(230, 90, 80), "🗑 상위 폴더가 삭제 표시됨");
+            ui.colored_label(theme::of(ui).danger_text, "🗑 상위 폴더가 삭제 표시됨");
         }
         _ => {}
     }
     if n.has(flags::DENIED) {
-        ui.colored_label(Color32::from_rgb(230, 160, 60), "⚠ 접근이 거부되어 일부 크기를 모릅니다");
+        ui.colored_label(theme::of(ui).warn, "⚠ 접근이 거부되어 일부 크기를 모릅니다");
     }
     if n.has(flags::HARDLINK_DUP) {
         ui.label(RichText::new("하드링크: 다른 경로에서 이미 세었으므로 0으로 계산").weak());

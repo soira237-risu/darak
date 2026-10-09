@@ -9,6 +9,7 @@ mod perf_trace;
 mod preview_worker;
 mod search_panel;
 mod search_worker;
+mod theme;
 mod treemap;
 
 fn main() -> eframe::Result {

@@ -9,6 +9,7 @@ use darak_core::{Kind, NodeId, SizeMode, human_size, thousands};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::doc::Doc;
+use crate::theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -71,7 +72,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                             let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
                             ui.label(format!("{icon} {}", doc.tree.path(id)));
                             if let Some(r) = protected_reason(&doc.tree, id) {
-                                ui.colored_label(Color32::from_rgb(230, 120, 60), format!("⚠ {r}"));
+                                ui.colored_label(theme::of(ui).warn, format!("⚠ {r}"));
                             }
                         });
                     }
@@ -88,7 +89,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     *error = None;
                 }
                 if *method == Method::Permanent
-                    && ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(Color32::from_rgb(230, 90, 80))).changed() {
+                    && ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(theme::of(ui).danger_text)).changed() {
                     *error = None;
                 }
                 ui.add_space(6.0);
@@ -99,7 +100,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                         Method::Recycle => format!("🗑 휴지통으로 이동 ({})", human_size(total)),
                         Method::Permanent => format!("⚠ 영구 삭제 ({})", human_size(total)),
                     };
-                    let btn = egui::Button::new(RichText::new(label).strong()).fill(Color32::from_rgb(170, 50, 45));
+                    let btn = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(theme::of(ui).danger_fill);
                     if ui.add_enabled(can_run, btn).clicked() {
                         match build_items(doc, &items, mode) {
                             Ok(jobs) => next = Some(start(jobs, *method)),
@@ -111,7 +112,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     }
                 });
                 if let Some(message) = error.as_deref() {
-                    ui.colored_label(Color32::from_rgb(230, 90, 80), message);
+                    ui.colored_label(theme::of(ui).danger_text, message);
                 }
             }
             Stage::Running { total, done, rx } => {
@@ -129,9 +130,9 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                 let failed: Vec<&Outcome> = outcomes.iter().filter(|o| o.error.is_some()).collect();
                 let freed: u64 = ok.iter().map(|o| o.size).sum();
                 ui.heading("삭제 결과");
-                ui.label(format!("성공 {}개 · {} 확보", ok.len(), human_size(freed)));
+                ui.colored_label(theme::of(ui).ok, format!("성공 {}개 · {} 확보", ok.len(), human_size(freed)));
                 if !failed.is_empty() {
-                    ui.colored_label(Color32::from_rgb(230, 90, 80), format!("실패 {}개", failed.len()));
+                    ui.colored_label(theme::of(ui).danger_text, format!("실패 {}개", failed.len()));
                     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                         for o in failed {
                             ui.label(RichText::new(&o.path).strong());

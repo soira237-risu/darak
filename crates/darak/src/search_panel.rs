@@ -1,8 +1,9 @@
 //! 검색 결과 패널 (가상 스크롤 표)
 
 use darak_core::{Kind, NodeId, SizeMode, format_time, human_size, thousands};
-use eframe::egui::{self, Color32, RichText, Sense};
+use eframe::egui::{self, RichText, Sense};
 use crate::doc::Doc;
+use crate::theme;
 
 pub fn controls(ui: &mut egui::Ui, doc: &mut Doc) -> bool {
     let mut changed = false;
@@ -29,7 +30,7 @@ pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
     let mut action = Action::None;
     let s = &mut doc.search;
     if let Some(e) = &s.error {
-        ui.colored_label(Color32::from_rgb(230, 120, 60), e);
+        ui.colored_label(theme::of(ui).danger_text, e);
         return action;
     }
     let Some(res) = &s.result else {
@@ -56,9 +57,9 @@ pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
             let painter = ui.painter_at(rect);
             let visuals = ui.visuals();
             if selected == Some(id) {
-                painter.rect_filled(rect, 2.0, visuals.selection.bg_fill);
+                painter.rect_filled(rect, 3.0, visuals.selection.bg_fill);
             } else if resp.hovered() {
-                painter.rect_filled(rect, 2.0, visuals.widgets.hovered.weak_bg_fill);
+                painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
             }
             let text = visuals.text_color();
             let weak = visuals.weak_text_color();

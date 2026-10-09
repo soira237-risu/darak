@@ -17,6 +17,8 @@ pub fn install(ctx: &Context) {
         ("msyh.ttc", false),
         ("seguisym.ttf", false),
     ];
+    // 고정폭: Cascadia Mono → Consolas. 한글 등은 위 글꼴로 대체된다.
+    let mono_fonts = ["CascadiaMono.ttf", "consola.ttf"];
     let mut primary = Vec::new();
     let mut fallback = Vec::new();
     for (file, is_primary) in candidates {
@@ -30,7 +32,16 @@ pub fn install(ctx: &Context) {
         prop.insert(i, name.clone());
     }
     prop.extend(fallback.iter().cloned());
+    let mut mono_primary = Vec::new();
+    for file in mono_fonts {
+        let Ok(bytes) = std::fs::read(format!("{dir}{file}")) else { continue };
+        fonts.font_data.insert(file.to_string(), Arc::new(FontData::from_owned(bytes)));
+        mono_primary.push(file.to_string());
+    }
     let mono = fonts.families.entry(FontFamily::Monospace).or_default();
+    for (i, name) in mono_primary.iter().enumerate() {
+        mono.insert(i, name.clone());
+    }
     mono.extend(primary.iter().chain(&fallback).cloned());
 
     ctx.set_fonts(fonts);

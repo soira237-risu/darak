@@ -10,8 +10,10 @@ use eframe::egui::{
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::theme;
+
 /// 디렉터리 제목 바 높이
-pub const HEADER_H: f32 = 16.0;
+pub const HEADER_H: f32 = 17.0;
 /// 디렉터리 안쪽 여백
 const PAD: f32 = 2.0;
 /// 한 디렉터리에서 그릴 최대 자식 수
@@ -399,7 +401,7 @@ pub struct ZoomAnim {
     pub old_items: Vec<Item>,
 }
 
-pub const ANIM_SECS: f32 = 0.22;
+pub const ANIM_SECS: f32 = 0.15;
 
 impl ZoomAnim {
     pub fn zoom_in(from: Rect, old_items: Vec<Item>) -> Self {
@@ -678,7 +680,8 @@ pub fn paint(
     hl: &Highlights,
 ) {
     let border = style.border();
-    let mark_color = Color32::from_rgb(220, 60, 60);
+    let t = theme::tokens(style.dark);
+    let mark_color = t.mark;
     let hover_glow = Color32::WHITE;
     let clip = painter.clip_rect();
     for it in items {
@@ -708,10 +711,10 @@ pub fn paint(
                     body_bg = lerp(body_bg, mark_color, 0.35);
                 }
                 if hovered {
-                    head_bg = lerp(head_bg, Color32::from_rgb(255, 196, 64), 0.55);
+                    head_bg = lerp(head_bg, t.accent_hover, 0.55);
                     body_bg = lerp(body_bg, hover_glow, 0.25);
                 } else if in_chain {
-                    head_bg = lerp(head_bg, Color32::from_rgb(255, 196, 64), 0.28);
+                    head_bg = lerp(head_bg, t.accent_hover, 0.28);
                 }
                 painter.rect_filled(r, CornerRadius::ZERO, fa(body_bg));
                 let head = Rect::from_min_max(r.min, Pos2::new(r.max.x, (r.min.y + HEADER_H).min(r.max.y)));
@@ -754,7 +757,7 @@ pub fn paint(
                     bg = bg.gamma_multiply(0.6);
                 }
                 if dim {
-                    bg = lerp(bg, if style.dark { Color32::from_gray(25) } else { Color32::from_gray(235) }, 0.75);
+                    bg = lerp(bg, t.bg_app, 0.75);
                 }
                 if hovered {
                     bg = lerp(bg, hover_glow, 0.35);
@@ -772,7 +775,7 @@ pub fn paint(
                 // 삭제 표시는 색을 섞지 않고 빨간 빗금과 테두리를 겹친다 (어떤 범주색 위에서도 같게 보이도록)
                 if marked {
                     let m = Color32::from_rgba_unmultiplied(mark_color.r(), mark_color.g(), mark_color.b(), 140);
-                    hatch(painter, r, fa(m), 10.0, 2.0);
+                    hatch(painter, r, fa(m), 8.0, 2.0);
                     painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.0, fa(mark_color)), StrokeKind::Inside);
                 }
 
@@ -800,7 +803,7 @@ pub fn paint(
     // 선택 테두리는 맨 위에
     if let Some(s) = hl.selected.and_then(|s| items.iter().find(|it| it.node == s && !matches!(it.kind, ItemKind::Group { .. }))) {
         let r = camera.map_or(s.rect, |c| c.map(s.rect));
-        painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.5, Color32::from_rgb(255, 184, 28)), StrokeKind::Inside);
+        painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.5, theme::tokens(style.dark).accent), StrokeKind::Inside);
         // 안쪽의 어두운 선: 노란·주황 타일 위에서도 앰버 테두리가 보이게
         if r.width() > 10.0 && r.height() > 10.0 {
             painter.rect_stroke(r.shrink(2.5), CornerRadius::ZERO, Stroke::new(1.5, Color32::from_rgb(20, 20, 24)), StrokeKind::Inside);
