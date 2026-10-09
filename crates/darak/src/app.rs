@@ -468,7 +468,6 @@ impl App {
             _ => RemovalApply::Rejected,
         };
         if applied == RemovalApply::Busy {
-            self.error = Some("검색 작업자가 트리 소유권을 반환하지 않았습니다".into());
             return;
         }
         let fence = pending.fence;
@@ -728,9 +727,16 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        if self.pending_removal.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
         ui.horizontal(|ui| {
             if let Some(e) = &self.error {
                 ui.colored_label(Color32::from_rgb(230, 90, 80), format!("⚠ {e}"));
+                return;
+            }
+            if self.pending_removal.is_some() {
+                ui.label("삭제 결과를 반영하는 중입니다…");
                 return;
             }
             if let Some(s) = &self.scanning {
@@ -1916,6 +1922,131 @@ mod tests {
         shutdown(runtime);
     }
 
+    const REMOVAL_WAIT_TEXT: &str = "삭제 결과를 반영하는 중입니다…";
+
+    fn removal_status_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+        let mut output = ctx.run_ui(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 400.0))),
+            time: Some(time),
+            ..Default::default()
+        }, |ui| {
+            egui::Panel::bottom("removal-status-test").show(ui, |ui| app.status_bar(ui));
+            app.update_search();
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    fn removal_shape_has_text(shape: &egui::epaint::Shape, text: &str) -> bool {
+        match shape {
+            egui::epaint::Shape::Text(shape) => shape.galley.text().contains(text),
+            egui::epaint::Shape::Vec(shapes) => shapes.iter().any(|shape| removal_shape_has_text(shape, text)),
+            _ => false,
+        }
+    }
+
+    fn has_removal_text(output: &egui::FullOutput, text: &str) -> bool {
+        output.shapes.iter().any(|shape| removal_shape_has_text(&shape.shape, text))
+    }
+
+    #[test]
+    fn removal_wait_repaints_until_applied() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let mut time = 0.0;
+        for _ in 0..4 {
+            removal_status_frame(&ctx, &mut app, time);
+            time += 0.1;
+        }
+        let lease = Arc::clone(&app.doc.as_ref().unwrap().tree);
+        app.begin_removal(1, vec![1]);
+        let fence = app.pending_removal.as_ref().unwrap().fence;
+        app.search_control(SearchControlEvent::Released(fence));
+        let output = removal_status_frame(&ctx, &mut app, time);
+        assert!(has_removal_text(&output, REMOVAL_WAIT_TEXT));
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay <= Duration::from_millis(50), "retry repaint not scheduled: {delay:?}");
+        assert!(app.pending_removal.is_some());
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
+        assert!(app.error.is_none());
+        time += delay.as_secs_f64();
+        drop(lease);
+        let output = removal_status_frame(&ctx, &mut app, time);
+        assert!(app.pending_removal.is_none());
+        assert!(!app.removal_released);
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 1);
+        // The status drawn before this frame's apply needs one last repaint.
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay <= Duration::from_millis(50));
+        time += delay.as_secs_f64();
+        let mut output = removal_status_frame(&ctx, &mut app, time);
+        for _ in 0..3 {
+            time += 0.1;
+            output = removal_status_frame(&ctx, &mut app, time);
+        }
+        assert!(!has_removal_text(&output, REMOVAL_WAIT_TEXT));
+        assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay > Duration::from_millis(50));
+        assert!(app.error.is_none());
+        assert_eq!(app.doc.as_ref().unwrap().tree.version, 1);
+    }
+
+    #[test]
+    fn removal_wait_preserves_scan_error() {
+        for error in [None, Some("기존 스캔 오류".to_owned())] {
+            let ctx = egui::Context::default();
+            let mut app = app(fixture(1));
+            app.error = error.clone();
+            for frame in 0..4 {
+                removal_status_frame(&ctx, &mut app, frame as f64 * 0.1);
+            }
+            let lease = Arc::clone(&app.doc.as_ref().unwrap().tree);
+            app.begin_removal(1, vec![1]);
+            let fence = app.pending_removal.as_ref().unwrap().fence;
+            app.search_control(SearchControlEvent::Released(fence));
+            let output = removal_status_frame(&ctx, &mut app, 0.4);
+            assert_eq!(app.error, error);
+            assert!(output.viewport_output[&egui::ViewportId::ROOT].repaint_delay <= Duration::from_millis(50));
+            if let Some(error) = &error {
+                assert!(has_removal_text(&output, error));
+            }
+            drop(lease);
+            app.finish_removal();
+            assert_eq!(app.error, error);
+            assert!(app.pending_removal.is_none());
+        }
+    }
+
+    #[test]
+    fn rejected_removal_clears_wait_state() {
+        for replacement in [Some((2, 0)), Some((1, 1)), None] {
+            let mut app = app(fixture(1));
+            let lease = Arc::clone(&app.doc.as_ref().unwrap().tree);
+            app.begin_removal(1, vec![1]);
+            let fence = app.pending_removal.as_ref().unwrap().fence;
+            app.search_control(SearchControlEvent::Released(fence));
+            app.finish_removal();
+            assert!(app.pending_removal.is_some());
+            app.doc = replacement.map(|(id, version)| {
+                let mut doc = fixture(id);
+                Arc::get_mut(&mut doc.tree).unwrap().version = version;
+                doc
+            });
+            app.finish_removal();
+            assert!(app.pending_removal.is_none());
+            assert!(!app.removal_released);
+            assert!(app.error.is_none());
+            if let Some((_, version)) = replacement {
+                let tree = &app.doc.as_ref().unwrap().tree;
+                assert_eq!(tree.version, version);
+                assert!(!tree.node(1).has(flags::REMOVED));
+            }
+            let ctx = egui::Context::default();
+            let output = removal_status_frame(&ctx, &mut app, 0.0);
+            assert!(!has_removal_text(&output, REMOVAL_WAIT_TEXT));
+            drop(lease);
+        }
+    }
+
     #[test]
     fn wrong_fence_cannot_apply_removal() {
         let mut app = app(fixture(1));
@@ -1941,11 +2072,14 @@ mod tests {
         app.search_control(SearchControlEvent::Released(fence));
         app.finish_removal();
         assert!(app.pending_removal.is_some());
-        assert!(app.error.is_some());
+        assert!(app.removal_released);
+        assert!(app.error.is_none());
         assert_eq!(app.doc.as_ref().unwrap().tree.version, 0);
         drop(lease);
         app.finish_removal();
         assert_eq!(app.doc.as_ref().unwrap().tree.version, 1);
+        assert!(app.pending_removal.is_none());
+        assert!(!app.removal_released);
     }
 
     #[test]
