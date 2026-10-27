@@ -625,6 +625,12 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// ui보다 먼저, 그리고 창이 최소화되거나 가려져 ui를 그리지 않을 때도 불린다
+    /// (작업 표시줄에서 닫기를 눌러도 삭제 중이면 막는다).
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.guard_close(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.show(ui);
     }
@@ -697,7 +703,6 @@ impl App {
         #[cfg(feature = "perf")]
         self.perf_record_draw(table_draw.as_ref());
         self.delete_dialog_ui(&ctx);
-        self.guard_close(&ctx);
         self.confirm_ui(&ctx);
         self.toast_ui(&ctx);
         self.keyboard(&ctx);
@@ -1308,11 +1313,15 @@ impl App {
     }
 
     /// 삭제가 진행 중이면 창 닫기를 미룬다. 닫히면 작업자 스레드가 끊겨 반쯤 지운 채 아무 기록도 남지 않는다.
+    /// eframe의 logic에서 부른다. 최소화된 창이면 다시 띄워 진행 상황과 안내가 보이게 한다.
     fn guard_close(&mut self, ctx: &egui::Context) {
         if self.delete_dialog.as_ref().is_some_and(|d| matches!(d.stage, Stage::Running { .. }))
             && ctx.input(|i| i.viewport().close_requested())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if ctx.input(|i| i.viewport().minimized == Some(true)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
             self.toast("삭제가 끝난 뒤에 닫을 수 있습니다");
         }
     }
@@ -1375,8 +1384,8 @@ impl App {
         let mut undo = false;
         egui::Area::new(egui::Id::new("toast"))
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
-            // 알림만 하는 안내는 모달(삭제 중 창 등) 위에 그린다. 그 층은 누를 수 없으므로 버튼이 있으면 보통 층에 둔다
-            .order(if toast.undo.is_some() { egui::Order::Middle } else { egui::Order::Tooltip })
+            // 모달(검토·삭제 중 창) 위에 그린다. 모달보다 위 층이라 '되돌리기'도 누를 수 있다
+            .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
@@ -2223,15 +2232,23 @@ mod tests {
         }
     }
 
-    /// 창의 X 버튼을 누른 한 프레임 (앱 전체)
-    fn close_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+    /// 창의 X 버튼을 누른 입력
+    fn close_input(time: f64) -> egui::RawInput {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
             time: Some(time),
             ..Default::default()
         };
         input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
-        let mut output = ctx.run_ui(input, |ui| app.show(ui));
+        input
+    }
+
+    /// 창의 X 버튼을 누른 한 프레임 (앱 전체, eframe처럼 logic 다음 ui)
+    fn close_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+        let mut output = ctx.run_ui(close_input(time), |ui| {
+            app.guard_close(ui.ctx());
+            app.show(ui);
+        });
         output.textures_delta.clear();
         output
     }
@@ -2265,6 +2282,22 @@ mod tests {
         full_frame(&ctx, &mut app, vec![], 0.4);
         assert!(matches!(app.delete_dialog.as_ref().unwrap().stage, Stage::Report { .. }));
         assert!(!cancels_close(&close_frame(&ctx, &mut app, 0.5)));
+    }
+
+    #[test]
+    fn minimized_close_waits_for_running_delete() {
+        // 최소화된 창은 ui 없이 logic만 돌므로, 작업 표시줄에서 닫아도 막고 창을 다시 띄워야 한다
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let (_tx, rx) = mpsc::channel();
+        app.delete_dialog = Some(Dialog { doc_id: 1, stage: running_stage(rx) });
+        let mut input = close_input(0.0);
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().minimized = Some(true);
+        let output = ctx.run_logic(&input, |ctx| app.guard_close(ctx));
+        let commands = &output.viewport_commands[&egui::ViewportId::ROOT];
+        assert!(commands.contains(&egui::ViewportCommand::CancelClose));
+        assert!(commands.contains(&egui::ViewportCommand::Minimized(false)));
+        assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some("삭제가 끝난 뒤에 닫을 수 있습니다"));
     }
 
     #[test]
@@ -2345,6 +2378,16 @@ mod tests {
         assert_eq!(doc.marks, marks);
         assert_eq!(doc.mark_state(3), 1);
         assert!(app.toast.is_none());
+
+        // 검토 창(모달)이 열려 있어도 안내가 그 위에 있어 되돌릴 수 있다
+        app.clear_marks();
+        app.delete_dialog = Some(Dialog {
+            doc_id: 1,
+            stage: Stage::Review { method: Method::Recycle, confirmed: false, error: None, bin: RecycleBin::Available { capacity: None } },
+        });
+        press_text(&ctx, &mut app, "되돌리기", &mut time);
+        assert_eq!(app.doc.as_ref().unwrap().marks, marks);
+        app.delete_dialog = None;
 
         // 그 사이 새 표시가 생기면 버튼을 숨기고 되돌리지 않는다
         app.clear_marks();

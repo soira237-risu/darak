@@ -213,7 +213,8 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     ui.add(egui::Label::new(RichText::new(&it.path).monospace().weak()).truncate());
                 }
                 ui.label(RichText::new(format!("경과 {}초", started.elapsed().as_secs())).weak());
-                if total > 1 && d < total {
+                // 지금 항목 뒤에 남은 항목이 있을 때만
+                if d + 1 < total {
                     if cancel.load(Relaxed) {
                         ui.label(RichText::new("지금 항목이 끝나면 멈춥니다").weak());
                     } else if ui.button("남은 항목 취소").clicked() {
