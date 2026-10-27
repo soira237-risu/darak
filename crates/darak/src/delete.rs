@@ -189,7 +189,8 @@ fn start(items: Vec<Item>, method: Method) -> Stage {
             let mut out = Vec::with_capacity(items.len());
             for it in items {
                 let res = match method {
-                    Method::Recycle => recycle(&it.path),
+                    // TODO(PR5): UI 스레드에서 얻은 owner_window()를 넘겨 영구 삭제 경고를 Darak 창 위에 띄운다
+                    Method::Recycle => recycle(&it.path, 0),
                     Method::Permanent => delete_permanently(&it.path, it.is_dir),
                 };
                 out.push(Outcome { node: it.node, path: it.path, size: it.size, error: res.err().map(|e| e.to_string()) });

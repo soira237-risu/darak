@@ -177,9 +177,10 @@ impl Tree {
     }
 
     /// 서브트리 전체를 REMOVED로 표시하고 값을 0으로 만든다. 조상 합계는 한 번 차감하며 자식 구간은 유지한다.
-    pub fn remove(&mut self, id: NodeId) {
+    /// 새로 지운 (파일 수, 폴더 수)를 돌려준다 (상태 바 통계 갱신용). 루트이거나 이미 지운 노드면 (0, 0).
+    pub fn remove(&mut self, id: NodeId) -> (u64, u64) {
         if id == Self::ROOT || self.node(id).has(flags::REMOVED) {
-            return;
+            return (0, 0);
         }
         let (alloc, logical, files) = {
             let n = self.node(id);
@@ -193,16 +194,22 @@ impl Tree {
             p.files = p.files.saturating_sub(files);
             cur = p.parent;
         }
+        let mut dirs = 0;
         let mut stack = vec![id];
         while let Some(current) = stack.pop() {
             stack.extend(self.children(current));
             let n = &mut self.nodes[current as usize];
+            // 먼저 지운 하위 폴더는 이미 셌다
+            if n.kind == Kind::Dir && !n.has(flags::REMOVED) {
+                dirs += 1;
+            }
             n.flags |= flags::REMOVED;
             n.alloc = 0;
             n.logical = 0;
             n.files = 0;
         }
         self.version += 1;
+        (files as u64, dirs)
     }
 }
 

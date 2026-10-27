@@ -26,6 +26,22 @@ pub const FSCTL_GET_NTFS_VOLUME_DATA: u32 = 0x0009_0064;
 pub const DRIVE_REMOVABLE: u32 = 2;
 pub const DRIVE_FIXED: u32 = 3;
 pub const DRIVE_REMOTE: u32 = 4;
+/// SetErrorMode: 매체 없는 드라이브를 건드려도 '디스크 없음' 대화상자를 띄우지 않는다
+pub const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+
+/// NUL을 포함한 UTF-16 경로 한도. 셸 API(휴지통 이동 등)는 이보다 긴 경로를 다루지 못한다
+pub const MAX_PATH: usize = 260;
+
+// 미리 정의된 레지스트리 루트. 32비트 값을 부호 확장해야 64비트 HKEY가 된다 (0x8000_0001 as isize는 틀린 값)
+pub const HKEY_CURRENT_USER: HANDLE = 0x8000_0001u32 as i32 as isize as HANDLE;
+pub const HKEY_LOCAL_MACHINE: HANDLE = 0x8000_0002u32 as i32 as isize as HANDLE;
+/// RegGetValueW: REG_DWORD 값만 받는다
+pub const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
+
+/// SHObjectProperties: 이름이 파일 시스템 경로
+pub const SHOP_FILEPATH: u32 = 2;
+/// SystemParametersInfoW: 창 안 애니메이션 효과가 켜져 있는지 (BOOL)
+pub const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
 
 /// FILE_ID_BOTH_DIR_INFO (x64 기준 헤더 104바이트, 뒤에 FileName이 이어진다)
 #[repr(C)]
@@ -142,6 +158,40 @@ unsafe extern "system" {
     ) -> i32;
     pub fn ReadFile(h: HANDLE, buf: *mut c_void, len: u32, read: *mut u32, overlapped: *mut OVERLAPPED) -> i32;
     pub fn K32GetProcessMemoryInfo(p: HANDLE, c: *mut PROCESS_MEMORY_COUNTERS, cb: u32) -> i32;
+    pub fn GetVolumePathNameW(path: *const u16, out: *mut u16, len: u32) -> i32;
+    pub fn GetVolumeNameForVolumeMountPointW(mount: *const u16, out: *mut u16, len: u32) -> i32;
+    pub fn GetVolumeInformationW(
+        root: *const u16,
+        volume_name: *mut u16,
+        volume_name_size: u32,
+        serial: *mut u32,
+        max_component: *mut u32,
+        fs_flags: *mut u32,
+        fs_name: *mut u16,
+        fs_name_size: u32,
+    ) -> i32;
+    pub fn GetSystemWindowsDirectoryW(buf: *mut u16, size: u32) -> u32;
+    pub fn GetErrorMode() -> u32;
+    pub fn SetErrorMode(mode: u32) -> u32;
+}
+
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    pub fn RegGetValueW(
+        hkey: HANDLE,
+        sub: *const u16,
+        value: *const u16,
+        flags: u32,
+        ty: *mut u32,
+        data: *mut c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    pub fn GetActiveWindow() -> HANDLE;
+    pub fn SystemParametersInfoW(action: u32, param: u32, pv: *mut c_void, ini: u32) -> i32;
 }
 
 #[link(name = "shell32")]
@@ -155,6 +205,7 @@ unsafe extern "system" {
         dir: *const u16,
         show: i32,
     ) -> HANDLE;
+    pub fn SHObjectProperties(hwnd: HANDLE, kind: u32, name: *const u16, page: *const u16) -> i32;
 }
 
 /// 닫힐 때 CloseHandle을 호출하는 핸들

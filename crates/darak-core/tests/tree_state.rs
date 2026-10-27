@@ -137,15 +137,15 @@ fn keeps_root_and_handles_deep_subtree() {
             .iter()
             .all(|n| !n.has(flags::REMOVED) && (n.alloc, n.logical, n.files) == (7, 11, 1))
     );
-    tree.remove(1);
+    assert_eq!(tree.remove(1), (1, u64::from(DEPTH) - 1));
     assert_eq!(totals(&tree, Tree::ROOT), (0, 0, 0));
     assert!(!tree.node(Tree::ROOT).has(flags::REMOVED));
     for id in 1..=DEPTH {
         assert_removed(&tree, id);
     }
     assert_eq!(tree.version, 1);
-    tree.remove(DEPTH);
-    tree.remove(1);
+    assert_eq!(tree.remove(DEPTH), (0, 0));
+    assert_eq!(tree.remove(1), (0, 0));
     assert_eq!(tree.version, 1);
 }
 
@@ -186,4 +186,24 @@ fn removes_child_then_parent_without_double_subtraction() {
     tree.remove(FOLDER);
     assert_eq!(tree.version, 2);
     assert_eq!(totals(&tree, Tree::ROOT), (40, 50, 1));
+}
+
+#[test]
+fn remove_reports_removed_files_and_dirs() {
+    let mut tree = fixture();
+    assert_eq!(tree.remove(Tree::ROOT), (0, 0));
+    assert_eq!(tree.remove(FOLDER), (2, 1));
+    assert_eq!(tree.remove(FOLDER), (0, 0));
+    assert_eq!(tree.remove(CHILD2), (0, 0));
+    assert_eq!(tree.remove(SIBLING), (1, 0));
+
+    // 자식을 먼저 지우고 부모를 지워도 폴더를 두 번 세지 않는다
+    let mut tree = fixture();
+    add_node(&mut tree, "Inner", FOLDER, Kind::Dir, (0, 0, 0));
+    add_node(&mut tree, "link", FOLDER, Kind::Link, (0, 0, 0));
+    tree.nodes[FOLDER as usize].child_count = 4;
+    assert_eq!(tree.remove(CHILD1), (1, 0));
+    assert_eq!(tree.remove(5), (0, 1));
+    assert_eq!(tree.remove(FOLDER), (1, 1), "link는 폴더로 세지 않는다");
+    assert!(tree.node(6).has(flags::REMOVED));
 }
