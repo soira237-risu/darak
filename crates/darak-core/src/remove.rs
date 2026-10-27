@@ -331,32 +331,53 @@ pub fn recycle(path: &str, owner: isize) -> io::Result<()> {
     Ok(())
 }
 
-/// 삭제 실패 코드를 문장으로 바꾼다. SHFileOperationW의 DE_* 코드와 Win32 오류 코드를 함께 다룬다.
-/// 모르는 코드면 None.
+const MISSING: &str = "항목을 찾을 수 없습니다 (이미 옮겨졌거나 이름이 바뀌었을 수 있음)";
+const DENIED: &str = "권한이 없습니다 (관리자 권한이 필요하거나 시스템이 보호하는 파일)";
+const TOO_LONG: &str = "경로가 너무 깁니다";
+const CANCELLED: &str = "취소해서 지우지 않았습니다";
+
+/// SHFileOperationW 실패 코드를 문장으로 바꾼다. DE_* 코드는 일부 Win32 코드와 값이 겹치며
+/// (0x79 = ERROR_SEM_TIMEOUT 등) 여기서는 DE_* 뜻이 먼저다. 모르는 코드면 None.
 fn describe(code: i32) -> Option<(io::ErrorKind, &'static str)> {
     use io::ErrorKind::{Interrupted, NotFound, Other, PermissionDenied};
     Some(match code {
-        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, DE_INVALIDFILES
-        2 | 3 | 0x7C => (NotFound, "항목을 찾을 수 없습니다 (이미 옮겨졌거나 이름이 바뀌었을 수 있음)"),
-        // ERROR_ACCESS_DENIED, DE_ACCESSDENIEDSRC
-        5 | 0x78 => (PermissionDenied, "권한이 없습니다 (관리자 권한이 필요하거나 시스템이 보호하는 파일)"),
+        // DE_INVALIDFILES
+        0x7C => (NotFound, MISSING),
+        // DE_ACCESSDENIEDSRC
+        0x78 => (PermissionDenied, DENIED),
+        // DE_PATHTOODEEP, DE_FILENAMETOOLONG, DE_ERROR_MAX
+        0x79 | 0x81 | 0xB7 => (Other, TOO_LONG),
+        // DE_OPCANCELLED
+        0x75 => (Interrupted, CANCELLED),
+        _ => return win32_message(code),
+    })
+}
+
+/// Win32 오류 코드만 문장으로 바꾼다. std 파일 작업의 오류는 DE_* 코드가 아니므로 이 표만 쓴다.
+fn win32_message(code: i32) -> Option<(io::ErrorKind, &'static str)> {
+    use io::ErrorKind::{Interrupted, NotFound, Other, PermissionDenied};
+    Some(match code {
+        // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+        2 | 3 => (NotFound, MISSING),
+        // ERROR_ACCESS_DENIED
+        5 => (PermissionDenied, DENIED),
         // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
         32 | 33 => (Other, "다른 프로그램이 사용 중인 파일이 있습니다"),
         // ERROR_DIR_NOT_EMPTY
         145 => (Other, "폴더 안의 일부 항목을 지우지 못했습니다"),
         // ERROR_WRITE_PROTECT
         19 => (Other, "쓰기 금지된 드라이브입니다"),
-        // ERROR_FILENAME_EXCED_RANGE, DE_PATHTOODEEP, DE_FILENAMETOOLONG, DE_ERROR_MAX
-        206 | 0x79 | 0x81 | 0xB7 => (Other, "경로가 너무 깁니다"),
-        // DE_OPCANCELLED, ERROR_CANCELLED
-        0x75 | 1223 => (Interrupted, "취소해서 지우지 않았습니다"),
+        // ERROR_FILENAME_EXCED_RANGE
+        206 => (Other, TOO_LONG),
+        // ERROR_CANCELLED
+        1223 => (Interrupted, CANCELLED),
         _ => return None,
     })
 }
 
 /// io 오류의 Win32 코드를 문장으로 바꾼다 (종류는 그대로 둔다)
 fn humanize(e: io::Error) -> io::Error {
-    match e.raw_os_error().and_then(describe) {
+    match e.raw_os_error().and_then(win32_message) {
         Some((_, message)) => io::Error::new(e.kind(), message),
         None => e,
     }
@@ -483,8 +504,10 @@ mod tests {
         let e = humanize(io::Error::from_raw_os_error(145));
         assert_eq!(e.kind(), io::ErrorKind::DirectoryNotEmpty);
         assert_eq!(e.to_string(), "폴더 안의 일부 항목을 지우지 못했습니다");
-        let unknown = humanize(io::Error::from_raw_os_error(87));
-        assert_eq!(unknown.raw_os_error(), Some(87));
+        // DE_* 값과 겹치는 Win32 코드는 DE_* 뜻으로 바꾸지 않는다 (ERROR_SEM_TIMEOUT, ERROR_ALREADY_EXISTS …)
+        for code in [87, 0x75, 0x78, 0x79, 0x7C, 0x81, 0xB7] {
+            assert_eq!(humanize(io::Error::from_raw_os_error(code)).raw_os_error(), Some(code), "0x{code:X}");
+        }
         let custom = humanize(io::Error::other("그대로"));
         assert_eq!(custom.to_string(), "그대로");
     }
