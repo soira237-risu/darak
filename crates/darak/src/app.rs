@@ -449,7 +449,9 @@ impl App {
     }
 
     /// 안내의 '되돌리기': 지운 표시를 다시 놓는다. 문서나 트리가 바뀌었거나 새 표시가 있으면 하지 않는다.
+    /// 스캔 중에도 하지 않는다 (숨은 문서에 표시가 생기면 스캔이 끝날 때 묻지 않고 사라진다).
     fn undo_clear(&mut self) {
+        if self.scanning.is_some() { return; }
         let Some(Toast { undo: Some(cleared), .. }) = self.toast.take() else { return };
         if self.pending_removal.is_none()
             && let Some(doc) = &mut self.doc
@@ -963,7 +965,7 @@ impl App {
                     doc.navigate(n);
                 }
                 let f = doc.tree.node(doc.focus);
-                let note = incomplete_note(&doc.tree, doc.focus);
+                let note = incomplete_note(doc, doc.focus);
                 let size = ui.label(
                     RichText::new(format!(
                         "  {}{}  ·  {} 파일",
@@ -1535,8 +1537,9 @@ impl App {
             self.toast = None;
             return;
         }
-        // 되돌릴 수 없게 된 뒤(새 표시, 다른 문서)에는 버튼을 숨긴다
-        let can_undo = toast.undo.as_ref().is_some_and(|u| self.doc.as_ref().is_some_and(|doc| u.applies_to(doc)));
+        // 되돌릴 수 없게 된 뒤(새 표시, 다른 문서)와 스캔 중에는 버튼을 숨긴다
+        let can_undo = self.scanning.is_none()
+            && toast.undo.as_ref().is_some_and(|u| self.doc.as_ref().is_some_and(|doc| u.applies_to(doc)));
         let mut undo = false;
         egui::Area::new(egui::Id::new("toast"))
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
@@ -1743,7 +1746,7 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         }
         _ => {}
     }
-    if let Some(note) = incomplete_note(tree, it.node) {
+    if let Some(note) = incomplete_note(doc, it.node) {
         ui.colored_label(theme::of(ui).warn, format!("⚠ {note}"));
         if let Some(names) = unread_children(tree, it.node) {
             ui.label(RichText::new(names).weak());
@@ -1767,17 +1770,17 @@ fn morph_items<'a>(morph: &mut Morph, items: &'a [Item], key: MorphKey, out: &'a
 }
 
 /// 크기를 다 세지 못한 까닭 (툴팁·breadcrumb). 다 셌으면 None.
-fn incomplete_note(tree: &Tree, id: NodeId) -> Option<&'static str> {
-    let n = tree.node(id);
+fn incomplete_note(doc: &Doc, id: NodeId) -> Option<&'static str> {
+    let (tree, n) = (&doc.tree, doc.tree.node(id));
     if n.has(flags::DENIED) {
         Some("접근이 거부되어 일부 크기를 모릅니다")
     } else if !n.has(flags::INCOMPLETE) {
         None
-    } else if tree.live_children(id).any(|c| tree.node(c).incomplete()) {
-        Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다")
-    } else {
-        // 중지 때문에 이 폴더 자체를 읽지 않았다
+    } else if doc.stats.cancelled && !tree.live_children(id).any(|c| tree.node(c).incomplete()) {
+        // 중지 때문에 이 폴더 자체를 읽지 않았다 (끝까지 한 스캔이면 읽지 못한 하위 폴더를 지운 경우라 아래 문구)
         Some("스캔을 중지해 읽지 못한 폴더라 실제 크기는 더 클 수 있습니다")
+    } else {
+        Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다")
     }
 }
 
@@ -2607,6 +2610,17 @@ mod tests {
         assert!(!has_removal_text(&output, "되돌리기"));
         app.undo_clear();
         assert_eq!(app.doc.as_ref().unwrap().marks.iter().copied().collect::<Vec<_>>(), [2]);
+        // 스캔 중에는 숨은 이전 문서에 표시를 되살리지 않는다 (끝나면 묻지 않고 사라지므로)
+        app.clear_marks();
+        let (_tx, rx) = mpsc::channel();
+        app.begin_scan("D:\\Other".into(), Arc::default(), rx, None);
+        let output = full_frame(&ctx, &mut app, vec![], time + 0.2);
+        assert!(has_removal_text(&output, "표시 1개를 모두 해제했습니다"));
+        assert!(!has_removal_text(&output, "되돌리기"));
+        app.undo_clear();
+        assert!(app.doc.as_ref().unwrap().marks.is_empty());
+        app.scanning = None;
+        app.doc.as_mut().unwrap().toggle_mark(2).unwrap();
         // 트리가 바뀌었거나 다른 문서여도 되돌리지 않는다
         for replace in [false, true] {
             app.clear_marks();
@@ -4430,7 +4444,7 @@ mod tests {
             node(&mut tree, name, 0, Kind::Dir, 20, 0, 0);
         }
         let mut d = doc(1, tree);
-        assert_eq!(incomplete_note(&d.tree, 0), None);
+        assert_eq!(incomplete_note(&d, 0), None);
         assert_eq!(unread_children(&d.tree, 0), None);
         let tree = Arc::get_mut(&mut d.tree).unwrap();
         tree.nodes[0].flags |= flags::INCOMPLETE;
@@ -4438,11 +4452,15 @@ mod tests {
         for id in 2..5 {
             tree.nodes[id].flags |= flags::INCOMPLETE;
         }
-        assert_eq!(incomplete_note(&d.tree, 0), Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다"));
+        assert_eq!(incomplete_note(&d, 0), Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다"));
         assert_eq!(unread_children(&d.tree, 0).as_deref(), Some("이어지는 하위 폴더: a, b, c 외 1개"));
-        assert_eq!(incomplete_note(&d.tree, 1), Some("접근이 거부되어 일부 크기를 모릅니다"));
-        assert!(incomplete_note(&d.tree, 2).unwrap().starts_with("스캔을 중지해"));
-        assert_eq!(incomplete_note(&d.tree, 5), None);
+        assert_eq!(incomplete_note(&d, 1), Some("접근이 거부되어 일부 크기를 모릅니다"));
+        assert_eq!(incomplete_note(&d, 5), None);
+        // 하위 폴더 없이 INCOMPLETE면 중지한 스캔에서만 '중지해 읽지 못한 폴더'다
+        assert_eq!(incomplete_note(&d, 2), Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다"));
+        d.stats.cancelled = true;
+        assert!(incomplete_note(&d, 2).unwrap().starts_with("스캔을 중지해"));
+        assert!(incomplete_note(&d, 0).unwrap().starts_with("읽지 못한 하위 폴더가"));
         // 지운 폴더는 이어지는 곳이 아니다
         d.apply_removed(&[4]);
         assert_eq!(unread_children(&d.tree, 0).as_deref(), Some("이어지는 하위 폴더: a, b, c"));
