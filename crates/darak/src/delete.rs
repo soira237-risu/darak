@@ -141,6 +141,11 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                             {
                                 ui.colored_label(t.warn, "⚠ 휴지통 불가").on_hover_text(b.reason());
                             }
+                            // 접근 거부로 읽지 못한 곳이 안에 있다 (트리 합계보다 더 지워진다)
+                            if n.incomplete() {
+                                ui.colored_label(t.warn, "⚠ 읽지 못한 하위 폴더 있음")
+                                    .on_hover_text("실제로 지워지는 양은 보이는 크기보다 클 수 있습니다");
+                            }
                             let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
                             ui.add(egui::Label::new(format!("{icon} {}", doc.tree.path(id))).truncate());
                         });
@@ -335,6 +340,10 @@ fn run_blocker(doc: &Doc, items: &[NodeId], method: Method, confirmed: bool, bin
 /// 실제 파일 작업 직전에 목록 전체를 다시 검사한다: 보호 정책, 그리고 휴지통 방식이면 휴지통으로 보낼 수 있는지
 /// (검토 창이 버튼을 막더라도 한 번 더 막는다).
 fn build_items(doc: &Doc, ids: &[NodeId], method: Method, bin: RecycleBin) -> Result<Vec<Item>, String> {
+    // 앱이 표시와 검토를 막지만 한 번 더 막는다 (읽지 않은 폴더가 0 B로 보이는 결과)
+    if doc.stats.cancelled {
+        return Err("중지한 스캔의 결과로는 삭제할 수 없습니다".into());
+    }
     ids.iter()
         .map(|&id| {
             if id as usize >= doc.tree.len() {
@@ -678,6 +687,33 @@ mod tests {
         Arc::get_mut(&mut doc.tree).unwrap().nodes[1].flags &= !flags::LOSSY_NAME;
         Arc::get_mut(&mut doc.tree).unwrap().nodes[3].flags |= flags::REMOVED;
         assert!(build_items(&doc, &[2, 3], Method::Recycle, AVAILABLE).is_err());
+    }
+
+    #[test]
+    fn refuses_jobs_from_stopped_scan() {
+        let mut doc = fixture(1);
+        doc.stats.cancelled = true;
+        for method in [Method::Recycle, Method::Permanent] {
+            assert_eq!(build_items(&doc, &[2], method, AVAILABLE).err().as_deref(), Some("중지한 스캔의 결과로는 삭제할 수 없습니다"));
+        }
+    }
+
+    #[test]
+    fn unread_folders_are_badged_in_review() {
+        let ctx = egui::Context::default();
+        let mut doc = fixture(1);
+        doc.toggle_mark(1).unwrap();
+        let mut dlg = review_dialog(Method::Recycle);
+        let draw = |dlg: &mut Dialog, doc: &mut Doc, t0: f64| {
+            let mut output = render_review_frame(&ctx, dlg, doc, vec![], t0);
+            for frame in 1..3 {
+                output = render_review_frame(&ctx, dlg, doc, vec![], t0 + frame as f64 * 0.1);
+            }
+            output
+        };
+        assert!(!has_text(&draw(&mut dlg, &mut doc, 0.0), "읽지 못한 하위 폴더 있음"));
+        Arc::get_mut(&mut doc.tree).unwrap().nodes[1].flags |= flags::INCOMPLETE;
+        assert!(has_text(&draw(&mut dlg, &mut doc, 1.0), "⚠ 읽지 못한 하위 폴더 있음"));
     }
 
     #[test]

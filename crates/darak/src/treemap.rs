@@ -726,7 +726,8 @@ pub fn paint(
                     let wide = head.width() > 120.0;
                     let size_w = (size_txt.chars().count() as f32) * 6.6 + 6.0;
                     let name_max = (head.width() - 8.0 - if wide { size_w } else { 0.0 }).max(10.0);
-                    let warn = if n.has(flags::DENIED) { " ⚠" } else { "" };
+                    // 접근 거부·중지로 읽지 못한 폴더가 안에 있다 (따라 내려가면 그 폴더에 닿는다)
+                    let warn = if n.incomplete() { " ⚠" } else { "" };
                     label(&clip, Pos2::new(head.min.x + 4.0, head.min.y + 1.5), format!("{name}{warn}"), 11.5, tc, name_max, false);
                     if wide {
                         clip.text(
@@ -785,6 +786,7 @@ pub fn paint(
                     let (title, sub) = match it.kind {
                         ItemKind::Group { count, size } => (format!("작은 항목 {count}개"), human_size(size)),
                         ItemKind::Link => (format!("{name} →"), "링크".to_string()),
+                        ItemKind::ClosedDir if n.incomplete() => (name.to_string(), format!("{} ⚠", human_size(n.size(mode)))),
                         _ => (name.to_string(), human_size(n.size(mode))),
                     };
                     // SpaceSniffer처럼 이름과 크기를 가운데에

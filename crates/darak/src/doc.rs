@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::search_worker::{SearchCompletion, SearchKey};
 
 use darak_core::remove::{Guard, protected_reason_as};
-use darak_core::search::SearchResult;
+use darak_core::search::{SearchResult, now_secs2000};
 use darak_core::{Kind, NodeId, ScanStats, SizeMode, Tree};
 
 pub struct Doc {
@@ -27,6 +27,17 @@ pub struct Doc {
     pub guard: Guard,
     /// 지우다 실패해 일부만 지워졌을 수 있는 폴더 (크기를 믿기 어렵다, 다시 스캔해야 맞아진다)
     pub stale: BTreeSet<NodeId>,
+    /// 스캔을 마친 시각 (2000년 기준 초)
+    pub scanned_at: u32,
+}
+
+/// 같은 루트를 다시 스캔할 때 새 문서로 이어 가는 위치와 검색 설정
+pub struct Carry {
+    /// 루트 아래에서 focus까지의 폴더 이름
+    focus: Vec<String>,
+    query: String,
+    in_focus_only: bool,
+    highlight: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -71,7 +82,37 @@ impl Doc {
             search: SearchState { highlight: true, ..Default::default() },
             guard: Guard::default(),
             stale: BTreeSet::new(),
+            scanned_at: now_secs2000(),
         }
+    }
+
+    /// 다시 스캔한 새 문서로 넘길 위치와 검색 설정
+    pub fn carry(&self) -> Carry {
+        let chain = self.tree.ancestry(self.focus);
+        Carry {
+            focus: chain[1..].iter().map(|&n| self.tree.name(n).to_owned()).collect(),
+            query: self.search.query.clone(),
+            in_focus_only: self.search.in_focus_only,
+            highlight: self.search.highlight,
+        }
+    }
+
+    /// 이전 문서의 위치를 이름으로 따라간다. 이름이 정확히 같은 폴더가 없으면 거기서 멈춘 폴더를 보여 준다.
+    /// 기록(뒤로·앞으로)과 삭제 표시는 이어 가지 않는다.
+    pub fn apply_carry(&mut self, c: Carry) {
+        let tree = &self.tree;
+        let mut focus = Tree::ROOT;
+        for name in &c.focus {
+            match tree.live_children(focus).find(|&ch| tree.node(ch).kind == Kind::Dir && tree.name(ch) == name) {
+                Some(ch) => focus = ch,
+                None => break,
+            }
+        }
+        self.focus = focus;
+        self.search.query = c.query;
+        self.search.in_focus_only = c.in_focus_only;
+        self.search.highlight = c.highlight;
+        // TODO(PR18): 범위를 복원한 focus에 고정한다 (self.set_search_scope(c.in_focus_only))
     }
 
     pub fn navigate(&mut self, to: NodeId) {
@@ -148,6 +189,10 @@ impl Doc {
         if self.marks.remove(&id) {
             self.rebuild_mark_bits();
             return Ok(0);
+        }
+        // 표시 해제는 위에서 끝났다. 새 표시만 막는다
+        if self.stats.cancelled {
+            return Err("중지한 스캔의 일부 결과라 삭제 표시를 할 수 없습니다 · 다시 스캔하세요".into());
         }
         if self.mark_state(id) == 2 {
             return Err("상위 폴더가 이미 삭제 표시되어 있습니다".into());
@@ -528,4 +573,46 @@ pub(crate) mod tests {
         assert_eq!(doc.search.result.as_ref().unwrap().total_size, 100);
     }
 
+    #[test]
+    fn carry_follows_names_and_stops_at_missing_folder() {
+        let mut old = fixture(1);
+        old.navigate(1);
+        old.search.query = "child".into();
+        old.search.in_focus_only = true;
+        old.search.highlight = false;
+        let mut next = fixture(2);
+        next.apply_carry(old.carry());
+        assert_eq!(next.tree.name(next.focus), "folder");
+        assert_eq!(next.search.query, "child");
+        assert!(next.search.in_focus_only && !next.search.highlight);
+        assert!(next.back.is_empty() && next.marks.is_empty());
+        // 같은 이름이 파일뿐이거나 없으면 루트에서 멈춘다
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 40, 1, 1);
+        node(&mut tree, "folder", 0, Kind::File, 40, 0, 0);
+        let mut other = doc(3, tree);
+        other.apply_carry(old.carry());
+        assert_eq!(other.focus, Tree::ROOT);
+        assert_eq!(other.search.query, "child");
+        // 지운 폴더도 따라가지 않는다
+        let mut removed = fixture(4);
+        removed.apply_removed(&[1]);
+        removed.apply_carry(old.carry());
+        assert_eq!(removed.focus, Tree::ROOT);
+    }
+
+    #[test]
+    fn partial_document_refuses_new_marks() {
+        let mut doc = fixture(1);
+        assert!(doc.scanned_at > 0);
+        doc.restore_marks(BTreeSet::from([2]));
+        doc.stats.cancelled = true;
+        assert!(doc.toggle_mark(3).is_err());
+        assert_eq!(doc.marks, BTreeSet::from([2]));
+        // 이미 있는 표시는 풀 수 있다
+        assert_eq!(doc.toggle_mark(2), Ok(0));
+        assert!(doc.marks.is_empty());
+        assert!(doc.toggle_mark(2).is_err());
+        assert!(doc.marks.is_empty());
+    }
 }

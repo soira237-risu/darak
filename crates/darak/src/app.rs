@@ -106,11 +106,12 @@ impl ClearedMarks {
 }
 
 /// 삭제 표시를 잃는 동작을 하기 전에 묻는 내용. 모두 `confirm_ui` 하나로 그린다.
-// TODO(PR7): 새 스캔·다시 스캔을 묻는 Scan(String)을 더한다
 #[derive(Debug, PartialEq)]
 enum Confirm {
     /// 관리자 권한으로 다시 열기 (새 창이 스캔할 루트, None이면 처음 화면)
     Relaunch(Option<String>),
+    /// 새 스캔·다시 스캔 (스캔할 루트, normalize_root를 거친 값)
+    Scan(String),
 }
 
 /// '관리자로 실행'이 지금 할 수 있는 일
@@ -198,6 +199,42 @@ impl App {
             app.start_scan(arg.to_string_lossy().into_owned());
         }
         app
+    }
+
+    /// 새 스캔을 시작할 수 없는 까닭 (스캔 시작 컨트롤의 툴팁). 시작할 수 있으면 None.
+    fn scan_blocked(&self) -> Option<&'static str> {
+        if self.scanning.is_some() {
+            Some("스캔 중에는 새로 시작할 수 없습니다 · 스캔 화면에서 먼저 중지하세요")
+        } else if self.delete_dialog.is_some() || self.pending_removal.is_some() {
+            Some("삭제를 마친 뒤에 스캔할 수 있습니다")
+        } else if self.confirm.is_some() {
+            Some("확인 창에 먼저 답하세요")
+        } else {
+            None
+        }
+    }
+
+    fn can_start_scan(&self) -> bool {
+        self.scan_blocked().is_none()
+    }
+
+    /// UI의 모든 스캔 진입점(드라이브·경로·폴더·환영 카드·다시 스캔). 삭제 표시가 있으면 먼저 묻는다.
+    fn request_scan(&mut self, root: String) {
+        if !self.can_start_scan() { return; }
+        let root = normalize_root(&root);
+        if self.doc.as_ref().is_some_and(|doc| !doc.marks.is_empty()) {
+            self.confirm = Some(Confirm::Scan(root));
+        } else {
+            self.start_scan(root);
+        }
+    }
+
+    /// 지금 문서의 루트를 다시 스캔한다 (↻·F5). 같은 루트라 끝나면 위치와 검색어를 이어 간다 (Doc::carry).
+    fn rescan(&mut self) {
+        if let Some(doc) = &self.doc {
+            let root = doc.tree.name(Tree::ROOT).to_owned();
+            self.request_scan(root);
+        }
     }
 
     fn start_scan(&mut self, root: String) {
@@ -294,7 +331,8 @@ impl App {
     }
 
     fn open_delete_review(&mut self) {
-        if self.doc.as_ref().is_some_and(|doc| !filesystem_actions_enabled(doc)) { return; }
+        // 중지한 스캔의 일부 결과는 크기가 실제보다 작으므로 검토하지 않는다
+        if self.doc.as_ref().is_some_and(|doc| !filesystem_actions_enabled(doc) || doc.stats.cancelled) { return; }
         if self.scanning.is_some() || self.delete_dialog.is_some() || self.pending_removal.is_some() {
             return;
         }
@@ -305,39 +343,73 @@ impl App {
         }
     }
 
+    /// 스캔 결과를 받는다.
+    ///
+    /// 중지했고 이전 문서가 있으면 결과를 기다리지 않고 바로 이전 문서(위치·삭제 표시 그대로)로 돌아간다.
+    /// 받는 쪽(rx)을 버리므로 스캔 스레드가 나중에 보내는 부분 결과는 들어올 수 없다. 이 복원 경로는 이전 문서를
+    /// 그대로 쓰므로 보호 수준(Guard)을 다시 정하지 않고, 최근 경로에도 기록하지 않는다 (뒤 PR에서 이 함수가
+    /// '새 문서를 받았는지'를 돌려주면 false다). 검색 재개는 다른 경로와 같이 끝의 공용 처리가 맡는다.
+    ///
+    /// 이전 문서가 없으면(첫 스캔) 읽은 데까지의 결과를 문서로 만든다(stats.cancelled, 배너·⚠, 삭제 표시 불가).
+    /// 하나도 읽지 못했거나 MFT처럼 부분 결과가 없으면 환영 화면으로 돌아가고 안내만 띄운다.
     fn poll_scan(&mut self) {
         let Some(s) = &self.scanning else { return };
-        let result = s.rx.try_recv();
+        let stopped = s.progress.is_cancelled();
         let resumed_at = Instant::now();
-        if !matches!(result, Err(mpsc::TryRecvError::Empty)) {
+        if stopped && let Some(doc) = &self.doc {
             self.preview.invalidate(s.scan_id);
             self.morph.invalidate();
-        }
-        match result {
-            Ok(Ok(res)) => {
-                self.suspend_search();
-                self.context_node = None;
-                self.anim = None;
-                self.last_focus = None;
-                let mut doc = Doc::new(self.next_doc_id, res.tree, res.stats);
-                if self.elevated {
-                    doc.guard = Guard::Admin;
+            self.root_input = doc.tree.name(Tree::ROOT).to_owned();
+            self.scanning = None;
+            self.toast("스캔을 중지했습니다 · 이전 결과를 그대로 보여 줍니다");
+        } else {
+            let result = s.rx.try_recv();
+            if !matches!(result, Err(mpsc::TryRecvError::Empty)) {
+                self.preview.invalidate(s.scan_id);
+                self.morph.invalidate();
+            }
+            match result {
+                Ok(Ok(res)) if stopped && res.tree.node(Tree::ROOT).child_count == 0 => {
+                    self.scanning = None;
+                    self.toast("스캔을 중지했습니다");
                 }
-                self.doc = Some(doc);
-                self.morph_until = Some(Instant::now() + Duration::from_millis(1500));
-                self.next_doc_id += 1;
-                self.scanning = None;
-                self.layout.invalidate();
-                self.drives = list_drives();
-            }
-            Ok(Err(e)) => {
-                self.error = Some(format!("{}: {e}", s.root));
-                self.scanning = None;
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                self.error = Some("스캔 스레드가 비정상 종료했습니다".into());
-                self.scanning = None;
+                Ok(Err(_)) if stopped => {
+                    self.scanning = None;
+                    self.toast("스캔을 중지했습니다");
+                }
+                Ok(Ok(res)) => {
+                    // 같은 루트를 다시 스캔했으면 보던 위치와 검색 설정을 이어 간다
+                    let carry = self.doc.as_ref()
+                        .filter(|d| d.tree.name(Tree::ROOT).eq_ignore_ascii_case(res.tree.name(Tree::ROOT)))
+                        .map(Doc::carry);
+                    self.suspend_search();
+                    self.context_node = None;
+                    self.anim = None;
+                    self.last_focus = None;
+                    let mut doc = Doc::new(self.next_doc_id, res.tree, res.stats);
+                    if self.elevated {
+                        doc.guard = Guard::Admin;
+                    }
+                    if let Some(c) = carry {
+                        doc.apply_carry(c);
+                    }
+                    // 미리 보기는 루트 기준이라 하위 폴더로 돌아가면 모양 보간이 어색하다
+                    self.morph_until = (doc.focus == Tree::ROOT).then(|| Instant::now() + Duration::from_millis(1500));
+                    self.doc = Some(doc);
+                    self.next_doc_id += 1;
+                    self.scanning = None;
+                    self.layout.invalidate();
+                    self.drives = list_drives();
+                }
+                Ok(Err(e)) => {
+                    self.error = Some(format!("{}: {e}", s.root));
+                    self.scanning = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.error = Some("스캔 스레드가 비정상 종료했습니다".into());
+                    self.scanning = None;
+                }
             }
         }
         // Fresh resume event excludes suspension but includes subsequent UI work.
@@ -694,6 +766,7 @@ impl App {
             if self.scanning.is_some() {
                 self.scan_view(ui);
             } else if self.doc.is_some() {
+                self.partial_notice(ui);
                 ui.add_enabled_ui(self.pending_removal.is_none(), |ui| self.treemap_view(ui));
             } else {
                 self.welcome(ui);
@@ -725,10 +798,17 @@ impl App {
 impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        let (mut review, mut clear) = (false, false);
+        let (mut review, mut clear, mut rescan) = (false, false, false);
+        // 스캔 중에는 스캔 시작 컨트롤을 모두 끄고 까닭을 툴팁으로 알린다 (중지는 스캔 화면에만 있다)
+        let blocked = self.scan_blocked();
+        let can_scan = blocked.is_none();
+        let why = |r: egui::Response| match blocked {
+            Some(w) => r.on_disabled_hover_text(w),
+            None => r,
+        };
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(self.delete_dialog.is_none() && self.pending_removal.is_none(), |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
-                let mut chosen = None;
+            let mut chosen = None;
+            why(ui.add_enabled_ui(can_scan, |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
                 for d in &self.drives {
                     let txt = format!(
                         "{}  {}  ({} 여유 / {})",
@@ -741,26 +821,22 @@ impl App {
                         chosen = Some(d.root.clone());
                     }
                 }
-                if let Some(r) = chosen {
-                    self.start_scan(r);
-                }
-            }));
+            }).response).inner);
+            if let Some(r) = chosen {
+                self.request_scan(r);
+            }
 
-            let edit = ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
+            let edit = why(ui.add_enabled(can_scan, egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로")));
             theme::focus_ring(ui, &edit);
             // Enter는 여기서 쓰고 지운다 (keyboard()가 선택한 항목을 열거나 확대하지 않게)
             let enter = edit.lost_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
 
-            if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("📁 폴더…")).clicked()
+            if why(ui.add_enabled(can_scan, egui::Button::new("📁 폴더…"))).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.start_scan(dir.display().to_string());
+                    self.request_scan(dir.display().to_string());
                 }
-            if self.scanning.is_some() {
-                if ui.button("⏹ 중지").clicked() {
-                    self.cancel_scan();
-                }
-            } else if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("🔍 스캔")).clicked() || enter {
-                self.start_scan(self.root_input.clone());
+            if why(ui.add_enabled(can_scan, egui::Button::new("🔍 스캔"))).clicked() || enter {
+                self.request_scan(self.root_input.clone());
             }
 
             // 상태는 admin_relaunch()가 정한다 (자리는 PR12에서 환영 화면·상태 바로 옮긴다)
@@ -803,7 +879,8 @@ impl App {
                 self.detail = self.detail.more();
             }
 
-            if let Some(doc) = &mut self.doc {
+            // 스캔 중에는 이전 문서의 검색 칸과 표시 묶음을 숨긴다 (보이지 않는 문서를 고치지 않게)
+            if self.scanning.is_none() && let Some(doc) = &mut self.doc {
                 ui.separator();
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut doc.search.query)
@@ -849,7 +926,8 @@ impl App {
             self.clear_marks();
         }
 
-        if let Some(doc) = &mut self.doc {
+        // 둘째 줄(이동·경로)도 스캔 중에는 숨긴다. 중지하면 그대로 돌아온다
+        if self.scanning.is_none() && let Some(doc) = &mut self.doc {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 if ui.add_enabled(!doc.back.is_empty(), egui::Button::new("⬅")).on_hover_text("뒤로 (Alt+←)").clicked() {
@@ -866,6 +944,7 @@ impl App {
                 {
                     doc.go_up();
                 }
+                rescan = why(ui.add_enabled(can_scan, egui::Button::new("↻")).on_hover_text("다시 스캔 (F5)")).clicked();
                 ui.separator();
                 let chain = doc.tree.ancestry(doc.focus);
                 let mut go = None;
@@ -884,10 +963,23 @@ impl App {
                     doc.navigate(n);
                 }
                 let f = doc.tree.node(doc.focus);
-                ui.label(
-                    RichText::new(format!("  {}  ·  {} 파일", human_size(f.size(self.mode)), thousands(f.files as u64))).weak(),
+                let note = incomplete_note(&doc.tree, doc.focus);
+                let size = ui.label(
+                    RichText::new(format!(
+                        "  {}{}  ·  {} 파일",
+                        human_size(f.size(self.mode)),
+                        if note.is_some() { " ⚠" } else { "" },
+                        thousands(f.files as u64)
+                    ))
+                    .weak(),
                 );
+                if let Some(note) = note {
+                    size.on_hover_text(note);
+                }
             });
+        }
+        if rescan {
+            self.rescan();
         }
         ui.add_space(4.0);
     }
@@ -896,7 +988,7 @@ impl App {
         if self.pending_removal.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
-        let mut rescan = None;
+        let mut rescan = false;
         ui.horizontal(|ui| {
             // 아래의 조기 반환보다 앞이라 오류·스캔 중·문서 없음 상태에서도 보인다
             if self.elevated {
@@ -913,9 +1005,17 @@ impl App {
                 ui.label("삭제 결과를 반영하는 중입니다…");
                 return;
             }
+            // 진행 애니메이션은 스캔 화면의 막대 하나만 둔다
             if let Some(s) = &self.scanning {
-                ui.spinner();
-                ui.label(format!("{} 스캔 중… {:.1}s", s.root, s.started.elapsed().as_secs_f32()));
+                if s.progress.is_cancelled() {
+                    ui.label("중지하는 중…");
+                } else {
+                    ui.label(format!("{} 스캔 중… {:.1}s", s.root, s.started.elapsed().as_secs_f32()));
+                }
+                // 스캔하는 동안 이전 문서를 들고 있다는 것을 알린다
+                if let Some(doc) = &self.doc {
+                    ui.label(RichText::new(format!("· 중지하면 {}의 이전 결과로 돌아갑니다", doc.tree.name(Tree::ROOT))).weak());
+                }
                 return;
             }
             let Some(doc) = &self.doc else {
@@ -936,6 +1036,7 @@ impl App {
             if let Some(reason) = &st.fallback_reason {
                 r.on_hover_text(reason);
             }
+            ui.label(RichText::new(format!("· {} 스캔", scanned_label(doc.scanned_at))).weak());
             if st.errors > 0 {
                 let label = if st.method == ScanMethod::Mft { "연결 끊긴 레코드" } else { "접근 실패" };
                 ui.label(format!("· {label} {}", thousands(st.errors)));
@@ -950,7 +1051,7 @@ impl App {
                     format!("⚠ 일부만 지워진 폴더 {}개 · 크기가 실제와 다를 수 있음", thousands(doc.stale.len() as u64)),
                 );
                 if ui.small_button("다시 스캔").clicked() {
-                    rescan = Some(doc.tree.name(Tree::ROOT).to_owned());
+                    rescan = true;
                 }
             }
             if let Some((total, free)) = disk_space(doc.tree.name(Tree::ROOT)) {
@@ -962,9 +1063,8 @@ impl App {
                 ui.label(RichText::new(doc.tree.path(h)).weak());
             }
         });
-        // TODO(PR7): 표시가 있으면 묻고 진행하는 rescan()으로 바꾼다
-        if let Some(root) = rescan {
-            self.start_scan(root);
+        if rescan {
+            self.rescan();
         }
     }
 
@@ -1020,9 +1120,32 @@ impl App {
                 ui.add_space(6.0);
             }
             if let Some(r) = chosen {
-                self.start_scan(r);
+                self.request_scan(r);
             }
         });
+    }
+
+    /// 중지한 첫 스캔의 일부 결과라는 배너. 삭제 표시를 막는 까닭과 다시 스캔을 함께 둔다.
+    fn partial_notice(&mut self, ui: &mut egui::Ui) {
+        if !self.doc.as_ref().is_some_and(|doc| doc.stats.cancelled) { return; }
+        let can_scan = self.can_start_scan();
+        let t = theme::of(ui);
+        let mut rescan = false;
+        egui::Frame::new().fill(t.surface_panel).stroke(egui::Stroke::new(1.0, t.line)).inner_margin(6).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(t.warn, "⚠");
+                ui.label(
+                    RichText::new(
+                        "스캔을 중지한 일부 결과입니다 · 읽지 않은 폴더는 크기에서 빠져 실제보다 작게 보이고, 삭제 표시는 할 수 없습니다",
+                    )
+                    .weak(),
+                );
+                rescan = ui.add_enabled(can_scan, egui::Button::new("↻ 다시 스캔")).clicked();
+            });
+        });
+        if rescan {
+            self.rescan();
+        }
     }
 
     fn scan_view(&mut self, ui: &mut egui::Ui) {
@@ -1059,18 +1182,31 @@ impl App {
             Some(f) => egui::ProgressBar::new(f as f32).show_percentage(),
             None => egui::ProgressBar::new(0.0).animate(true),
         };
+        // 중지를 눌렀다: 이전 문서가 있으면 다음 프레임에 돌아가고, 없으면 스캔 스레드가 읽은 데까지 정리하는 중이다
+        const SETTLING: &str = "읽은 데까지 정리하는 중입니다";
+        let stopping = p.is_cancelled();
+        let title = if stopping { "중지하는 중…".to_owned() } else { format!("{} 스캔 중", s.root) };
+        let stop = |ui: &mut egui::Ui, button: egui::Button| {
+            if ui.add_enabled(!stopping, button).clicked() {
+                p.cancel();
+                ui.ctx().request_repaint();
+                true
+            } else {
+                false
+            }
+        };
 
         let Some(tree) = &s.preview else {
             ui.add_space(80.0);
             ui.vertical_centered(|ui| {
-                ui.heading(format!("{} 스캔 중", s.root));
+                ui.heading(&title);
                 ui.add_space(16.0);
                 ui.add(bar().desired_width(420.0));
                 ui.add_space(8.0);
-                ui.label(RichText::new(&eta_text).size(16.0));
+                let eta = if stopping { RichText::new(SETTLING).weak() } else { RichText::new(&eta_text) };
+                ui.label(eta.size(16.0));
                 ui.add_space(16.0);
-                if ui.button("중지").clicked() {
-                    p.cancel();
+                if stop(ui, egui::Button::new("중지")) {
                     self.preview.invalidate(s.scan_id);
                 }
             });
@@ -1079,11 +1215,10 @@ impl App {
 
         ui.horizontal(|ui| {
             ui.add_space(6.0);
-            ui.label(RichText::new(format!("{} 스캔 중", s.root)).strong());
+            ui.label(RichText::new(&title).strong());
             ui.add(bar().desired_width(260.0));
-            ui.label(&eta_text);
-            if ui.small_button("중지").clicked() {
-                p.cancel();
+            ui.label(if stopping { RichText::new(SETTLING).weak() } else { RichText::new(&eta_text) });
+            if stop(ui, egui::Button::new("중지").small()) {
                 self.preview.invalidate(s.scan_id);
             }
         });
@@ -1330,18 +1465,30 @@ impl App {
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
         let (marks, size) = self.doc.as_ref().map_or((0, 0), |doc| (doc.marks.len(), doc.marked_size(self.mode)));
-        let (title, lines, ok) = match confirm {
+        let marks = format!("삭제 표시 {}개({})", thousands(marks as u64), human_size(size));
+        // (제목, 본문, 흐린 안내, 진행 버튼)
+        let (title, lines, note, ok) = match confirm {
             Confirm::Relaunch(root) => (
                 "관리자 권한으로 다시 열까요?",
                 [
-                    format!("삭제 표시 {}개({})는 새 창으로 넘어가지 않습니다.", thousands(marks as u64), human_size(size)),
+                    format!("{marks}는 새 창으로 넘어가지 않습니다."),
                     match root {
                         Some(r) => format!("새 창에서 처음부터 다시 스캔합니다: {r}"),
                         None => "새 창은 처음 화면에서 시작합니다.".into(),
                     },
                 ],
+                None,
                 "관리자로 다시 열기",
             ),
+            Confirm::Scan(root) => {
+                let same = self.doc.as_ref().is_some_and(|doc| doc.tree.name(Tree::ROOT).eq_ignore_ascii_case(root));
+                (
+                    if same { "다시 스캔할까요?" } else { "새로 스캔할까요?" },
+                    [format!("{marks}는 스캔이 끝나면 사라집니다."), format!("스캔할 위치: {root}")],
+                    Some("스캔을 중지하면 지금 결과와 표시가 그대로 남습니다."),
+                    "스캔",
+                )
+            }
         };
         let mut answer = None;
         let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
@@ -1350,6 +1497,9 @@ impl App {
             ui.add_space(6.0);
             for line in &lines {
                 ui.label(line);
+            }
+            if let Some(note) = note {
+                ui.label(RichText::new(note).weak());
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -1365,11 +1515,17 @@ impl App {
         if answer.is_none() && modal.should_close() {
             answer = Some(false);
         }
-        let Some(proceed) = answer else { return };
-        // 어느 쪽이든 모달은 닫는다
-        let confirm = self.confirm.take();
-        if proceed && let Some(Confirm::Relaunch(root)) = confirm {
-            self.relaunch(ctx, root);
+        if let Some(proceed) = answer {
+            self.resolve_confirm(ctx, proceed);
+        }
+    }
+
+    /// 확인 창의 답. 어느 쪽이든 창은 닫는다.
+    fn resolve_confirm(&mut self, ctx: &egui::Context, proceed: bool) {
+        match self.confirm.take() {
+            Some(Confirm::Relaunch(root)) if proceed => self.relaunch(ctx, root),
+            Some(Confirm::Scan(root)) if proceed => self.start_scan(root),
+            _ => {}
         }
     }
 
@@ -1401,8 +1557,11 @@ impl App {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
+        // 스캔 중에는 검색 칸이 숨어 있다 (끝난 뒤 포커스가 검색 칸으로 튀지 않게)
         let ctrl_f = ctx.input(|i| i.modifiers.command && i.key_pressed(Key::F));
-        if ctrl_f || (!ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Slash))) {
+        if self.scanning.is_none()
+            && (ctrl_f || (!ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Slash))))
+        {
             self.focus_search = true;
         }
         // 모달 뒤에서 Space 같은 키가 표시를 바꾸지 않게 한다
@@ -1413,6 +1572,7 @@ impl App {
         let mut toggle = None;
         let mut detail = None;
         let mut open = None;
+        let mut rescan = false;
         let Some(doc) = &mut self.doc else { return };
         ctx.input(|i| {
             if i.modifiers.alt && i.key_pressed(Key::ArrowLeft) || i.pointer.button_pressed(PointerButton::Extra1) {
@@ -1440,8 +1600,13 @@ impl App {
                 detail = Some(false);
             } else if i.key_pressed(Key::Plus) || i.key_pressed(Key::Equals) || i.key_pressed(Key::CloseBracket) {
                 detail = Some(true);
+            } else if i.key_pressed(Key::F5) {
+                rescan = true;
             }
         });
+        if rescan {
+            self.rescan();
+        }
         if let Some(n) = toggle {
             self.toggle_mark(n);
         }
@@ -1513,6 +1678,9 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
         }
     } else if state == 2 {
         ui.add_enabled(false, egui::Button::new("🗑 상위 폴더가 이미 표시됨"));
+    } else if doc.stats.cancelled {
+        ui.add_enabled(false, egui::Button::new("🗑 삭제 표시"))
+            .on_disabled_hover_text("중지한 스캔의 일부 결과에서는 표시할 수 없습니다 · 다시 스캔하세요");
     } else if let Some(r) = protected {
         ui.add_enabled(false, egui::Button::new("🗑 삭제 표시")).on_disabled_hover_text(format!("보호된 항목: {r}"));
     } else if ui.button("🗑 삭제 표시  (Space)").clicked() {
@@ -1575,8 +1743,11 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         }
         _ => {}
     }
-    if n.has(flags::DENIED) {
-        ui.colored_label(theme::of(ui).warn, "⚠ 접근이 거부되어 일부 크기를 모릅니다");
+    if let Some(note) = incomplete_note(tree, it.node) {
+        ui.colored_label(theme::of(ui).warn, format!("⚠ {note}"));
+        if let Some(names) = unread_children(tree, it.node) {
+            ui.label(RichText::new(names).weak());
+        }
     }
     if doc.stale_within(it.node) {
         ui.colored_label(theme::of(ui).warn, "⚠ 일부만 지워진 폴더라 크기가 실제와 다를 수 있습니다 · 다시 스캔하세요");
@@ -1595,9 +1766,48 @@ fn morph_items<'a>(morph: &mut Morph, items: &'a [Item], key: MorphKey, out: &'a
     (if morph.is_settled(key) { items } else { out }, moving)
 }
 
+/// 크기를 다 세지 못한 까닭 (툴팁·breadcrumb). 다 셌으면 None.
+fn incomplete_note(tree: &Tree, id: NodeId) -> Option<&'static str> {
+    let n = tree.node(id);
+    if n.has(flags::DENIED) {
+        Some("접근이 거부되어 일부 크기를 모릅니다")
+    } else if !n.has(flags::INCOMPLETE) {
+        None
+    } else if tree.live_children(id).any(|c| tree.node(c).incomplete()) {
+        Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다")
+    } else {
+        // 중지 때문에 이 폴더 자체를 읽지 않았다
+        Some("스캔을 중지해 읽지 못한 폴더라 실제 크기는 더 클 수 있습니다")
+    }
+}
+
+/// 크기를 다 세지 못한 바로 아래 폴더 (앞의 3개 이름, 나머지는 개수). 따라 내려가면 원인 폴더에 닿는다.
+fn unread_children(tree: &Tree, id: NodeId) -> Option<String> {
+    let mut unread = tree.live_children(id).filter(|&c| tree.node(c).incomplete());
+    let names: Vec<&str> = unread.by_ref().take(3).map(|c| tree.name(c)).collect();
+    if names.is_empty() {
+        return None;
+    }
+    let names = names.join(", ");
+    Some(match unread.count() {
+        0 => format!("이어지는 하위 폴더: {names}"),
+        rest => format!("이어지는 하위 폴더: {names} 외 {}개", thousands(rest as u64)),
+    })
+}
+
 fn fmt_duration(secs: f64) -> String {
     let s = secs.round() as u64;
     if s < 60 { format!("{s}초") } else { format!("{}분 {:02}초", s / 60, s % 60) }
+}
+
+/// 스캔 시각: 오늘이면 `14:32`, 아니면 `2026-10-03 16:42` (시각을 읽지 못하면 `-`)
+fn scanned_label(at: u32) -> String {
+    let (t, now) = (format_time(at), format_time(now_secs2000()));
+    let today = t.get(..10).is_some_and(|day| now.get(..10) == Some(day));
+    match t.get(11..) {
+        Some(time) if today => time.to_owned(),
+        _ => t,
+    }
 }
 
 /// 이번 프레임의 휠 이동량 (위로 굴리면 양수, 점 단위)
@@ -3689,8 +3899,8 @@ mod tests {
         assert_eq!(app.doc.as_ref().unwrap().selected, Some(2));
     }
 
-    /// 오른쪽 클릭 메뉴만 그리며 `text` 항목을 누른다
-    fn press_menu(doc: &mut Doc, n: NodeId, elevated: bool, text: &str) {
+    /// 오른쪽 클릭 메뉴만 그리며 `text` 항목을 누른다. 메뉴가 삭제 표시를 바꾸라고 했으면 true
+    fn press_menu(doc: &mut Doc, n: NodeId, elevated: bool, text: &str) -> bool {
         let ctx = egui::Context::default();
         let mut time = 0.0;
         let draw = |doc: &mut Doc, events: Vec<egui::Event>, time: f64| {
@@ -3700,22 +3910,25 @@ mod tests {
                 time: Some(time),
                 ..Default::default()
             };
+            let mut toggle = false;
             let mut output = ctx.run_ui(input, |ui| {
-                egui::CentralPanel::default().show(ui, |ui| context_menu(ui, doc, n, elevated));
+                egui::CentralPanel::default().show(ui, |ui| toggle = context_menu(ui, doc, n, elevated));
             });
             output.textures_delta.clear();
-            output
+            (output, toggle)
         };
-        let mut output = draw(doc, vec![], time);
+        let mut output = draw(doc, vec![], time).0;
         for _ in 0..2 {
             time += 0.1;
-            output = draw(doc, vec![], time);
+            output = draw(doc, vec![], time).0;
         }
         let pos = text_pos(&output, text).unwrap_or_else(|| panic!("{text} 없음"));
+        let mut toggled = false;
         for pressed in [true, false] {
             time += 0.05;
-            draw(doc, pointer(pos, pressed), time);
+            toggled |= draw(doc, pointer(pos, pressed), time).1;
         }
+        toggled
     }
 
     #[test]
@@ -3897,6 +4110,352 @@ mod tests {
                 assert_eq!(doc.marks.iter().copied().collect::<Vec<_>>(), [1]);
             }
         }
+    }
+
+    // ---- 스캔 중지·다시 스캔 ----
+
+    const RESTORED: &str = "스캔을 중지했습니다 · 이전 결과를 그대로 보여 줍니다";
+
+    /// 스캔 스레드가 보낼 결과
+    fn scan_result(doc: Doc) -> io::Result<ScanResult> {
+        Ok(ScanResult { tree: Arc::try_unwrap(doc.tree).ok().unwrap(), stats: doc.stats })
+    }
+
+    /// 중지한 일반 순회의 일부 결과: folder(1)를 다 읽지 못했다
+    fn partial_result() -> Doc {
+        let mut partial = fixture(9);
+        let tree = Arc::get_mut(&mut partial.tree).unwrap();
+        for id in [0, 1] {
+            tree.nodes[id].flags |= flags::INCOMPLETE;
+        }
+        partial.stats.cancelled = true;
+        partial
+    }
+
+    /// 있을 리 없는 경로. 스캔은 열지 못하고 곧바로 끝나며, 테스트는 그 결과를 보지 않는다.
+    fn missing_root() -> String {
+        std::env::temp_dir().join(format!("darak-test-missing-{}", std::process::id())).display().to_string()
+    }
+
+    /// 툴바만 한 프레임 그린다
+    fn toolbar_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::Panel::top("toolbar-test").show(ui, |ui| app.toolbar(ui));
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    /// 스캔 화면만 한 프레임 그린다
+    fn scan_view_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| app.scan_view(ui));
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn stop_with_previous_document_restores_it_immediately() {
+        let mut app = app(fixture(1));
+        let doc = app.doc.as_mut().unwrap();
+        doc.toggle_mark(3).unwrap();
+        doc.navigate(1);
+        let (tx, rx) = mpsc::channel();
+        app.begin_scan("D:\\Other".into(), Arc::default(), rx, None);
+        assert_eq!(app.root_input, "D:\\Other");
+        // 스캔 스레드가 정리를 마칠 때까지 기다리지 않는다
+        app.cancel_scan();
+        app.poll_scan();
+        assert!(app.scanning.is_none());
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!((doc.id, doc.focus), (1, 1));
+        assert_eq!(doc.marks.iter().copied().collect::<Vec<_>>(), [3]);
+        assert_eq!(app.root_input, "C:\\Data");
+        assert!(app.error.is_none());
+        assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some(RESTORED));
+        // 받는 쪽이 없으므로 부분 결과는 나중에도 들어올 수 없다
+        assert!(tx.send(scan_result(partial_result())).is_err());
+        assert_eq!(app.doc.as_ref().unwrap().id, 1);
+    }
+
+    #[test]
+    fn search_results_refill_after_restore() {
+        let (mut app, runtime, wake) = running_app(|_| {});
+        app.doc.as_mut().unwrap().search.query = "sibling".into();
+        pump_until(&mut app, &wake, |app| app.doc.as_ref().unwrap().search.result.is_some());
+        let (_tx, rx) = mpsc::channel();
+        app.begin_scan("D:\\Other".into(), Arc::default(), rx, None);
+        assert!(app.doc.as_ref().unwrap().search.result.is_none());
+        app.cancel_scan();
+        app.poll_scan();
+        assert!(app.scanning.is_none());
+        // 다른 경로와 같은 재개 처리를 거쳐 같은 검색어로 다시 찾는다
+        pump_until(&mut app, &wake, |app| app.doc.as_ref().unwrap().search.result.is_some());
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.search.query, "sibling");
+        assert_eq!(doc.search.result.as_ref().unwrap().hits, [2]);
+        shutdown(runtime);
+    }
+
+    #[test]
+    fn stop_without_document_waits_then_shows_partial() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        app.doc = None;
+        let tx = preview_scan(&mut app);
+        app.cancel_scan();
+        app.poll_scan();
+        // 이전 문서가 없으면 스캔 스레드가 읽은 데까지 정리하기를 기다린다
+        assert!(app.scanning.is_some());
+        removal_status_frame(&ctx, &mut app, 0.0);
+        let output = removal_status_frame(&ctx, &mut app, 0.1);
+        assert!(has_removal_text(&output, "중지하는 중…"));
+        assert!(!has_removal_text(&output, "스캔 중…"));
+        assert!(!has_removal_text(&output, "중지하면"));
+        scan_view_frame(&ctx, &mut app, 0.2);
+        let output = scan_view_frame(&ctx, &mut app, 0.3);
+        assert!(has_removal_text(&output, "중지하는 중…"));
+        assert!(has_removal_text(&output, "읽은 데까지 정리하는 중입니다"));
+
+        tx.send(scan_result(partial_result())).unwrap();
+        app.poll_scan();
+        assert!(app.scanning.is_none());
+        assert!(app.doc.as_ref().unwrap().stats.cancelled);
+        // 표시도 검토도 막는다
+        app.toggle_mark(3);
+        assert!(app.doc.as_ref().unwrap().marks.is_empty());
+        assert!(app.toast.as_ref().is_some_and(|t| t.msg.contains("삭제 표시를 할 수 없습니다")));
+        app.doc.as_mut().unwrap().marks.insert(3);
+        app.open_delete_review();
+        assert!(app.delete_dialog.is_none());
+        app.doc.as_mut().unwrap().marks.clear();
+        // 우클릭 메뉴의 표시 항목도 꺼져 있다
+        assert!(!press_menu(app.doc.as_mut().unwrap(), 3, false, "🗑 삭제 표시"));
+        assert!(press_menu(&mut fixture(1), 3, false, "🗑 삭제 표시  (Space)"));
+        // 배너가 까닭과 다시 스캔을 알린다
+        full_frame(&ctx, &mut app, vec![], 1.0);
+        let output = full_frame(&ctx, &mut app, vec![], 1.1);
+        assert!(has_removal_text(&output, "스캔을 중지한 일부 결과입니다"));
+        assert!(has_removal_text(&output, "↻ 다시 스캔"));
+        assert!(has_removal_text(&output, "· 중지됨(일부 결과)"));
+    }
+
+    #[test]
+    fn stopped_scan_with_nothing_read_returns_to_welcome() {
+        for interrupted in [false, true] {
+            let mut app = app(fixture(1));
+            app.doc = None;
+            let tx = preview_scan(&mut app);
+            app.cancel_scan();
+            if interrupted {
+                // MFT는 중지하면 부분 결과 없이 Interrupted를 돌려준다
+                tx.send(Err(io::Error::new(io::ErrorKind::Interrupted, "스캔을 중지했습니다"))).unwrap();
+            } else {
+                let mut tree = Tree::default();
+                node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 0, 0, 0);
+                let mut empty = doc(9, tree);
+                empty.stats.cancelled = true;
+                tx.send(scan_result(empty)).unwrap();
+            }
+            app.poll_scan();
+            assert!(app.scanning.is_none(), "{interrupted}");
+            assert!(app.doc.is_none() && app.error.is_none(), "{interrupted}");
+            assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some("스캔을 중지했습니다"));
+        }
+    }
+
+    #[test]
+    fn scan_with_marks_waits_for_confirmation() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
+        let marks = app.doc.as_ref().unwrap().marks.clone();
+        let missing = missing_root();
+        let mut time = 0.0;
+        // 다른 루트는 '새로', 같은 루트는 '다시'. 취소와 Esc는 아무것도 바꾸지 않는다
+        for (other, title, answer) in [(true, "새로 스캔할까요?", Some("취소")), (false, "다시 스캔할까요?", None)] {
+            if other { app.request_scan(missing.clone()) } else { app.rescan() }
+            let root = if other { normalize_root(&missing) } else { "C:\\Data".into() };
+            assert_eq!(app.confirm, Some(Confirm::Scan(root.clone())));
+            assert!(app.scanning.is_none());
+            let mut output = full_frame(&ctx, &mut app, vec![], time);
+            for _ in 0..3 {
+                time += 0.1;
+                output = full_frame(&ctx, &mut app, vec![], time);
+            }
+            assert!(has_removal_text(&output, title), "{title}");
+            assert!(has_removal_text(&output, "삭제 표시 1개(60 B)는 스캔이 끝나면 사라집니다."));
+            assert!(has_removal_text(&output, &format!("스캔할 위치: {root}")));
+            assert!(has_removal_text(&output, "스캔을 중지하면 지금 결과와 표시가 그대로 남습니다."));
+            match answer {
+                Some(text) => {
+                    press_text(&ctx, &mut app, text, &mut time);
+                }
+                None => {
+                    time += 0.1;
+                    full_frame(&ctx, &mut app, vec![key(Key::Escape)], time);
+                }
+            }
+            assert!(app.confirm.is_none(), "{title}");
+            assert!(app.scanning.is_none(), "{title}");
+            assert_eq!(app.doc.as_ref().unwrap().marks, marks);
+        }
+        // 진행하면 스캔을 시작한다. 표시는 스캔이 끝날 때까지 그대로다 (중지하면 남는다)
+        app.request_scan(missing.clone());
+        press_text(&ctx, &mut app, "스캔", &mut time);
+        assert!(app.confirm.is_none());
+        assert_eq!(app.scanning.as_ref().map(|s| s.root.clone()), Some(normalize_root(&missing)));
+        assert_eq!(app.doc.as_ref().unwrap().marks, marks);
+        // 스캔 중에는 새로 요청해도 묻지도 시작하지도 않는다
+        let scan_id = app.scanning.as_ref().unwrap().scan_id;
+        app.request_scan("D:\\Other".into());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.scanning.as_ref().unwrap().scan_id, scan_id);
+        // 표시가 없으면 묻지 않고 바로 시작한다
+        app.cancel_scan();
+        app.scanning = None;
+        app.doc.as_mut().unwrap().clear_marks();
+        app.request_scan(missing.clone());
+        assert!(app.confirm.is_none());
+        assert!(app.scanning.is_some());
+    }
+
+    #[test]
+    fn f5_and_rescan_button_ask_when_marked() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
+        frame(&ctx, &mut app, vec![key(Key::F5)], 0.0);
+        assert_eq!(app.confirm, Some(Confirm::Scan("C:\\Data".into())));
+        assert!(app.scanning.is_none());
+        app.confirm = None;
+        let mut time = 1.0;
+        press_text(&ctx, &mut app, "↻", &mut time);
+        assert_eq!(app.confirm, Some(Confirm::Scan("C:\\Data".into())));
+        assert!(app.scanning.is_none());
+        // 표시가 없으면 문서 루트를 바로 다시 스캔한다
+        let missing = missing_root();
+        let ctx = egui::Context::default();
+        let mut plain = self::app(rooted(&missing));
+        frame(&ctx, &mut plain, vec![key(Key::F5)], 0.0);
+        assert!(plain.confirm.is_none());
+        assert_eq!(plain.scanning.as_ref().map(|s| s.root.clone()), Some(normalize_root(&missing)));
+    }
+
+    #[test]
+    fn rescan_same_root_keeps_focus_and_query() {
+        let mut app = app(fixture(1));
+        let doc = app.doc.as_mut().unwrap();
+        doc.navigate(1);
+        doc.search.query = "child".into();
+        doc.search.in_focus_only = true;
+        let tx = preview_scan(&mut app);
+        tx.send(scan_result(fixture(9))).unwrap();
+        app.poll_scan();
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.id, 2);
+        assert_eq!(doc.tree.name(doc.focus), "folder");
+        assert_eq!(doc.search.query, "child");
+        assert!(doc.search.in_focus_only);
+        assert!(doc.back.is_empty());
+        // 미리 보기는 루트 기준이라 하위 폴더로 돌아가면 모양을 보간하지 않는다
+        assert!(app.morph_until.is_none());
+        // 루트가 다르면 처음부터 본다
+        let tx = preview_scan(&mut app);
+        tx.send(scan_result(rooted("D:\\Data"))).unwrap();
+        app.poll_scan();
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!((doc.id, doc.focus), (3, Tree::ROOT));
+        assert!(doc.search.query.is_empty() && !doc.search.in_focus_only);
+        assert!(app.morph_until.is_some());
+    }
+
+    #[test]
+    fn scanning_hides_previous_document_controls() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let draw = |app: &mut App, time: f64| {
+            toolbar_frame(&ctx, app, time);
+            toolbar_frame(&ctx, app, time + 0.05)
+        };
+        let shown = ["⬅", "↻", "C:\\Data", "🔎 검색"];
+        let output = draw(&mut app, 0.0);
+        for text in shown {
+            assert!(has_removal_text(&output, text), "{text}");
+        }
+        let (_tx, rx) = mpsc::channel();
+        app.begin_scan("D:\\Other".into(), Arc::default(), rx, None);
+        assert!(!app.can_start_scan());
+        let output = draw(&mut app, 1.0);
+        for text in shown.into_iter().chain(["⏹ 중지"]) {
+            assert!(!has_removal_text(&output, text), "{text}");
+        }
+        // 스캔 시작 컨트롤은 꺼진 채 남는다 (중지는 스캔 화면에만 있다)
+        assert!(has_removal_text(&output, "🔍 스캔"));
+        // 상태 바는 이전 결과를 들고 있다고 알린다
+        removal_status_frame(&ctx, &mut app, 1.2);
+        let output = removal_status_frame(&ctx, &mut app, 1.3);
+        assert!(has_removal_text(&output, "D:\\Other 스캔 중…"));
+        assert!(has_removal_text(&output, "· 중지하면 C:\\Data의 이전 결과로 돌아갑니다"));
+        app.cancel_scan();
+        app.poll_scan();
+        assert!(app.can_start_scan());
+        let output = draw(&mut app, 2.0);
+        for text in shown {
+            assert!(has_removal_text(&output, text), "{text}");
+        }
+        // 상태 바에 스캔 시각
+        removal_status_frame(&ctx, &mut app, 2.2);
+        let output = removal_status_frame(&ctx, &mut app, 2.3);
+        let at = scanned_label(app.doc.as_ref().unwrap().scanned_at);
+        assert!(has_removal_text(&output, &format!("· {at} 스캔")), "{at}");
+    }
+
+    #[test]
+    fn explains_unread_folders() {
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 100, 1, 5);
+        for name in ["a", "b", "c", "d", "e"] {
+            node(&mut tree, name, 0, Kind::Dir, 20, 0, 0);
+        }
+        let mut d = doc(1, tree);
+        assert_eq!(incomplete_note(&d.tree, 0), None);
+        assert_eq!(unread_children(&d.tree, 0), None);
+        let tree = Arc::get_mut(&mut d.tree).unwrap();
+        tree.nodes[0].flags |= flags::INCOMPLETE;
+        tree.nodes[1].flags |= flags::DENIED;
+        for id in 2..5 {
+            tree.nodes[id].flags |= flags::INCOMPLETE;
+        }
+        assert_eq!(incomplete_note(&d.tree, 0), Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다"));
+        assert_eq!(unread_children(&d.tree, 0).as_deref(), Some("이어지는 하위 폴더: a, b, c 외 1개"));
+        assert_eq!(incomplete_note(&d.tree, 1), Some("접근이 거부되어 일부 크기를 모릅니다"));
+        assert!(incomplete_note(&d.tree, 2).unwrap().starts_with("스캔을 중지해"));
+        assert_eq!(incomplete_note(&d.tree, 5), None);
+        // 지운 폴더는 이어지는 곳이 아니다
+        d.apply_removed(&[4]);
+        assert_eq!(unread_children(&d.tree, 0).as_deref(), Some("이어지는 하위 폴더: a, b, c"));
+    }
+
+    #[test]
+    fn scan_time_is_short_for_today() {
+        let today = scanned_label(now_secs2000());
+        assert!(today.len() == 5 && today.as_bytes()[2] == b':', "{today}");
+        // 2000-01-31 UTC (어느 시간대에서도 2000년 1월)
+        let old = scanned_label(86_400 * 30);
+        assert!(old.starts_with("2000-01-") && old.len() == 16, "{old}");
+        assert_eq!(scanned_label(0), "-");
     }
 
     #[test]
