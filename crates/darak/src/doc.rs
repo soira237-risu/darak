@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::search_worker::{SearchCompletion, SearchKey};
 
-use darak_core::remove::protected_reason;
+use darak_core::remove::{Guard, protected_reason_as};
 use darak_core::search::SearchResult;
 use darak_core::{Kind, NodeId, ScanStats, SizeMode, Tree};
 
@@ -23,6 +23,8 @@ pub struct Doc {
     /// 노드별: 1 = 표시됨, 2 = 표시된 항목 안에 있음
     mark_bits: Vec<u8>,
     pub search: SearchState,
+    /// 삭제 보호 수준 (관리자 권한으로 스캔한 문서는 Admin)
+    pub guard: Guard,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -65,6 +67,7 @@ impl Doc {
             marks: BTreeSet::new(),
             mark_bits: vec![0; n],
             search: SearchState { highlight: true, ..Default::default() },
+            guard: Guard::default(),
         }
     }
 
@@ -131,6 +134,12 @@ impl Doc {
         self.mark_bits.get(id as usize).copied().unwrap_or(0)
     }
 
+    /// 이 문서의 보호 수준에서 이 항목을 지우면 안 되는 이유. 지워도 되면 None.
+    /// 표시·검토·실행 직전 검사가 모두 이 기준을 쓴다.
+    pub fn protected(&self, id: NodeId) -> Option<&'static str> {
+        protected_reason_as(&self.tree, id, self.guard)
+    }
+
     /// 표시를 켜거나 끈다. 표시할 수 없으면 이유를 돌려준다.
     pub fn toggle_mark(&mut self, id: NodeId) -> Result<(), String> {
         if self.marks.remove(&id) {
@@ -140,7 +149,7 @@ impl Doc {
         if self.mark_state(id) == 2 {
             return Err("상위 폴더가 이미 삭제 표시되어 있습니다".into());
         }
-        if let Some(r) = protected_reason(&self.tree, id) {
+        if let Some(r) = self.protected(id) {
             return Err(format!("보호된 항목: {r}"));
         }
         // 이 항목 아래의 기존 표시는 흡수

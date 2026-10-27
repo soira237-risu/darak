@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
 
-use darak_core::remove::{delete_permanently, protected_reason, recycle, top_level_marks};
+use darak_core::remove::{delete_permanently, recycle, top_level_marks};
 use darak_core::{Kind, NodeId, SizeMode, human_size, thousands};
 use eframe::egui::{self, Color32, RichText};
 
@@ -71,7 +71,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                             ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new(human_size(n.size(mode))).monospace()));
                             let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
                             ui.label(format!("{icon} {}", doc.tree.path(id)));
-                            if let Some(r) = protected_reason(&doc.tree, id) {
+                            if let Some(r) = doc.protected(id) {
                                 ui.colored_label(theme::of(ui).warn, format!("⚠ {r}"));
                             }
                         });
@@ -93,7 +93,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     *error = None;
                 }
                 ui.add_space(6.0);
-                let any_protected = items.iter().any(|&i| protected_reason(&doc.tree, i).is_some());
+                let any_protected = items.iter().any(|&i| doc.protected(i).is_some());
                 let can_run = !items.is_empty() && !any_protected && (*method == Method::Recycle || *confirmed);
                 ui.horizontal(|ui| {
                     let label = match method {
@@ -165,7 +165,7 @@ fn build_items(doc: &Doc, ids: &[NodeId], mode: SizeMode) -> Result<Vec<Item>, S
             if doc.tree.node(id).has(darak_core::flags::REMOVED) {
                 return Err("이미 삭제된 항목입니다".into());
             }
-            if let Some(reason) = protected_reason(&doc.tree, id) {
+            if let Some(reason) = doc.protected(id) {
                 return Err(format!("보호된 항목: {reason}"));
             }
             let n = doc.tree.node(id);

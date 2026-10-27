@@ -1,12 +1,13 @@
 use std::io;
-use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use darak_core::remove::protected_reason;
-use darak_core::scan::{Drive, disk_space, is_elevated, list_drives, normalize_root, relaunch_as_admin, shell_open};
+use darak_core::category::runs_code;
+use darak_core::remove::Guard;
+use darak_core::scan::{Drive, disk_space, is_drive_root, is_elevated, list_drives, normalize_root};
+use darak_core::sys::DRIVE_REMOTE;
 use darak_core::{
     Kind, NodeId, ScanMethod, ScanOptions, ScanProgress, ScanResult, SizeMode, Tree, flags, format_time, human_size,
     scan, thousands,
@@ -47,6 +48,8 @@ pub struct App {
     next_doc_id: u64,
     elevated: bool,
     delete_dialog: Option<Dialog>,
+    /// 진행하기 전에 확인을 받는 중 (모달 하나를 같이 쓴다)
+    confirm: Option<Confirm>,
     focus_search: bool,
     detail: Detail,
     anim: Option<ZoomAnim>,
@@ -75,6 +78,25 @@ struct PendingRemoval {
 
 /// 반환 알림 뒤에도 트리를 다른 소유자가 붙잡고 있으면, 이 시간이 지난 뒤 복제해서 반영한다.
 const REMOVAL_DETACH_AFTER: Duration = Duration::from_secs(2);
+
+/// 삭제 표시를 잃는 동작을 하기 전에 묻는 내용. 모두 `confirm_ui` 하나로 그린다.
+// TODO(PR7): 새 스캔·다시 스캔을 묻는 Scan(String)을 더한다
+#[derive(Debug, PartialEq)]
+enum Confirm {
+    /// 관리자 권한으로 다시 열기 (새 창이 스캔할 루트, None이면 처음 화면)
+    Relaunch(Option<String>),
+}
+
+/// '관리자로 실행'이 지금 할 수 있는 일
+#[derive(Debug, PartialEq)]
+enum AdminRelaunch {
+    /// 이미 관리자이거나 합성 문서라 보이지 않는다
+    Hidden,
+    /// 보이지만 누를 수 없다 (까닭)
+    Blocked(&'static str),
+    /// 누를 수 있다 (새 창이 스캔할 문서 루트, 문서가 없으면 None)
+    Ready(Option<String>),
+}
 
 struct Scanning {
     scan_id: u64,
@@ -123,6 +145,7 @@ impl App {
             next_doc_id: 1,
             elevated: is_elevated(),
             delete_dialog: None,
+            confirm: None,
             focus_search: false,
             detail: Detail::default(),
             anim: None,
@@ -143,9 +166,10 @@ impl App {
             app.perf_fixture_id = Some(id);
             return app;
         }
-        // `darak.exe D:\` 처럼 경로를 주면 바로 스캔
-        if let Some(arg) = std::env::args().nth(1) {
-            app.start_scan(arg);
+        // 경로를 주면 바로 스캔한다: `darak.exe D:\`, 따옴표로 감싸면 끝의 \를 두 번 (`"D:\\"`, quote_arg).
+        // UTF-16으로 온전하지 않은 인자에도 패닉하지 않는다.
+        if let Some(arg) = std::env::args_os().nth(1) {
+            app.start_scan(arg.to_string_lossy().into_owned());
         }
         app
     }
@@ -276,7 +300,11 @@ impl App {
                 self.context_node = None;
                 self.anim = None;
                 self.last_focus = None;
-                self.doc = Some(Doc::new(self.next_doc_id, res.tree, res.stats));
+                let mut doc = Doc::new(self.next_doc_id, res.tree, res.stats);
+                if self.elevated {
+                    doc.guard = Guard::Admin;
+                }
+                self.doc = Some(doc);
                 self.morph_until = Some(Instant::now() + Duration::from_millis(1500));
                 self.next_doc_id += 1;
                 self.scanning = None;
@@ -309,6 +337,54 @@ impl App {
             && let Err(e) = doc.toggle_mark(id) {
                 self.toast = Some((e, Instant::now()));
             }
+    }
+
+    /// 파일을 연다. 열지 않는 파일이면 탐색기에서 위치를 보여 주고 까닭을 알린다 (더블클릭·Enter·검색 결과).
+    fn open_file(&mut self, id: NodeId) {
+        let Some(doc) = &self.doc else { return };
+        if let Some(note) = open_item(doc, id, self.elevated) {
+            self.toast(note);
+        }
+    }
+
+    /// '관리자로 실행'을 보일지, 누를 수 있는지, 새 창에 무엇을 넘길지.
+    /// 넘기는 루트는 경로 칸이 아니라 화면에 있는 문서의 루트다.
+    fn admin_relaunch(&self) -> AdminRelaunch {
+        if self.elevated || self.doc.as_ref().is_some_and(|doc| !filesystem_actions_enabled(doc)) {
+            return AdminRelaunch::Hidden;
+        }
+        if self.scanning.is_some() {
+            return AdminRelaunch::Blocked("스캔을 중지하거나 끝난 뒤에 다시 실행할 수 있습니다");
+        }
+        if self.delete_dialog.is_some() || self.pending_removal.is_some() {
+            return AdminRelaunch::Blocked("삭제를 마친 뒤에 다시 실행할 수 있습니다");
+        }
+        let Some(doc) = &self.doc else { return AdminRelaunch::Ready(None) };
+        let root = doc.tree.name(Tree::ROOT);
+        if is_network(root, &self.drives) {
+            return AdminRelaunch::Blocked(
+                "네트워크 위치는 관리자 권한으로 빨라지지 않고, 관리자 창에서는 연결된 드라이브가 보이지 않을 수 있습니다",
+            );
+        }
+        AdminRelaunch::Ready(Some(root.to_owned()))
+    }
+
+    /// 관리자 권한으로 다시 연다. 삭제 표시가 있으면 먼저 묻고, 없으면 UAC 창이 확인 역할을 한다.
+    fn request_relaunch(&mut self, ctx: &egui::Context, root: Option<String>) {
+        if self.doc.as_ref().is_some_and(|doc| !doc.marks.is_empty()) {
+            self.confirm = Some(Confirm::Relaunch(root));
+        } else {
+            self.relaunch(ctx, root);
+        }
+    }
+
+    fn relaunch(&mut self, ctx: &egui::Context, root: Option<String>) {
+        if shell(Shell::Elevate(root)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            // UAC 창에서 취소한 경우도 여기로 온다
+            self.toast("관리자 권한으로 다시 열지 않았습니다");
+        }
     }
 }
 
@@ -502,6 +578,13 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.show(ui);
+    }
+}
+
+impl App {
+    /// 한 프레임 전체. eframe::Frame을 쓰지 않으므로 헤드리스 테스트도 이 함수를 그대로 부른다.
+    fn show(&mut self, ui: &mut egui::Ui) {
         #[cfg(feature = "perf")]
         let frame_started = Instant::now();
         let ctx = ui.ctx().clone();
@@ -531,6 +614,7 @@ impl eframe::App for App {
                 #[cfg(feature = "perf")]
                 { table_draw = self.perf_draw_identity(); }
             });
+            let mut open = None;
             if let Some(doc) = &mut self.doc {
                 match action {
                     search_panel::Action::Reveal(id) => doc.reveal(id),
@@ -538,11 +622,14 @@ impl eframe::App for App {
                     search_panel::Action::Open(id) => {
                         doc.reveal(id);
                         if doc.tree.node(id).kind == Kind::File {
-                            open_item(doc, id);
+                            open = Some(id);
                         }
                     }
                     search_panel::Action::None => {}
                 }
+            }
+            if let Some(id) = open {
+                self.open_file(id);
             }
         }
 
@@ -562,6 +649,7 @@ impl eframe::App for App {
         #[cfg(feature = "perf")]
         self.perf_record_draw(table_draw.as_ref());
         self.delete_dialog_ui(&ctx);
+        self.confirm_ui(&ctx);
         self.toast_ui(&ctx);
         self.keyboard(&ctx);
         // Treemap/context/keyboard navigation happens after the results panel.
@@ -620,18 +708,17 @@ impl App {
                 self.start_scan(self.root_input.clone());
             }
 
-            if !self.elevated
-                && self.doc.as_ref().is_none_or(filesystem_actions_enabled)
-                && ui
-                    .button("🛡 관리자로 실행")
-                    .on_hover_text("관리자 권한이면 NTFS의 $MFT를 직접 읽어 드라이브 전체를 몇 초 안에 스캔합니다")
-                    .clicked()
-            {
-                // TODO(PR4): admin_relaunch()로 문서 루트(없으면 None)를 넘기고 표시가 있으면 먼저 묻는다
-                if relaunch_as_admin(Some(&self.root_input)) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                } else {
-                    self.toast("관리자 권한으로 다시 실행하지 못했습니다");
+            // 상태는 admin_relaunch()가 정한다 (자리는 PR12에서 환영 화면·상태 바로 옮긴다)
+            const RELAUNCH: &str = "🛡 관리자로 실행";
+            match self.admin_relaunch() {
+                AdminRelaunch::Hidden => {}
+                AdminRelaunch::Blocked(why) => {
+                    ui.add_enabled(false, egui::Button::new(RELAUNCH)).on_disabled_hover_text(why);
+                }
+                AdminRelaunch::Ready(root) => {
+                    if ui.button(RELAUNCH).on_hover_text(relaunch_hint(root.as_deref())).clicked() {
+                        self.request_relaunch(ui.ctx(), root);
+                    }
                 }
             }
 
@@ -748,6 +835,13 @@ impl App {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
         ui.horizontal(|ui| {
+            // 아래의 조기 반환보다 앞이라 오류·스캔 중·문서 없음 상태에서도 보인다
+            if self.elevated {
+                theme::badge(ui, "관리자 권한").on_hover_text(
+                    "관리자 권한으로 실행 중입니다. 파일은 직접 열지 않고 탐색기에서 위치를 보여 주며, \
+                     설치된 프로그램 폴더와 다른 사용자의 프로필 기본 폴더는 삭제 표시할 수 없습니다",
+                );
+            }
             if let Some(e) = &self.error {
                 ui.colored_label(theme::of(ui).danger_text, format!("⚠ {e}"));
                 return;
@@ -801,9 +895,13 @@ impl App {
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.heading("어느 드라이브를 살펴볼까요?");
-            if !self.elevated {
-                ui.label(RichText::new("관리자로 실행하면 드라이브 전체를 훨씬 빠르게 스캔합니다 (⚡ MFT)").weak());
-            }
+            let hint = if self.elevated {
+                // 인자 없이 다시 연 관리자 창에서 다음에 할 일
+                "관리자 권한으로 실행 중 · 로컬 NTFS 드라이브는 $MFT로 몇 초 안에 스캔합니다"
+            } else {
+                "관리자로 실행하면 드라이브 전체를 훨씬 빠르게 스캔합니다 (⚡ MFT)"
+            };
+            ui.label(RichText::new(hint).weak());
             ui.add_space(16.0);
             let mut chosen = None;
             for d in &self.drives {
@@ -955,7 +1053,7 @@ impl App {
     }
 
     fn treemap_view(&mut self, ui: &mut egui::Ui) {
-        let (mode, detail) = (self.mode, self.detail);
+        let (mode, detail, elevated) = (self.mode, self.detail, self.elevated);
         let dark = ui.visuals().dark_mode;
         let Some(doc) = &mut self.doc else { return };
         let (resp, painter) = treemap::canvas(ui);
@@ -1054,13 +1152,16 @@ impl App {
         if resp.clicked() {
             doc.selected = selectable_node(hit.as_ref());
         }
+        let mut open = None;
         if resp.double_clicked()
             && let Some(it) = hit
         {
             match it.kind {
                 ItemKind::OpenDir | ItemKind::ClosedDir => doc.navigate(it.node),
-                ItemKind::File => open_item(doc, it.node),
-                ItemKind::Link if filesystem_actions_enabled(doc) => reveal_in_explorer(&doc.tree.path(it.node)),
+                ItemKind::File => open = Some(it.node),
+                ItemKind::Link if filesystem_actions_enabled(doc) => {
+                    shell(Shell::Reveal(doc.tree.path(it.node)));
+                }
                 ItemKind::Link => {},
                 ItemKind::Group { .. } => {}
             }
@@ -1097,12 +1198,15 @@ impl App {
                 ui.close();
                 return;
             };
-            if context_menu(ui, doc, n) {
+            if context_menu(ui, doc, n, elevated) {
                 toggle = Some(n);
             }
         });
         if let Some(n) = toggle {
             self.toggle_mark(n);
+        }
+        if let Some(id) = open {
+            self.open_file(id);
         }
 
         let Some(doc) = &self.doc else { return };
@@ -1119,6 +1223,53 @@ impl App {
         if !removed.is_empty() { self.begin_removal(source_id, removed); }
         if !open {
             self.delete_dialog = None;
+        }
+    }
+
+    /// 공용 확인 모달. Esc·바깥 클릭은 취소다.
+    fn confirm_ui(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = &self.confirm else { return };
+        let (marks, size) = self.doc.as_ref().map_or((0, 0), |doc| (doc.marks.len(), doc.marked_size(self.mode)));
+        let (title, lines, ok) = match confirm {
+            Confirm::Relaunch(root) => (
+                "관리자 권한으로 다시 열까요?",
+                [
+                    format!("삭제 표시 {}개({})는 새 창으로 넘어가지 않습니다.", thousands(marks as u64), human_size(size)),
+                    match root {
+                        Some(r) => format!("새 창에서 처음부터 다시 스캔합니다: {r}"),
+                        None => "새 창은 처음 화면에서 시작합니다.".into(),
+                    },
+                ],
+                "관리자로 다시 열기",
+            ),
+        };
+        let mut answer = None;
+        let modal = egui::Modal::new(egui::Id::new("confirm")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(title);
+            ui.add_space(6.0);
+            for line in &lines {
+                ui.label(line);
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                // 지우는 동작이 아니므로 빨강이 아닌 기본 버튼
+                if ui.button(ok).clicked() {
+                    answer = Some(true);
+                }
+                if ui.button("취소").clicked() {
+                    answer = Some(false);
+                }
+            });
+        });
+        if answer.is_none() && modal.should_close() {
+            answer = Some(false);
+        }
+        let Some(proceed) = answer else { return };
+        // 어느 쪽이든 모달은 닫는다
+        let confirm = self.confirm.take();
+        if proceed && let Some(Confirm::Relaunch(root)) = confirm {
+            self.relaunch(ctx, root);
         }
     }
 
@@ -1141,11 +1292,14 @@ impl App {
         if ctrl_f || (!ctx.egui_wants_keyboard_input() && ctx.input(|i| i.key_pressed(Key::Slash))) {
             self.focus_search = true;
         }
-        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() || self.scanning.is_some() || self.pending_removal.is_some() {
+        // 모달 뒤에서 Space 같은 키가 표시를 바꾸지 않게 한다
+        if ctx.egui_wants_keyboard_input() || self.delete_dialog.is_some() || self.confirm.is_some()
+            || self.scanning.is_some() || self.pending_removal.is_some() {
             return;
         }
         let mut toggle = None;
         let mut detail = None;
+        let mut open = None;
         let Some(doc) = &mut self.doc else { return };
         ctx.input(|i| {
             if i.modifiers.alt && i.key_pressed(Key::ArrowLeft) || i.pointer.button_pressed(PointerButton::Extra1) {
@@ -1157,8 +1311,13 @@ impl App {
             } else if i.key_pressed(Key::Backspace) || i.modifiers.alt && i.key_pressed(Key::ArrowUp) {
                 doc.go_up();
             } else if i.key_pressed(Key::Enter) {
+                // 폴더는 확대, 파일은 더블클릭과 같은 열기 정책
                 if let Some(s) = doc.selected {
-                    doc.navigate(s);
+                    match doc.tree.node(s).kind {
+                        Kind::Dir => doc.navigate(s),
+                        Kind::File => open = Some(s),
+                        Kind::Link => {}
+                    }
                 }
             } else if i.key_pressed(Key::Escape) {
                 doc.selected = None;
@@ -1172,6 +1331,9 @@ impl App {
         });
         if let Some(n) = toggle {
             self.toggle_mark(n);
+        }
+        if let Some(id) = open {
+            self.open_file(id);
         }
         match detail {
             Some(true) => self.detail = self.detail.more(),
@@ -1188,7 +1350,7 @@ fn selectable_node(item: Option<&treemap::Item>) -> Option<NodeId> {
 }
 
 /// 오른쪽 클릭 메뉴. 삭제 표시를 바꿔야 하면 true.
-fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId) -> bool {
+fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> bool {
     let mut toggle = false;
     let path = doc.tree.path(n);
     ui.label(RichText::new(doc.tree.name(n)).strong());
@@ -1199,21 +1361,29 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId) -> bool {
     }
     match doc.tree.node(n).kind {
         Kind::File => {
-            if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("📄 열기")).clicked() {
-                open_item(doc, n);
+            // 열지 않는 파일은 아래의 '위치 보기'를 쓰게 한다
+            let refusal = open_refusal(doc.tree.name(n), elevated);
+            let open = ui.add_enabled(filesystem_actions_enabled(doc) && refusal.is_none(), egui::Button::new("📄 열기"));
+            let open = match refusal {
+                Some(why) => open.on_disabled_hover_text(why),
+                None => open,
+            };
+            if open.clicked() {
+                open_item(doc, n, elevated);
                 ui.close();
             }
         }
         Kind::Dir => {
             if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("📂 폴더 열기")).clicked() {
-                shell_open(&path);
+                // 관리자 권한이면 타사 폴더 처리기가 관리자 권한으로 뜨지 않게 탐색기로 직접 연다
+                shell(if elevated { Shell::Explore(path.clone()) } else { Shell::Open(path.clone()) });
                 ui.close();
             }
         }
         Kind::Link => {}
     }
     if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("🔎 탐색기에서 위치 보기")).clicked() {
-        reveal_in_explorer(&path);
+        shell(Shell::Reveal(path.clone()));
         ui.close();
     }
     if ui.button("📋 경로 복사").clicked() {
@@ -1222,7 +1392,7 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId) -> bool {
     }
     ui.separator();
     let state = doc.mark_state(n);
-    let protected = protected_reason(&doc.tree, n);
+    let protected = doc.protected(n);
     if state == 1 {
         if ui.button("↩ 삭제 표시 해제").clicked() {
             toggle = true;
@@ -1333,17 +1503,95 @@ fn wheel_delta(i: &egui::InputState) -> f32 {
         .sum()
 }
 
-/// 파일을 기본 앱으로 연다
-fn open_item(doc: &Doc, id: NodeId) {
-    if !filesystem_actions_enabled(doc) { return; }
-    let path = doc.tree.path(id);
-    if !shell_open(&path) {
-        reveal_in_explorer(&path);
+/// 파일을 직접 열지 않는 까닭. 열어도 되면 None.
+/// 관리자 권한이면 무엇을 열든 관리자 권한을 물려주므로 모두 거부하고, 일반 권한이면 코드가 실행되는 파일만 거부한다.
+fn open_refusal(name: &str, elevated: bool) -> Option<&'static str> {
+    if elevated {
+        Some("관리자 권한으로 실행 중이라 파일은 열지 않고 탐색기에서 위치를 보여 줍니다")
+    } else if runs_code(name) {
+        Some("실행 파일과 스크립트는 열지 않고 탐색기에서 위치를 보여 줍니다")
+    } else {
+        None
     }
 }
 
-fn reveal_in_explorer(path: &str) {
-    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{path}\"")).spawn();
+/// 파일을 기본 앱으로 연다. 열지 않는 파일이거나 열지 못하면 탐색기에서 위치를 보여 준다.
+/// 열지 않은 까닭(open_refusal)을 돌려준다.
+fn open_item(doc: &Doc, id: NodeId, elevated: bool) -> Option<&'static str> {
+    if !filesystem_actions_enabled(doc) { return None; }
+    let path = doc.tree.path(id);
+    let refusal = open_refusal(doc.tree.name(id), elevated);
+    if refusal.is_some() || !shell(Shell::Open(path.clone())) {
+        shell(Shell::Reveal(path));
+    }
+    refusal
+}
+
+/// 네트워크 위치인지: UNC 경로(`\\server\share`, `\\?\UNC\..`)이거나 네트워크 드라이브 문자
+fn is_network(root: &str, drives: &[Drive]) -> bool {
+    let path = root.strip_prefix(r"\\?\").unwrap_or(root);
+    if path.starts_with(r"\\") || path.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(r"UNC\")) {
+        return true;
+    }
+    let letter = |p: &str| p.get(..2).map(str::to_ascii_uppercase);
+    drives.iter().any(|d| d.kind == DRIVE_REMOTE && letter(&d.root).is_some_and(|l| letter(path) == Some(l)))
+}
+
+/// '관리자로 실행' 툴팁: 새 창이 무엇을 하는지
+fn relaunch_hint(root: Option<&str>) -> String {
+    match root {
+        None => "관리자 권한으로 다시 엽니다. 드라이브를 고르면 $MFT를 직접 읽어 몇 초 안에 스캔합니다".into(),
+        Some(r) if is_drive_root(r) => {
+            format!("관리자 권한으로 다시 열어 바로 스캔합니다: {r}\n$MFT를 직접 읽어 몇 초 안에 끝납니다")
+        }
+        Some(r) => format!(
+            "관리자 권한으로 다시 열어 바로 스캔합니다: {r}\n\
+             접근이 거부된 폴더까지 읽습니다. $MFT 빠른 스캔은 드라이브 전체를 고를 때만 씁니다"
+        ),
+    }
+}
+
+/// 셸에 맡기는 동작. 테스트 빌드에서는 실행하지 않고 기록만 한다.
+#[derive(Debug, PartialEq)]
+enum Shell {
+    /// 기본 앱으로 열기
+    Open(String),
+    /// 탐색기 창으로 폴더 열기
+    Explore(String),
+    /// 탐색기에서 위치 보기 (항목을 선택한 채로)
+    Reveal(String),
+    /// 관리자 권한으로 다시 실행 (새 창이 스캔할 루트)
+    Elevate(Option<String>),
+}
+
+/// 셸 동작을 실행한다. 성공하면 true. 탐색기는 이름이 아니라 절대 경로로 띄운다 (explorer_exe).
+#[cfg(not(test))]
+fn shell(action: Shell) -> bool {
+    use darak_core::scan::{explorer_exe, relaunch_as_admin, shell_open};
+    use std::os::windows::process::CommandExt;
+    match action {
+        Shell::Open(path) => shell_open(&path),
+        Shell::Explore(path) => std::process::Command::new(explorer_exe()).arg(path).spawn().is_ok(),
+        Shell::Reveal(path) => {
+            std::process::Command::new(explorer_exe()).raw_arg(format!("/select,\"{path}\"")).spawn().is_ok()
+        }
+        Shell::Elevate(root) => relaunch_as_admin(root.as_deref()),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트에서 shell()이 받은 동작
+    static SHELL_LOG: std::cell::RefCell<Vec<Shell>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// 테스트에서 shell()이 돌려줄 값
+    static SHELL_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// 테스트 빌드: 아무것도 실행하지 않고 기록만 한다.
+#[cfg(test)]
+fn shell(action: Shell) -> bool {
+    SHELL_LOG.with_borrow_mut(|log| log.push(action));
+    SHELL_OK.get()
 }
 
 // The marker is carried by the synthetic tree, so leaf handlers cannot bypass it.
@@ -1503,6 +1751,7 @@ mod tests {
             next_doc_id: 2,
             elevated: false,
             delete_dialog: None,
+            confirm: None,
             focus_search: false,
             detail: Detail::default(),
             anim: None,
@@ -1523,6 +1772,7 @@ mod tests {
         let tree = darak_core::perf::make_fixture(100, darak_core::perf::Shape::Balanced, 25);
         let mut app = app(doc(1, tree));
         assert!(!filesystem_actions_enabled(app.doc.as_ref().unwrap()));
+        assert_eq!(app.admin_relaunch(), AdminRelaunch::Hidden);
         app.doc.as_mut().unwrap().marks.insert(1);
         app.open_delete_review();
         assert!(app.delete_dialog.is_none());
@@ -1579,6 +1829,19 @@ mod tests {
             app.keyboard(ui.ctx());
         });
         output.textures_delta.clear();
+    }
+
+    /// 앱 전체(App::show: 툴바·상태 바·모달·키보드까지)를 창 크기로 한 프레임 그린다
+    fn full_frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>, time: f64) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+            events,
+            time: Some(time),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.show(ui));
+        output.textures_delta.clear();
+        output
     }
 
     #[test]
@@ -2960,6 +3223,382 @@ mod tests {
             app.observe_search_input();
             assert_eq!(app.search_generation, generation + 1);
             assert_eq!(app.perf_measurement.as_ref().unwrap().input_at, resumed_at);
+        }
+    }
+
+    // ---- 셸 동작·열기 정책·관리자 재실행 ----
+
+    /// shell()이 돌려줄 값을 정하고 기록을 비운다
+    fn reset_shell(ok: bool) {
+        SHELL_OK.set(ok);
+        SHELL_LOG.take();
+    }
+
+    /// 지금까지 shell()이 받은 동작을 꺼낸다
+    fn shell_log() -> Vec<Shell> {
+        SHELL_LOG.take()
+    }
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE },
+        ]
+    }
+
+    fn key(key: Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// 트리맵에서 같은 자리를 egui 더블클릭 간격 안에 두 번 누른다
+    fn double_click(ctx: &egui::Context, app: &mut App, pos: egui::Pos2, time: f64) {
+        for (dt, pressed) in [(0.0, true), (0.05, false), (0.1, true), (0.15, false)] {
+            frame(ctx, app, pointer(pos, pressed), time + dt);
+        }
+    }
+
+    /// 화면에 그려진 글자 `text`(정확히 일치)의 가운데
+    fn text_pos(output: &egui::FullOutput, text: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::epaint::Shape, text: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::epaint::Shape::Text(s) if s.galley.text() == text => Some(s.pos + s.galley.size() * 0.5),
+                egui::epaint::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, text)),
+                _ => None,
+            }
+        }
+        output.shapes.iter().find_map(|s| find(&s.shape, text))
+    }
+
+    /// 이 프레임에 창을 닫으라고 했는지
+    fn closes(output: &egui::FullOutput) -> bool {
+        output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Close)
+    }
+
+    /// 앱 전체를 그리며 `text` 버튼을 누른다. 뗀 프레임의 출력을 돌려준다.
+    fn press_text(ctx: &egui::Context, app: &mut App, text: &str, time: &mut f64) -> egui::FullOutput {
+        let mut output = full_frame(ctx, app, vec![], *time);
+        for _ in 0..2 {
+            *time += 0.1;
+            output = full_frame(ctx, app, vec![], *time);
+        }
+        let pos = text_pos(&output, text).unwrap_or_else(|| panic!("{text} 없음"));
+        *time += 0.1;
+        full_frame(ctx, app, pointer(pos, true), *time);
+        *time += 0.05;
+        full_frame(ctx, app, pointer(pos, false), *time)
+    }
+
+    /// 루트 이름만 다른 문서
+    fn rooted(root: &str) -> Doc {
+        let mut tree = Tree::default();
+        node(&mut tree, root, NO_NODE, Kind::Dir, 100, 1, 1);
+        node(&mut tree, "child", 0, Kind::File, 100, 0, 0);
+        doc(1, tree)
+    }
+
+    /// 실행 파일과 영상 파일이 나란히 있는 문서
+    fn launch_fixture() -> Doc {
+        let mut tree = Tree::default();
+        node(&mut tree, "C:\\Data", NO_NODE, Kind::Dir, 100, 1, 2);
+        node(&mut tree, "setup.exe", 0, Kind::File, 50, 0, 0);
+        node(&mut tree, "movie.mkv", 0, Kind::File, 50, 0, 0);
+        doc(1, tree)
+    }
+
+    #[test]
+    fn open_refusal_reasons() {
+        assert_eq!(open_refusal("movie.mkv", false), None);
+        let code = open_refusal("setup.exe", false).unwrap();
+        let admin = open_refusal("movie.mkv", true).unwrap();
+        assert_ne!(code, admin);
+        assert_eq!(open_refusal("setup.exe", true), Some(admin));
+    }
+
+    #[test]
+    fn double_click_never_runs_code_and_only_reveals_when_elevated() {
+        for (elevated, ok) in [(false, true), (false, false), (true, true)] {
+            reset_shell(ok);
+            let ctx = egui::Context::default();
+            let mut app = app(launch_fixture());
+            app.elevated = elevated;
+            frame(&ctx, &mut app, vec![], 0.0);
+            for (time, id) in [(1.0, 1), (2.0, 2)] {
+                app.toast = None;
+                let pos = app.layout.rect_of(id).unwrap().center();
+                double_click(&ctx, &mut app, pos, time);
+                let path = app.doc.as_ref().unwrap().tree.path(id);
+                let refused = id == 1 || elevated;
+                let expected = if refused {
+                    vec![Shell::Reveal(path)]
+                } else if ok {
+                    vec![Shell::Open(path)]
+                } else {
+                    // 기본 앱으로 열지 못하면 위치를 보여 준다
+                    vec![Shell::Open(path.clone()), Shell::Reveal(path)]
+                };
+                assert_eq!(shell_log(), expected, "elevated={elevated} ok={ok} id={id}");
+                let note = app.toast.as_ref().map(|(msg, _)| msg.as_str());
+                let name = if id == 1 { "setup.exe" } else { "movie.mkv" };
+                assert_eq!(note, open_refusal(name, elevated), "elevated={elevated} id={id}");
+                assert_eq!(note.is_some(), refused);
+            }
+        }
+        reset_shell(true);
+    }
+
+    #[test]
+    fn enter_follows_the_same_open_policy() {
+        for elevated in [false, true] {
+            reset_shell(true);
+            let ctx = egui::Context::default();
+            let mut app = app(launch_fixture());
+            app.elevated = elevated;
+            frame(&ctx, &mut app, vec![], 0.0);
+            for (time, id) in [(0.1, 1), (0.2, 2)] {
+                app.doc.as_mut().unwrap().selected = Some(id);
+                frame(&ctx, &mut app, vec![key(Key::Enter)], time);
+                let path = app.doc.as_ref().unwrap().tree.path(id);
+                let expected = if id == 1 || elevated { Shell::Reveal(path) } else { Shell::Open(path) };
+                assert_eq!(shell_log(), [expected], "elevated={elevated} id={id}");
+            }
+        }
+        // 폴더에서는 지금처럼 확대한다
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        app.doc.as_mut().unwrap().selected = Some(1);
+        frame(&ctx, &mut app, vec![key(Key::Enter)], 0.0);
+        assert_eq!(app.doc.as_ref().unwrap().focus, 1);
+        assert!(shell_log().is_empty());
+    }
+
+    /// 오른쪽 클릭 메뉴만 그리며 `text` 항목을 누른다
+    fn press_menu(doc: &mut Doc, n: NodeId, elevated: bool, text: &str) {
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let draw = |doc: &mut Doc, events: Vec<egui::Event>, time: f64| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0))),
+                events,
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| context_menu(ui, doc, n, elevated));
+            });
+            output.textures_delta.clear();
+            output
+        };
+        let mut output = draw(doc, vec![], time);
+        for _ in 0..2 {
+            time += 0.1;
+            output = draw(doc, vec![], time);
+        }
+        let pos = text_pos(&output, text).unwrap_or_else(|| panic!("{text} 없음"));
+        for pressed in [true, false] {
+            time += 0.05;
+            draw(doc, pointer(pos, pressed), time);
+        }
+    }
+
+    #[test]
+    fn context_menu_follows_open_policy() {
+        reset_shell(true);
+        let mut doc = launch_fixture();
+        let (exe, movie) = (doc.tree.path(1), doc.tree.path(2));
+        press_menu(&mut doc, 2, false, "📄 열기");
+        assert_eq!(shell_log(), [Shell::Open(movie.clone())]);
+        // 열지 않는 파일은 '열기'가 꺼져 있고, 위치 보기는 쓸 수 있다
+        press_menu(&mut doc, 1, false, "📄 열기");
+        press_menu(&mut doc, 2, true, "📄 열기");
+        assert!(shell_log().is_empty());
+        press_menu(&mut doc, 1, false, "🔎 탐색기에서 위치 보기");
+        assert_eq!(shell_log(), [Shell::Reveal(exe)]);
+        // 관리자 권한이면 폴더는 탐색기로 직접 연다
+        let mut doc = fixture(1);
+        let folder = doc.tree.path(1);
+        press_menu(&mut doc, 1, false, "📂 폴더 열기");
+        press_menu(&mut doc, 1, true, "📂 폴더 열기");
+        assert_eq!(shell_log(), [Shell::Open(folder.clone()), Shell::Explore(folder)]);
+    }
+
+    #[test]
+    fn admin_relaunch_targets_document_root_and_blocks_busy_states() {
+        let mut app = app(fixture(1));
+        // 경로 칸이 아니라 화면에 있는 문서의 루트를 넘긴다
+        app.root_input = "D:\\Other".into();
+        assert_eq!(app.admin_relaunch(), AdminRelaunch::Ready(Some("C:\\Data".into())));
+        let _scan = install_scan(&mut app);
+        assert!(matches!(app.admin_relaunch(), AdminRelaunch::Blocked(_)));
+        app.scanning = None;
+        app.delete_dialog = Some(Dialog {
+            doc_id: 1,
+            stage: Stage::Review { method: Method::Recycle, confirmed: false, error: None },
+        });
+        assert!(matches!(app.admin_relaunch(), AdminRelaunch::Blocked(_)));
+        app.delete_dialog = None;
+        app.begin_removal(1, vec![1]);
+        assert!(matches!(app.admin_relaunch(), AdminRelaunch::Blocked(_)));
+        app.pending_removal = None;
+        app.elevated = true;
+        assert_eq!(app.admin_relaunch(), AdminRelaunch::Hidden);
+        app.elevated = false;
+        app.doc = None;
+        assert_eq!(app.admin_relaunch(), AdminRelaunch::Ready(None));
+
+        app.drives = vec![
+            Drive { root: "Z:\\".into(), kind: DRIVE_REMOTE, total: 0, free: 0 },
+            Drive { root: "Y:\\".into(), kind: darak_core::sys::DRIVE_FIXED, total: 0, free: 0 },
+        ];
+        for (root, network) in [
+            (r"\\server\share", true),
+            (r"\\?\UNC\server\share", true),
+            (r"Z:\Data", true),
+            (r"z:\", true),
+            (r"\\?\Z:\Data", true),
+            (r"Y:\Data", false),
+            (r"\\?\C:\Data", false),
+        ] {
+            app.doc = Some(rooted(root));
+            let state = app.admin_relaunch();
+            if network {
+                assert!(matches!(state, AdminRelaunch::Blocked(_)), "{root}: {state:?}");
+            } else {
+                assert_eq!(state, AdminRelaunch::Ready(Some(root.into())), "{root}");
+            }
+        }
+
+        assert!(relaunch_hint(None).contains("드라이브를 고르면"));
+        assert!(relaunch_hint(Some("C:\\")).contains("$MFT를 직접 읽어"));
+        assert!(relaunch_hint(Some("C:\\Data")).contains("드라이브 전체를 고를 때만"));
+    }
+
+    #[test]
+    fn relaunch_without_marks_elevates_and_closes() {
+        for ok in [true, false] {
+            reset_shell(ok);
+            let ctx = egui::Context::default();
+            let mut app = app(fixture(1));
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.request_relaunch(ui.ctx(), Some("C:\\Data".into()));
+            });
+            output.textures_delta.clear();
+            assert_eq!(shell_log(), [Shell::Elevate(Some("C:\\Data".into()))]);
+            assert_eq!(closes(&output), ok);
+            assert!(app.confirm.is_none());
+            // UAC 취소나 실패는 창을 그대로 두고 알린다
+            assert_eq!(app.toast.is_some(), !ok);
+        }
+        reset_shell(true);
+    }
+
+    #[test]
+    fn toolbar_relaunch_passes_document_root_and_waits_for_scan() {
+        reset_shell(true);
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        app.root_input = "D:\\Other".into();
+        let mut time = 0.0;
+        let scan = install_scan(&mut app);
+        let output = press_text(&ctx, &mut app, "🛡 관리자로 실행", &mut time);
+        assert!(shell_log().is_empty());
+        assert!(!closes(&output));
+        drop(scan);
+        app.scanning = None;
+        let output = press_text(&ctx, &mut app, "🛡 관리자로 실행", &mut time);
+        assert_eq!(shell_log(), [Shell::Elevate(Some("C:\\Data".into()))]);
+        assert!(closes(&output));
+    }
+
+    #[test]
+    fn relaunch_with_marks_asks_before_closing() {
+        reset_shell(true);
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let doc = app.doc.as_mut().unwrap();
+        doc.toggle_mark(3).unwrap();
+        doc.selected = Some(3);
+        let marks = doc.marks.clone();
+        let root = Some("C:\\Data".to_owned());
+        let mut time = 0.0;
+        for answer in [Some("취소"), None, Some("관리자로 다시 열기")] {
+            app.request_relaunch(&ctx, root.clone());
+            assert_eq!(app.confirm, Some(Confirm::Relaunch(root.clone())));
+            assert!(shell_log().is_empty());
+            // 모달이 열린 동안에는 Space가 표시를 바꾸지 않는다
+            let mut output = full_frame(&ctx, &mut app, vec![key(Key::Space)], time);
+            for _ in 0..3 {
+                time += 0.1;
+                output = full_frame(&ctx, &mut app, vec![], time);
+            }
+            assert_eq!(app.doc.as_ref().unwrap().marks, marks);
+            assert!(has_removal_text(&output, "삭제 표시 1개(60 B)는 새 창으로 넘어가지 않습니다."));
+            assert!(has_removal_text(&output, "새 창에서 처음부터 다시 스캔합니다: C:\\Data"));
+            let output = match answer {
+                Some(text) => press_text(&ctx, &mut app, text, &mut time),
+                // Esc는 취소이고, 모달이 먹으므로 선택도 그대로다
+                None => {
+                    time += 0.1;
+                    full_frame(&ctx, &mut app, vec![key(Key::Escape)], time)
+                }
+            };
+            let proceed = answer == Some("관리자로 다시 열기");
+            assert!(app.confirm.is_none(), "{answer:?}");
+            assert_eq!(closes(&output), proceed, "{answer:?}");
+            let expected = if proceed { vec![Shell::Elevate(root.clone())] } else { vec![] };
+            assert_eq!(shell_log(), expected, "{answer:?}");
+            let doc = app.doc.as_ref().unwrap();
+            assert_eq!(doc.marks, marks);
+            assert_eq!(doc.selected, Some(3));
+        }
+    }
+
+    #[test]
+    fn elevated_scan_result_uses_admin_guard() {
+        for elevated in [false, true] {
+            let mut app = app(fixture(1));
+            app.elevated = elevated;
+            let scan = install_scan(&mut app);
+            let mut tree = Tree::default();
+            node(&mut tree, "Z:\\Program Files", NO_NODE, Kind::Dir, 100, 1, 1);
+            node(&mut tree, "App", 0, Kind::Dir, 100, 2, 1);
+            node(&mut tree, "cache", 1, Kind::File, 100, 0, 0);
+            let result = doc(9, tree);
+            scan.send(Ok(ScanResult { tree: Arc::try_unwrap(result.tree).ok().unwrap(), stats: result.stats })).unwrap();
+            app.poll_scan();
+            assert_eq!(app.doc.as_ref().unwrap().guard, if elevated { Guard::Admin } else { Guard::User });
+            app.toggle_mark(1);
+            let doc = app.doc.as_ref().unwrap();
+            if elevated {
+                assert!(doc.marks.is_empty());
+                let note = app.toast.as_ref().map(|(msg, _)| msg.as_str());
+                assert_eq!(note, Some("보호된 항목: 설치된 프로그램 폴더 (관리자 권한)"));
+                // 더 깊은 하위는 관리자 권한에서도 표시할 수 있다
+                app.toggle_mark(2);
+                assert_eq!(app.doc.as_ref().unwrap().marks.iter().copied().collect::<Vec<_>>(), [2]);
+            } else {
+                assert_eq!(doc.marks.iter().copied().collect::<Vec<_>>(), [1]);
+            }
+        }
+    }
+
+    #[test]
+    fn status_bar_shows_admin_badge_only_when_elevated() {
+        for elevated in [false, true] {
+            for (error, has_doc) in [(None, true), (Some("스캔 오류"), true), (None, false)] {
+                let ctx = egui::Context::default();
+                let mut app = app(fixture(1));
+                app.elevated = elevated;
+                app.error = error.map(Into::into);
+                if !has_doc {
+                    app.doc = None;
+                }
+                removal_status_frame(&ctx, &mut app, 0.0);
+                let output = removal_status_frame(&ctx, &mut app, 0.1);
+                assert_eq!(has_removal_text(&output, "관리자 권한"), elevated, "{error:?} {has_doc}");
+                if let Some(error) = error {
+                    assert!(has_removal_text(&output, error));
+                }
+            }
         }
     }
 }

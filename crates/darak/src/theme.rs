@@ -106,6 +106,17 @@ pub fn focus_ring(ui: &egui::Ui, resp: &egui::Response) {
     }
 }
 
+/// 차분한 회색 배지 (컴포넌트 보드 「배지」: 높이 20 · 모서리 3). 응답은 hover를 감지하므로 툴팁을 붙일 수 있다.
+pub fn badge(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    let t = of(ui);
+    egui::Frame::new()
+        .fill(t.surface_raised)
+        .corner_radius(3)
+        .inner_margin(egui::Margin::symmetric(7, 2))
+        .show(ui, |ui| ui.label(egui::RichText::new(text).size(12.0).color(t.text_secondary)))
+        .response
+}
+
 fn visuals(mut v: egui::Visuals, t: &Tokens) -> egui::Visuals {
     let control = CornerRadius::same(4);
     v.panel_fill = t.surface_panel;

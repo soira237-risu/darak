@@ -77,6 +77,7 @@ struct Node {            // Vec<Node> 아레나, u32 인덱스로 참조
 ### 3.4 UI / 상호작용
 
 - 클릭: 선택. 더블클릭 또는 휠: 줌 인. Backspace: 상위로. Alt+←/→: 이전/다음 위치.
+- 파일을 더블클릭하거나 선택하고 Enter를 누르면 기본 앱으로 연다. 실행 파일·스크립트·설치 패키지·바로 가기는 실행하지 않고 탐색기에서 위치를 보여 주며, 관리자 권한에서는 어떤 파일도 열지 않고 위치만 보여 준다(새 프로그램에 관리자 권한을 물려주지 않음). 이런 파일에서는 우클릭 '열기'가 꺼진다.
 - 마우스를 올리면 툴팁(경로, 크기, 비율, 파일 수)을 보여 준다.
 - 상단: 드라이브 선택, breadcrumb, 검색(`/`), 크기·논리 크기 토글. 하단: 상태 바(스캔 진행률, 여유 공간).
 - 우클릭 메뉴: 탐색기에서 열기, 경로 복사, 표시, 속성.
@@ -91,7 +92,8 @@ struct Node {            // Vec<Node> 아레나, u32 인덱스로 참조
   - **안쪽까지 모두 막음**: Windows 폴더(`%WINDIR%`), 각 드라이브의 `System Volume Information`·`$Recycle.Bin`·`Recovery`·`Boot`·`$Windows.~BT`·`$Windows.~WS`, 이름을 정확히 복원할 수 없는 항목(UTF-16 변환이 깨진 이름)과 그 안쪽.
   - **그 폴더 자신만 막음**(안쪽의 앱·하위 폴더는 지울 수 있음): 모든 드라이브의 `Program Files`·`Program Files (x86)`, 시스템 드라이브의 `ProgramData`·`Users`·`Users\Public`·`Users\Default`, 현재 사용자의 홈과 그 안의 `AppData`·`AppData\Local`·`AppData\Roaming`·`Documents`·`Desktop`·`Downloads`. 예를 들어 `C:\Program Files\MyApp`은 지울 수 있다(테스트로 정한 동작).
   - **항상 막음**: 드라이브 루트, 스캔 루트, 따라가지 않은 junction·디렉터리 symlink·마운트 지점(링크 자체. 셸로 지우면 대상 폴더가 지워질 수 있음), 드라이브 루트 바로 아래의 `$`로 시작하는 항목과 `pagefile.sys`·`hiberfil.sys`·`swapfile.sys`·`DumpStack.log`, 보호 여부를 확인할 수 없는 경로(UNC, 장치 경로 등).
-  - **지금은 막지 않음**: 다른 드라이브의 `ProgramData`, 다른 사용자의 홈 루트(`C:\Users\<다른 사용자>`)와 그 기본 폴더. 일반 권한에서는 대개 NTFS 권한이 막아 주지만 관리자 권한에서는 그렇지 않다. 그래서 관리자 권한일 때 모든 사용자의 프로필 루트·기본 폴더, 모든 드라이브의 `Program Files`·`Program Files (x86)` 직속 하위, `ProgramData` 직속 하위까지 막는 규칙을 수정 M1의 PR3·PR4에서 더한다(더 깊은 하위는 계속 허용, §7 '남은 일'). 규칙은 PR3에서 `remove::Guard::Admin`(`protected_reason_as`)으로 들어갔고, 관리자 권한으로 만든 문서에 적용하는 일은 PR4에서 한다.
+  - **관리자 권한으로 스캔한 문서에서 더 막음**(`remove::Guard::Admin`, 문서마다 `Doc::guard`로 들고 다님): 모든 사용자의 프로필 루트(`C:\Users\<이름>`)와 그 안의 `AppData`·`AppData\Local`·`AppData\Roaming`·`Documents`·`Desktop`·`Downloads`, 모든 드라이브의 `Program Files`·`Program Files (x86)` 직속 하위, 시스템 드라이브 `ProgramData`의 직속 하위. 일반 권한에서는 대개 NTFS 권한이 막아 주는 곳이다. 더 깊은 하위(`C:\Program Files\MyApp\cache`, 다른 프로필의 `Downloads` 안 파일)는 지울 수 있다.
+  - **막지 않음**: 다른 드라이브의 `ProgramData`, 일반 권한일 때 다른 사용자의 홈 루트(`C:\Users\<다른 사용자>`)와 그 기본 폴더(NTFS 권한이 막아 준다).
 - 삭제가 끝나면 트리에서 해당 노드를 빼고, 상위 크기를 증분으로 갱신한다(다시 스캔하지 않음).
 
 ## 4. 마일스톤

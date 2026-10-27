@@ -33,7 +33,8 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Darak")
+            // 한국어 Windows의 '관리자: 명령 프롬프트'와 같은 관례
+            .with_title(if darak_core::scan::is_elevated() { "관리자: Darak" } else { "Darak" })
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0])
             .with_icon(
