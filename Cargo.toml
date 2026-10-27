@@ -6,6 +6,7 @@ members = ["crates/darak-core", "crates/darak-cli", "crates/darak"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+repository = "https://github.com/soira237-risu/darak"
 
 [workspace.dependencies]
 darak-core = { path = "crates/darak-core" }

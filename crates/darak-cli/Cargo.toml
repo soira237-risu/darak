@@ -3,6 +3,8 @@ name = "darak-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Darak 스캔 벤치마크·디버깅 CLI"
 
 [dependencies]
 darak-core.workspace = true

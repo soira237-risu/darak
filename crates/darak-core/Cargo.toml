@@ -3,6 +3,8 @@ name = "darak-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Darak 스캔·트리·레이아웃·삭제 정책 라이브러리"
 
 [dependencies]
 rayon.workspace = true

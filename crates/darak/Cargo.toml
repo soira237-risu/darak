@@ -3,6 +3,8 @@ name = "darak"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Windows 디스크 공간 트리맵 앱"
 
 [dependencies]
 darak-core.workspace = true
