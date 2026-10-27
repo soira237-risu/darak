@@ -25,6 +25,8 @@ pub struct Doc {
     pub search: SearchState,
     /// 삭제 보호 수준 (관리자 권한으로 스캔한 문서는 Admin)
     pub guard: Guard,
+    /// 지우다 실패해 일부만 지워졌을 수 있는 폴더 (크기를 믿기 어렵다, 다시 스캔해야 맞아진다)
+    pub stale: BTreeSet<NodeId>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,6 +70,7 @@ impl Doc {
             mark_bits: vec![0; n],
             search: SearchState { highlight: true, ..Default::default() },
             guard: Guard::default(),
+            stale: BTreeSet::new(),
         }
     }
 
@@ -140,11 +143,11 @@ impl Doc {
         protected_reason_as(&self.tree, id, self.guard)
     }
 
-    /// 표시를 켜거나 끈다. 표시할 수 없으면 이유를 돌려준다.
-    pub fn toggle_mark(&mut self, id: NodeId) -> Result<(), String> {
+    /// 표시를 켜거나 끈다. 표시하면 이 항목 안에서 흡수한 기존 표시 수를, 표시할 수 없으면 이유를 돌려준다.
+    pub fn toggle_mark(&mut self, id: NodeId) -> Result<usize, String> {
         if self.marks.remove(&id) {
             self.rebuild_mark_bits();
-            return Ok(());
+            return Ok(0);
         }
         if self.mark_state(id) == 2 {
             return Err("상위 폴더가 이미 삭제 표시되어 있습니다".into());
@@ -153,16 +156,36 @@ impl Doc {
             return Err(format!("보호된 항목: {r}"));
         }
         // 이 항목 아래의 기존 표시는 흡수
-        let tree = &self.tree;
+        let (tree, before) = (&self.tree, self.marks.len());
         self.marks.retain(|&m| !tree.is_ancestor(id, m));
+        let absorbed = before - self.marks.len();
         self.marks.insert(id);
         self.rebuild_mark_bits();
-        Ok(())
+        Ok(absorbed)
     }
 
     pub fn clear_marks(&mut self) {
         self.marks.clear();
         self.rebuild_mark_bits();
+    }
+
+    /// 지운 표시를 되돌린다. 같은 문서·같은 트리 버전이고 그 사이 새 표시가 없는지는 부르는 쪽이 확인한다.
+    pub fn restore_marks(&mut self, marks: BTreeSet<NodeId>) {
+        self.marks = marks;
+        self.rebuild_mark_bits();
+    }
+
+    /// 일부만 지워졌을 수 있는 폴더로 기록한다 (범위 밖이거나 이미 지운 노드는 무시)
+    pub fn mark_stale(&mut self, ids: &[NodeId]) {
+        let tree = &self.tree;
+        self.stale.extend(ids.iter().copied().filter(|&id| {
+            tree.nodes.get(id as usize).is_some_and(|n| !n.has(darak_core::flags::REMOVED))
+        }));
+    }
+
+    /// 이 항목이 일부만 지워진 폴더이거나 그 안에 있어 크기를 믿기 어려운지
+    pub fn stale_within(&self, id: NodeId) -> bool {
+        !self.stale.is_empty() && std::iter::successors(Some(id), |&n| self.tree.parent(n)).any(|n| self.stale.contains(&n))
     }
 
     pub fn marked_size(&self, mode: SizeMode) -> u64 {
@@ -208,8 +231,16 @@ impl Doc {
         }
         let Some(tree) = Arc::get_mut(&mut self.tree) else { return RemovalApply::Busy };
         let version = tree.version;
-        for &id in removed { tree.remove(id); }
+        let (mut files, mut dirs) = (0, 0);
+        for &id in removed {
+            let (f, d) = tree.remove(id);
+            files += f;
+            dirs += d;
+        }
         if version == tree.version { return RemovalApply::Applied; }
+        // 상태 바의 파일·폴더 수도 지운 만큼 줄인다
+        self.stats.files = self.stats.files.saturating_sub(files);
+        self.stats.dirs = self.stats.dirs.saturating_sub(dirs);
         let tree = &self.tree;
         let live = |id: NodeId| {
             tree.nodes
@@ -224,6 +255,7 @@ impl Doc {
         self.back.retain(|&id| live(id));
         self.forward.retain(|&id| live(id));
         self.marks.retain(|&id| live(id));
+        self.stale.retain(|&id| live(id));
         self.rebuild_mark_bits();
         self.clear_search();
         RemovalApply::Applied
@@ -386,6 +418,43 @@ pub(crate) mod tests {
         unchanged(&other);
         assert_eq!(other.apply_removed_for(2, &[1, u32::MAX]), RemovalApply::Rejected);
         unchanged(&other);
+    }
+
+    #[test]
+    fn removal_updates_stats_and_stale_folders() {
+        let mut doc = fixture(1);
+        doc.mark_stale(&[1, 2, u32::MAX]);
+        assert_eq!(doc.stale.iter().copied().collect::<Vec<_>>(), [1, 2]);
+        assert!(doc.stale_within(1) && doc.stale_within(3) && doc.stale_within(2));
+        assert!(!doc.stale_within(Tree::ROOT));
+        assert_eq!(doc.apply_removed(&[1]), RemovalApply::Applied);
+        // 지운 폴더 하나와 그 안의 파일 하나만큼 줄어든다
+        assert_eq!((doc.stats.files, doc.stats.dirs), (1, 1));
+        assert_eq!(doc.stale.iter().copied().collect::<Vec<_>>(), [2]);
+        // 이미 지운 노드는 기록하지 않는다
+        doc.stale.clear();
+        doc.mark_stale(&[1, 3]);
+        assert!(doc.stale.is_empty());
+        assert!(!doc.stale_within(2));
+        // 같은 노드를 다시 지워도 두 번 빼지 않는다
+        doc.apply_removed(&[1, 2]);
+        assert_eq!((doc.stats.files, doc.stats.dirs), (0, 1));
+    }
+
+    #[test]
+    fn toggle_mark_counts_absorbed_marks_and_restores() {
+        let mut doc = fixture(1);
+        assert_eq!(doc.toggle_mark(3), Ok(0));
+        assert_eq!(doc.toggle_mark(2), Ok(0));
+        assert_eq!(doc.toggle_mark(1), Ok(1));
+        assert_eq!(doc.marks, BTreeSet::from([1, 2]));
+        // 상위 표시를 풀어도 흡수한 표시는 돌아오지 않는다
+        assert_eq!(doc.toggle_mark(1), Ok(0));
+        assert_eq!(doc.marks, BTreeSet::from([2]));
+        doc.clear_marks();
+        doc.restore_marks(BTreeSet::from([2, 3]));
+        assert_eq!((doc.mark_state(3), doc.mark_state(2), doc.mark_state(1)), (1, 1, 0));
+        assert_eq!(doc.marked_size(SizeMode::Allocated), 100);
     }
 
     #[test]

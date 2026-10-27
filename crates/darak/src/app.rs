@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
@@ -14,7 +15,7 @@ use darak_core::{
 };
 use eframe::egui::{self, Color32, Key, PointerButton, RichText};
 
-use crate::delete::{self, Dialog, Method, Stage};
+use crate::delete::{self, Dialog, Stage};
 use crate::doc::{Doc, RemovalApply};
 use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
 use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
@@ -39,8 +40,8 @@ pub struct App {
     scanning: Option<Scanning>,
     doc: Option<Doc>,
     error: Option<String>,
-    /// 잠깐 보여 줄 안내 (메시지, 표시 시각)
-    toast: Option<(String, Instant)>,
+    /// 잠깐 보여 줄 안내
+    toast: Option<Toast>,
     mode: SizeMode,
     layout: Layout,
     wheel_acc: f32,
@@ -78,6 +79,31 @@ struct PendingRemoval {
 
 /// 반환 알림 뒤에도 트리를 다른 소유자가 붙잡고 있으면, 이 시간이 지난 뒤 복제해서 반영한다.
 const REMOVAL_DETACH_AFTER: Duration = Duration::from_secs(2);
+
+/// 잠깐 보여 줄 안내. 되돌릴 수 있는 동작이면 '되돌리기' 버튼이 붙고 더 오래 보인다.
+struct Toast {
+    msg: String,
+    at: Instant,
+    undo: Option<ClearedMarks>,
+}
+
+/// 안내를 보여 주는 시간
+const TOAST_FOR: Duration = Duration::from_millis(2500);
+/// 되돌리기 버튼이 있는 안내를 보여 주는 시간
+const UNDO_FOR: Duration = Duration::from_secs(6);
+
+/// '표시 모두 해제'로 지운 표시. 같은 문서·같은 트리 버전이고 그 사이 새 표시가 없을 때만 되돌린다.
+struct ClearedMarks {
+    doc_id: u64,
+    version: u64,
+    marks: BTreeSet<NodeId>,
+}
+
+impl ClearedMarks {
+    fn applies_to(&self, doc: &Doc) -> bool {
+        doc.id == self.doc_id && doc.tree.version == self.version && doc.marks.is_empty()
+    }
+}
 
 /// 삭제 표시를 잃는 동작을 하기 전에 묻는 내용. 모두 `confirm_ui` 하나로 그린다.
 // TODO(PR7): 새 스캔·다시 스캔을 묻는 Scan(String)을 더한다
@@ -275,14 +301,7 @@ impl App {
         if let Some(doc) = &self.doc
             && !doc.marks.is_empty()
         {
-            self.delete_dialog = Some(Dialog {
-                doc_id: doc.id,
-                stage: Stage::Review {
-                    method: Method::Recycle,
-                    confirmed: false,
-                    error: None,
-                },
-            });
+            self.delete_dialog = Some(Dialog::review(doc));
         }
     }
 
@@ -328,15 +347,44 @@ impl App {
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), Instant::now()));
+        self.toast = Some(Toast { msg: msg.into(), at: Instant::now(), undo: None });
     }
 
     fn toggle_mark(&mut self, id: NodeId) {
         if self.pending_removal.is_some() { return; }
-        if let Some(doc) = &mut self.doc
-            && let Err(e) = doc.toggle_mark(id) {
-                self.toast = Some((e, Instant::now()));
-            }
+        let Some(doc) = &mut self.doc else { return };
+        match doc.toggle_mark(id) {
+            Ok(0) => {}
+            // 상위 폴더 표시가 안쪽 표시를 흡수했다 (상위 표시를 풀어도 돌아오지 않으므로 알린다)
+            Ok(n) => self.toast(format!("안쪽 표시 {}개를 이 폴더 표시에 합쳤습니다", thousands(n as u64))),
+            Err(e) => self.toast(e),
+        }
+    }
+
+    /// 표시를 모두 지우고, 6초 동안 되돌릴 수 있는 안내를 띄운다.
+    // TODO(PR13): 검토 창 왼쪽 아래의 '목록 비우기'도 이 함수를 부른다 (버튼 자리는 PR13에서 정한다)
+    fn clear_marks(&mut self) {
+        if self.pending_removal.is_some() { return; }
+        let Some(doc) = &mut self.doc else { return };
+        if doc.marks.is_empty() { return; }
+        let undo = ClearedMarks { doc_id: doc.id, version: doc.tree.version, marks: std::mem::take(&mut doc.marks) };
+        doc.clear_marks();
+        self.toast = Some(Toast {
+            msg: format!("표시 {}개를 모두 해제했습니다", thousands(undo.marks.len() as u64)),
+            at: Instant::now(),
+            undo: Some(undo),
+        });
+    }
+
+    /// 안내의 '되돌리기': 지운 표시를 다시 놓는다. 문서나 트리가 바뀌었거나 새 표시가 있으면 하지 않는다.
+    fn undo_clear(&mut self) {
+        let Some(Toast { undo: Some(cleared), .. }) = self.toast.take() else { return };
+        if self.pending_removal.is_none()
+            && let Some(doc) = &mut self.doc
+            && cleared.applies_to(doc)
+        {
+            doc.restore_marks(cleared.marks);
+        }
     }
 
     /// 파일을 연다. 열지 않는 파일이면 탐색기에서 위치를 보여 주고 까닭을 알린다 (더블클릭·Enter·검색 결과).
@@ -649,6 +697,7 @@ impl App {
         #[cfg(feature = "perf")]
         self.perf_record_draw(table_draw.as_ref());
         self.delete_dialog_ui(&ctx);
+        self.guard_close(&ctx);
         self.confirm_ui(&ctx);
         self.toast_ui(&ctx);
         self.keyboard(&ctx);
@@ -671,7 +720,7 @@ impl App {
 impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
-        let mut review = false;
+        let (mut review, mut clear) = (false, false);
         ui.horizontal(|ui| {
             ui.add_enabled_ui(self.delete_dialog.is_none() && self.pending_removal.is_none(), |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
                 let mut chosen = None;
@@ -783,13 +832,16 @@ impl App {
                         review = true;
                     }
                     if ui.add_enabled(self.pending_removal.is_none(), egui::Button::new("표시 모두 해제").small()).clicked() {
-                        doc.clear_marks();
+                        clear = true;
                     }
                 }
             }
         });
         if review {
             self.open_delete_review();
+        }
+        if clear {
+            self.clear_marks();
         }
 
         if let Some(doc) = &mut self.doc {
@@ -839,6 +891,7 @@ impl App {
         if self.pending_removal.is_some() {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
+        let mut rescan = None;
         ui.horizontal(|ui| {
             // 아래의 조기 반환보다 앞이라 오류·스캔 중·문서 없음 상태에서도 보인다
             if self.elevated {
@@ -885,6 +938,16 @@ impl App {
             if st.cancelled {
                 ui.label("· 중지됨(일부 결과)");
             }
+            if !doc.stale.is_empty() {
+                ui.separator();
+                ui.colored_label(
+                    theme::of(ui).warn,
+                    format!("⚠ 일부만 지워진 폴더 {}개 · 크기가 실제와 다를 수 있음", thousands(doc.stale.len() as u64)),
+                );
+                if ui.small_button("다시 스캔").clicked() {
+                    rescan = Some(doc.tree.name(Tree::ROOT).to_owned());
+                }
+            }
             if let Some((total, free)) = disk_space(doc.tree.name(Tree::ROOT)) {
                 ui.separator();
                 ui.label(format!("여유 공간 {} / {}", human_size(free), human_size(total)));
@@ -894,6 +957,10 @@ impl App {
                 ui.label(RichText::new(doc.tree.path(h)).weak());
             }
         });
+        // TODO(PR7): 표시가 있으면 묻고 진행하는 rescan()으로 바꾼다
+        if let Some(root) = rescan {
+            self.start_scan(root);
+        }
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
@@ -1222,12 +1289,31 @@ impl App {
 
     fn delete_dialog_ui(&mut self, ctx: &egui::Context) {
         let Some(dlg) = &mut self.delete_dialog else { return };
-        let mut removed = Vec::new();
-        let open = delete::show(ctx, dlg, self.doc.as_mut(), self.mode, &mut removed);
+        let mut fx = delete::Effects::default();
+        let open = delete::show(ctx, dlg, self.doc.as_mut(), self.mode, &mut fx);
         let source_id = dlg.doc_id;
-        if !removed.is_empty() { self.begin_removal(source_id, removed); }
+        // 일부만 지워진 폴더는 그 문서에만 남긴다 (실행 중에 문서가 바뀌었으면 버린다)
+        if let Some(doc) = &mut self.doc
+            && doc.id == source_id
+        {
+            doc.mark_stale(&fx.stale);
+        }
+        if fx.open_bin {
+            shell(Shell::Explore("shell:RecycleBinFolder".into()));
+        }
+        if !fx.removed.is_empty() { self.begin_removal(source_id, fx.removed); }
         if !open {
             self.delete_dialog = None;
+        }
+    }
+
+    /// 삭제가 진행 중이면 창 닫기를 미룬다. 닫히면 작업자 스레드가 끊겨 반쯤 지운 채 아무 기록도 남지 않는다.
+    fn guard_close(&mut self, ctx: &egui::Context) {
+        if self.delete_dialog.as_ref().is_some_and(|d| matches!(d.stage, Stage::Running { .. }))
+            && ctx.input(|i| i.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.toast("삭제가 끝난 뒤에 닫을 수 있습니다");
         }
     }
 
@@ -1279,16 +1365,29 @@ impl App {
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
-        let Some((msg, at)) = &self.toast else { return };
-        if at.elapsed() > Duration::from_millis(2500) {
+        let Some(toast) = &self.toast else { return };
+        if toast.at.elapsed() > if toast.undo.is_some() { UNDO_FOR } else { TOAST_FOR } {
             self.toast = None;
             return;
         }
+        // 되돌릴 수 없게 된 뒤(새 표시, 다른 문서)에는 버튼을 숨긴다
+        let can_undo = toast.undo.as_ref().is_some_and(|u| self.doc.as_ref().is_some_and(|doc| u.applies_to(doc)));
+        let mut undo = false;
         egui::Area::new(egui::Id::new("toast"))
             .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+            // 알림만 하는 안내는 모달(삭제 중 창 등) 위에 그린다. 그 층은 누를 수 없으므로 버튼이 있으면 보통 층에 둔다
+            .order(if toast.undo.is_some() { egui::Order::Middle } else { egui::Order::Tooltip })
             .show(ctx, |ui| {
-                egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(msg));
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(&toast.msg);
+                        undo = can_undo && ui.button("되돌리기").clicked();
+                    });
+                });
             });
+        if undo {
+            self.undo_clear();
+        }
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 
@@ -1469,6 +1568,9 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
     }
     if n.has(flags::DENIED) {
         ui.colored_label(theme::of(ui).warn, "⚠ 접근이 거부되어 일부 크기를 모릅니다");
+    }
+    if doc.stale_within(it.node) {
+        ui.colored_label(theme::of(ui).warn, "⚠ 일부만 지워진 폴더라 크기가 실제와 다를 수 있습니다 · 다시 스캔하세요");
     }
     if n.has(flags::HARDLINK_DUP) {
         ui.label(RichText::new("하드링크: 다른 경로에서 이미 세었으므로 0으로 계산").weak());
@@ -1731,8 +1833,10 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delete::{Finished, Method, Outcome};
     use crate::doc::tests::{doc, fixture, node};
     use darak_core::NO_NODE;
+    use darak_core::remove::RecycleBin;
 
     fn app(doc: Doc) -> App {
         let (search, runtime) = crate::search_worker::SearchRuntime::new();
@@ -2005,6 +2109,18 @@ mod tests {
         }
     }
 
+    /// 결과를 기다리는 실행 단계 (폴더 하나)
+    fn running_stage(rx: mpsc::Receiver<Finished>) -> Stage {
+        Stage::Running {
+            method: Method::Recycle,
+            items: vec![delete::Item { node: 1, path: "C:\\Data\\folder".into(), is_dir: true, reparse: false, size: 60 }],
+            done: Arc::default(),
+            cancel: Arc::default(),
+            started: Instant::now(),
+            rx,
+        }
+    }
+
     #[test]
     fn blocks_conflicting_operation_starts() {
         let mut app = app(fixture(1));
@@ -2039,11 +2155,7 @@ mod tests {
         assert!(app.scanning.is_none());
         assert_eq!(app.root_input, original);
         let (_tx, rx) = mpsc::channel();
-        app.delete_dialog.as_mut().unwrap().stage = Stage::Running {
-            total: 1,
-            done: Arc::default(),
-            rx,
-        };
+        app.delete_dialog.as_mut().unwrap().stage = running_stage(rx);
         app.start_scan("C:\\does-not-exist".into());
         assert!(app.scanning.is_none());
         assert_eq!(app.root_input, original);
@@ -2068,21 +2180,16 @@ mod tests {
         for no_doc in [false, true] {
             let mut app = app(fixture(2));
             let (tx, rx) = mpsc::channel();
-            tx.send(vec![delete::Outcome {
-                node: u32::MAX,
-                path: "C:\\original-source".into(),
-                size: 60,
-                error: None,
-            }])
+            tx.send(Finished {
+                outcomes: vec![
+                    Outcome { node: u32::MAX, path: "C:\\original-source".into(), size: 60, error: None, partial: false },
+                    // 다른 문서의 노드 번호이므로 지금 문서의 stale에 넣지 않는다
+                    Outcome { node: 1, path: "C:\\original-dir".into(), size: 60, error: Some("사용 중".into()), partial: true },
+                ],
+                free: None,
+            })
             .unwrap();
-            app.delete_dialog = Some(Dialog {
-                doc_id: 1,
-                stage: Stage::Running {
-                    total: 1,
-                    done: Arc::default(),
-                    rx,
-                },
-            });
+            app.delete_dialog = Some(Dialog { doc_id: 1, stage: running_stage(rx) });
             if no_doc {
                 app.doc = None;
             }
@@ -2093,16 +2200,17 @@ mod tests {
             output.textures_delta.clear();
             let dlg = app.delete_dialog.as_ref().unwrap();
             assert_eq!(dlg.doc_id, 1);
-            let Stage::Report { outcomes } = &dlg.stage else {
+            let Stage::Report { finished, .. } = &dlg.stage else {
                 panic!("source outcome report missing")
             };
-            assert_eq!(outcomes[0].path, "C:\\original-source");
-            assert_eq!(outcomes[0].node, u32::MAX);
+            assert_eq!(finished.outcomes[0].path, "C:\\original-source");
+            assert_eq!(finished.outcomes[0].node, u32::MAX);
             if let Some(doc) = &app.doc {
                 assert_eq!(doc.id, 2);
                 assert_eq!(doc.tree.version, 0);
                 assert_eq!(doc.tree.node(0).alloc, 100);
                 assert!(doc.marks.is_empty());
+                assert!(doc.stale.is_empty());
             }
             let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
                 app.delete_dialog_ui(ui.ctx())
@@ -2112,6 +2220,151 @@ mod tests {
                 app.delete_dialog.as_ref().unwrap().stage,
                 Stage::Report { .. }
             ));
+        }
+    }
+
+    /// 창의 X 버튼을 누른 한 프레임 (앱 전체)
+    fn close_frame(ctx: &egui::Context, app: &mut App, time: f64) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 820.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().events.push(egui::ViewportEvent::Close);
+        let mut output = ctx.run_ui(input, |ui| app.show(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    fn cancels_close(output: &egui::FullOutput) -> bool {
+        output.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::CancelClose)
+    }
+
+    #[test]
+    fn close_waits_for_running_delete() {
+        const WAIT: &str = "삭제가 끝난 뒤에 닫을 수 있습니다";
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        assert!(!cancels_close(&close_frame(&ctx, &mut app, 0.0)));
+        app.doc.as_mut().unwrap().toggle_mark(3).unwrap();
+        app.delete_dialog = Some(Dialog {
+            doc_id: 1,
+            stage: Stage::Review { method: Method::Recycle, confirmed: false, error: None, bin: RecycleBin::Available { capacity: None } },
+        });
+        // 검토 중에는 아직 아무것도 지우지 않았으므로 닫혀도 된다
+        assert!(!cancels_close(&close_frame(&ctx, &mut app, 0.1)));
+        assert!(app.toast.is_none());
+        let (tx, rx) = mpsc::channel();
+        app.delete_dialog.as_mut().unwrap().stage = running_stage(rx);
+        assert!(cancels_close(&close_frame(&ctx, &mut app, 0.2)));
+        assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some(WAIT));
+        // 안내는 삭제 중 창 위에 보인다
+        let output = full_frame(&ctx, &mut app, vec![], 0.3);
+        assert!(has_removal_text(&output, WAIT));
+        tx.send(Finished { outcomes: vec![], free: None }).unwrap();
+        full_frame(&ctx, &mut app, vec![], 0.4);
+        assert!(matches!(app.delete_dialog.as_ref().unwrap().stage, Stage::Report { .. }));
+        assert!(!cancels_close(&close_frame(&ctx, &mut app, 0.5)));
+    }
+
+    #[test]
+    fn partial_failures_mark_folders_stale() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Finished {
+            outcomes: vec![
+                Outcome { node: 2, path: "C:\\Data\\sibling".into(), size: 40, error: None, partial: false },
+                Outcome { node: 1, path: "C:\\Data\\folder".into(), size: 60, error: Some("사용 중".into()), partial: true },
+            ],
+            free: None,
+        })
+        .unwrap();
+        app.delete_dialog = Some(Dialog { doc_id: 1, stage: running_stage(rx) });
+        full_frame(&ctx, &mut app, vec![], 0.0);
+        // 검색 작업자가 트리를 돌려주면 반영된다 (멈춘 작업자는 같은 프레임에 돌려줄 수도 있다)
+        if let Some(pending) = &app.pending_removal {
+            assert_eq!(pending.ids, [2]);
+            let fence = pending.fence;
+            app.search_control(SearchControlEvent::Released(fence));
+            app.finish_removal();
+        }
+        assert!(app.pending_removal.is_none());
+        let doc = app.doc.as_ref().unwrap();
+        assert!(doc.tree.node(2).has(flags::REMOVED));
+        assert_eq!(doc.stale.iter().copied().collect::<Vec<_>>(), [1]);
+        assert!(doc.stale_within(3));
+        // 상태 바의 파일 수도 지운 만큼 줄고, 다시 스캔하라는 안내가 붙는다
+        assert_eq!((doc.stats.files, doc.stats.dirs), (1, 2));
+        removal_status_frame(&ctx, &mut app, 0.1);
+        let output = removal_status_frame(&ctx, &mut app, 0.2);
+        assert!(has_removal_text(&output, "⚠ 일부만 지워진 폴더 1개 · 크기가 실제와 다를 수 있음"));
+        assert!(has_removal_text(&output, "다시 스캔"));
+        assert!(has_removal_text(&output, "일반 스캔 · 1 파일 · 2 폴더"));
+    }
+
+    #[test]
+    fn recycle_bin_opens_through_shell() {
+        reset_shell(true);
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let finished = Finished {
+            outcomes: vec![Outcome { node: 2, path: "C:\\Data\\sibling".into(), size: 40, error: None, partial: false }],
+            free: None,
+        };
+        app.delete_dialog = Some(Dialog { doc_id: 1, stage: Stage::Report { method: Method::Recycle, finished } });
+        let mut time = 0.0;
+        press_text(&ctx, &mut app, "휴지통 열기", &mut time);
+        assert_eq!(shell_log(), [Shell::Explore("shell:RecycleBinFolder".into())]);
+    }
+
+    #[test]
+    fn absorbing_inner_marks_is_announced() {
+        let mut app = app(fixture(1));
+        app.toggle_mark(3);
+        assert!(app.toast.is_none());
+        app.toggle_mark(1);
+        assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some("안쪽 표시 1개를 이 폴더 표시에 합쳤습니다"));
+        assert_eq!(app.doc.as_ref().unwrap().marks.iter().copied().collect::<Vec<_>>(), [1]);
+    }
+
+    #[test]
+    fn cleared_marks_can_be_undone() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        let doc = app.doc.as_mut().unwrap();
+        doc.toggle_mark(3).unwrap();
+        doc.toggle_mark(2).unwrap();
+        let marks = doc.marks.clone();
+        let mut time = 0.0;
+        app.clear_marks();
+        assert!(app.doc.as_ref().unwrap().marks.is_empty());
+        assert_eq!(app.toast.as_ref().map(|t| t.msg.as_str()), Some("표시 2개를 모두 해제했습니다"));
+        press_text(&ctx, &mut app, "되돌리기", &mut time);
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.marks, marks);
+        assert_eq!(doc.mark_state(3), 1);
+        assert!(app.toast.is_none());
+
+        // 그 사이 새 표시가 생기면 버튼을 숨기고 되돌리지 않는다
+        app.clear_marks();
+        app.toggle_mark(2);
+        let output = full_frame(&ctx, &mut app, vec![], time + 0.1);
+        assert!(has_removal_text(&output, "표시 2개를 모두 해제했습니다"));
+        assert!(!has_removal_text(&output, "되돌리기"));
+        app.undo_clear();
+        assert_eq!(app.doc.as_ref().unwrap().marks.iter().copied().collect::<Vec<_>>(), [2]);
+        // 트리가 바뀌었거나 다른 문서여도 되돌리지 않는다
+        for replace in [false, true] {
+            app.clear_marks();
+            if replace {
+                app.doc = Some(fixture(2));
+            } else {
+                Arc::get_mut(&mut app.doc.as_mut().unwrap().tree).unwrap().version += 1;
+            }
+            app.undo_clear();
+            assert!(app.doc.as_ref().unwrap().marks.is_empty(), "replace={replace}");
+            app.doc.as_mut().unwrap().toggle_mark(2).unwrap();
         }
     }
     struct TestWake {
@@ -3342,7 +3595,7 @@ mod tests {
                     vec![Shell::Open(path.clone()), Shell::Reveal(path)]
                 };
                 assert_eq!(shell_log(), expected, "elevated={elevated} ok={ok} id={id}");
-                let note = app.toast.as_ref().map(|(msg, _)| msg.as_str());
+                let note = app.toast.as_ref().map(|t| t.msg.as_str());
                 let name = if id == 1 { "setup.exe" } else { "movie.mkv" };
                 assert_eq!(note, open_refusal(name, elevated), "elevated={elevated} id={id}");
                 assert_eq!(note.is_some(), refused);
@@ -3454,7 +3707,7 @@ mod tests {
         app.scanning = None;
         app.delete_dialog = Some(Dialog {
             doc_id: 1,
-            stage: Stage::Review { method: Method::Recycle, confirmed: false, error: None },
+            stage: Stage::Review { method: Method::Recycle, confirmed: false, error: None, bin: RecycleBin::Unavailable("테스트") },
         });
         assert!(matches!(app.admin_relaunch(), AdminRelaunch::Blocked(_)));
         app.delete_dialog = None;
@@ -3592,7 +3845,7 @@ mod tests {
             let doc = app.doc.as_ref().unwrap();
             if elevated {
                 assert!(doc.marks.is_empty());
-                let note = app.toast.as_ref().map(|(msg, _)| msg.as_str());
+                let note = app.toast.as_ref().map(|t| t.msg.as_str());
                 assert_eq!(note, Some("보호된 항목: 설치된 프로그램 폴더 (관리자 권한)"));
                 // 더 깊은 하위는 관리자 권한에서도 표시할 수 있다
                 app.toggle_mark(2);
