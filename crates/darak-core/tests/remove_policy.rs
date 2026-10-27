@@ -153,11 +153,13 @@ fn admin_guard_protects_profiles_and_program_folders() {
     let drive = ordinary_path(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
     // 이 PC의 사용자 이름과 겹치지 않을 다른 프로필
     let other = format!("{drive}\\Users\\Darak Test Other");
+    // 시스템 드라이브가 아닌 드라이브
+    let far = if drive.eq_ignore_ascii_case("Z:") { "Y:" } else { "Z:" };
     for (path, reason) in [
         (format!("{drive}\\Program Files\\MyApp"), PROGRAM),
         (format!("{drive}\\Program Files (x86)\\MyApp"), PROGRAM),
-        (r"Z:\Program Files\App".to_owned(), PROGRAM),
-        (r"Z:\Program Files (x86)\App".to_owned(), PROGRAM),
+        (format!("{far}\\Program Files\\App"), PROGRAM),
+        (format!("{far}\\Program Files (x86)\\App"), PROGRAM),
         (format!("{drive}\\ProgramData\\Microsoft"), DATA),
         (other.clone(), PROFILE),
         (format!("{other}\\AppData"), PROFILE),
@@ -180,18 +182,23 @@ fn admin_guard_protects_profiles_and_program_folders() {
         format!("{other}\\Downloads\\big.iso"),
         format!("{other}\\AppData\\Local\\Temp"),
         format!("{other}\\Videos"),
-        r"Z:\ProgramData\App".to_owned(),
-        r"Z:\Users\Other".to_owned(),
-        r"Z:\MyApp\Program Files".to_owned(),
+        format!("{far}\\ProgramData\\App"),
+        format!("{far}\\Users\\Other"),
+        format!("{far}\\MyApp\\Program Files"),
     ] {
         for guard in [Guard::User, Guard::Admin] {
             assert_eq!(reason_for_path_as(&path, guard), None, "{path} {guard:?}");
         }
     }
     // 어느 드라이브의 Program Files든 그 폴더 자신은 두 수준 모두 막는다
-    for path in [r"Z:\Program Files", r"Z:\Program Files (x86)", r"\\?\z:\program files"] {
+    let far_lower = far.to_lowercase();
+    for path in [
+        format!("{far}\\Program Files"),
+        format!("{far}\\Program Files (x86)"),
+        format!(r"\\?\{far_lower}\program files"),
+    ] {
         for guard in [Guard::User, Guard::Admin] {
-            assert_eq!(reason_for_path_as(path, guard), Some("시스템/사용자 기본 폴더"), "{path} {guard:?}");
+            assert_eq!(reason_for_path_as(&path, guard), Some("시스템/사용자 기본 폴더"), "{path} {guard:?}");
         }
     }
     // 공통 규칙은 관리자 수준에서도 그대로다
