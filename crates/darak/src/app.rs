@@ -694,7 +694,8 @@ impl App {
 
             let edit = ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로"));
             theme::focus_ring(ui, &edit);
-            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            // Enter는 여기서 쓰고 지운다 (keyboard()가 선택한 항목을 열거나 확대하지 않게)
+            let enter = edit.lost_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
 
             if ui.add_enabled(self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new("📁 폴더…")).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder() {
@@ -762,6 +763,10 @@ impl App {
                 }
                 if resp.changed() {
                     doc.search.note_edit(Instant::now());
+                }
+                // 입력을 끝내는 Enter는 검색 칸 몫이다 (keyboard()가 선택한 파일을 열지 않게)
+                if resp.lost_focus() {
+                    ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
                 }
                 if resp.has_focus() && ui.input(|i| i.key_pressed(Key::Escape)) && !doc.search.query.is_empty() {
                     doc.search.note_edit(Instant::now());
@@ -3369,6 +3374,23 @@ mod tests {
         frame(&ctx, &mut app, vec![key(Key::Enter)], 0.0);
         assert_eq!(app.doc.as_ref().unwrap().focus, 1);
         assert!(shell_log().is_empty());
+    }
+
+    #[test]
+    fn enter_in_search_box_does_not_open_selected_file() {
+        reset_shell(true);
+        let ctx = egui::Context::default();
+        let mut app = app(launch_fixture());
+        app.doc.as_mut().unwrap().selected = Some(2);
+        app.focus_search = true;
+        full_frame(&ctx, &mut app, vec![], 0.0);
+        full_frame(&ctx, &mut app, vec![], 0.1);
+        assert!(ctx.text_edit_focused());
+        // 입력을 끝내는 Enter는 검색 칸이 쓰고, 선택된 파일을 열지 않는다
+        full_frame(&ctx, &mut app, vec![key(Key::Enter)], 0.2);
+        assert!(!ctx.text_edit_focused());
+        assert!(shell_log().is_empty());
+        assert_eq!(app.doc.as_ref().unwrap().selected, Some(2));
     }
 
     /// 오른쪽 클릭 메뉴만 그리며 `text` 항목을 누른다
