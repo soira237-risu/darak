@@ -3,6 +3,7 @@
 mod app;
 mod delete;
 mod doc;
+mod drives;
 mod fonts;
 #[cfg(feature = "perf")]
 mod perf_trace;
@@ -13,6 +14,8 @@ mod theme;
 mod treemap;
 
 fn main() -> eframe::Result {
+    // 매체 없는 카드 리더의 용량을 물어도 시스템 '디스크 없음' 창이 뜨지 않게
+    darak_core::scan::suppress_drive_dialogs();
     #[cfg(feature = "perf")]
     let fixture = std::env::var("DARAK_PERF_FIXTURE").ok().map(|s| {
         let parts: Vec<_> = s.split(',').collect();

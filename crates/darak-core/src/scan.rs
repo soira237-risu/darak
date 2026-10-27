@@ -6,6 +6,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 use std::io;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -64,6 +65,52 @@ impl ScanProgress {
     }
 }
 
+/// 드라이브 루트인데 MFT 대신 일반 순회를 쓴 이유
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fallback {
+    /// 볼륨을 열 권한이 없음
+    NotElevated,
+    /// 네트워크 드라이브 (원격 볼륨은 열 수 없음)
+    Network,
+    /// NTFS가 아닌 볼륨 (파일 시스템 이름)
+    NotNtfs(String),
+    /// 그 밖의 MFT 읽기 실패 (오류 문장)
+    Failed(String),
+}
+
+impl Fallback {
+    /// MFT를 읽다 난 오류. Rust가 붙이는 ` (os error N)` 꼬리는 ` (코드 N)`으로 바꾼다
+    fn failed(e: &io::Error) -> Self {
+        let text = e.to_string();
+        Self::Failed(match (e.raw_os_error(), text.rsplit_once(" (os error ")) {
+            (Some(code), Some((msg, _))) => format!("{msg} (코드 {code})"),
+            _ => text,
+        })
+    }
+
+    /// 상태 바 배지에 붙이는 짧은 이유
+    pub fn short(&self) -> String {
+        match self {
+            Self::NotElevated => "관리자 권한 없음".into(),
+            Self::Network => "네트워크 드라이브".into(),
+            Self::NotNtfs(fs) => format!("{fs} 볼륨"),
+            Self::Failed(_) => "MFT 읽기 실패".into(),
+        }
+    }
+}
+
+/// 툴팁과 CLI에 쓰는 전체 문장
+impl fmt::Display for Fallback {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::NotElevated => f.write_str("관리자 권한이 없어 일반 스캔을 사용"),
+            Self::Network => f.write_str("네트워크 드라이브라 일반 스캔을 사용"),
+            Self::NotNtfs(fs) => write!(f, "{fs} 볼륨이라 일반 스캔을 사용 (MFT는 NTFS 전용)"),
+            Self::Failed(e) => write!(f, "MFT 읽기 실패, 일반 스캔 사용: {e}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanStats {
     pub elapsed: Duration,
@@ -74,8 +121,8 @@ pub struct ScanStats {
     /// 중지되어 일부 폴더를 읽지 못한 결과 (그 폴더와 조상에 INCOMPLETE)
     pub cancelled: bool,
     pub method: ScanMethod,
-    /// MFT를 시도했다가 일반 순회로 바꾼 이유
-    pub fallback_reason: Option<String>,
+    /// 드라이브 루트인데 MFT 대신 일반 순회를 쓴 이유
+    pub fallback_reason: Option<Fallback>,
 }
 
 pub struct ScanResult {
@@ -87,25 +134,33 @@ pub struct ScanResult {
 ///
 /// 중지되면 일반 순회는 읽은 데까지의 트리(stats.cancelled, 읽지 않은 폴더와 조상에 INCOMPLETE)를,
 /// MFT는 부분 트리 없이 Err(대개 Interrupted)를 돌려준다. 중지한 뒤에는 일반 순회로 넘어가지 않는다.
+/// 네트워크 드라이브와 NTFS가 아닌 볼륨은 MFT를 시도하지 않고 그 이유를 남긴다.
 pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Result<ScanResult> {
     let display = normalize_root(root);
     let mut fallback_reason = None;
     if opts.use_mft && is_drive_root(&display) {
-        match crate::mft::scan_volume(&display, progress, opts.dedupe_hardlinks) {
-            Ok((tree, stats)) => return Ok(ScanResult { tree, stats }),
-            // 넘어가면 중지 플래그 때문에 루트만 있는 빈 트리가 나온다
-            Err(e) if progress.is_cancelled() => return Err(e),
-            Err(e) => {
-                fallback_reason = Some(if e.kind() == io::ErrorKind::PermissionDenied {
-                    "관리자 권한이 없어 일반 스캔을 사용".to_string()
-                } else {
-                    format!("MFT 읽기 실패, 일반 스캔 사용: {e}")
-                });
-                progress.total_hint.store(0, Relaxed);
-                progress.done_hint.store(0, Relaxed);
-                progress.files.store(0, Relaxed);
-                progress.dirs.store(0, Relaxed);
-                progress.bytes.store(0, Relaxed);
+        let kind = unsafe { GetDriveTypeW(wide(&display).as_ptr()) };
+        let fs = if kind == DRIVE_REMOTE { None } else { volume_fs(&display) };
+        fallback_reason = walk_only(kind, fs.as_deref());
+        if fallback_reason.is_none() {
+            match crate::mft::scan_volume(&display, progress, opts.dedupe_hardlinks) {
+                Ok((tree, stats)) => return Ok(ScanResult { tree, stats }),
+                // 넘어가면 중지 플래그 때문에 루트만 있는 빈 트리가 나온다
+                Err(e) if progress.is_cancelled() => return Err(e),
+                Err(e) => {
+                    fallback_reason = Some(if e.kind() == io::ErrorKind::PermissionDenied {
+                        Fallback::NotElevated
+                    } else {
+                        Fallback::failed(&e)
+                    });
+                    progress.total_hint.store(0, Relaxed);
+                    progress.done_hint.store(0, Relaxed);
+                    progress.files.store(0, Relaxed);
+                    progress.dirs.store(0, Relaxed);
+                    progress.bytes.store(0, Relaxed);
+                    // '$MFT 읽는 중' 문구가 일반 순회 동안 남지 않게
+                    progress.current.lock().unwrap().clear();
+                }
             }
         }
     }
@@ -131,6 +186,7 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
     let root_buf = pool.install(|| scan_dir(os_path, &display, NO_NODE, 0, &ctx));
     drop(ctx.dedupe);
 
+    *progress.current.lock().unwrap() = format!("{display} 트리 구성 중");
     let tree = build_tree(&display, root_buf);
     let stats = ScanStats {
         elapsed: start.elapsed(),
@@ -146,7 +202,17 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
     Ok(ScanResult { tree, stats })
 }
 
-/// `C:\` 형태인지
+/// 드라이브 루트에서 MFT를 시도하지 않고 바로 일반 순회할 이유. 네트워크 드라이브와 NTFS가 아닌 볼륨이다.
+/// 파일 시스템을 모르면(조회 실패) MFT를 시도해 보고 그 결과로 정한다.
+fn walk_only(kind: u32, fs: Option<&str>) -> Option<Fallback> {
+    if kind == DRIVE_REMOTE {
+        Some(Fallback::Network)
+    } else {
+        fs.filter(|fs| !fs.eq_ignore_ascii_case("NTFS")).map(|fs| Fallback::NotNtfs(fs.to_owned()))
+    }
+}
+
+/// `C:\` 형태인지 (`c:`·`C:/` 같은 입력은 normalize_root를 먼저 거친다)
 pub fn is_drive_root(display: &str) -> bool {
     let b = display.as_bytes();
     b.len() == 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
@@ -155,6 +221,11 @@ pub fn is_drive_root(display: &str) -> bool {
 /// 현재 프로세스가 관리자 권한(상승됨)으로 실행 중인지
 pub fn is_elevated() -> bool {
     unsafe { IsUserAnAdmin() != 0 }
+}
+
+/// 매체 없는 드라이브를 건드려도 시스템 '디스크 없음' 대화상자가 뜨지 않게 한다 (프로세스 전체)
+pub fn suppress_drive_dialogs() {
+    unsafe { SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS) };
 }
 
 /// 기본 앱으로 연다 (탐색기에서 더블클릭한 것과 같다)
@@ -769,13 +840,13 @@ fn clamp32(v: u64) -> u32 {
 
 // ---------------------------------------------------------------------------
 
+/// 드라이브 문자와 종류. 용량은 장치에 물어야 해서 따로 조회한다 (disk_space, GUI는 백그라운드 캐시)
 #[derive(Clone, Debug)]
 pub struct Drive {
     /// `C:\`
     pub root: String,
+    /// DRIVE_FIXED·DRIVE_REMOVABLE·DRIVE_REMOTE
     pub kind: u32,
-    pub total: u64,
-    pub free: u64,
 }
 
 impl Drive {
@@ -789,30 +860,55 @@ impl Drive {
     }
 }
 
-/// 사용 가능한 드라이브 목록 (고정/이동식/네트워크)
+/// 드라이브 목록 (고정/이동식/네트워크). 장치에 묻지 않으므로 끊긴 네트워크 드라이브가 있어도 바로 끝난다.
+/// 매체 없는 이동식(카드 리더 등)도 들어 있다.
 pub fn list_drives() -> Vec<Drive> {
     let mask = unsafe { GetLogicalDrives() };
     (0..26u8)
         .filter(|i| mask & (1 << i) != 0)
         .filter_map(|i| {
             let root = format!("{}:\\", (b'A' + i) as char);
-            let w = wide(&root);
-            let kind = unsafe { GetDriveTypeW(w.as_ptr()) };
-            if !matches!(kind, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_REMOTE) {
-                return None;
-            }
-            let (total, free) = disk_space(&root)?;
-            Some(Drive { root, kind, total, free })
+            let kind = unsafe { GetDriveTypeW(wide(&root).as_ptr()) };
+            matches!(kind, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_REMOTE).then_some(Drive { root, kind })
         })
         .collect()
 }
 
-/// (전체, 여유) 바이트
+/// (전체, 여유) 바이트. 장치에 묻으므로 끊긴 네트워크 경로에서는 오래 막힐 수 있다 (UI 스레드에서 부르지 않는다).
+/// UNC 경로는 끝에 `\`가 있어야 한다. 값은 검사하지 않으므로 표시하기 전에 plausible_space로 거른다.
 pub fn disk_space(path: &str) -> Option<(u64, u64)> {
     let w = wide(path);
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, &mut free) };
     (ok != 0).then_some((total, free))
+}
+
+/// 믿을 만한 용량인지. 클라우드·가상 네트워크 드라이브가 돌려주는 2^63 B(8192 PB) 같은 표지값,
+/// 전체가 0이거나 여유가 전체 이상인 값은 false
+pub fn plausible_space(total: u64, free: u64) -> bool {
+    total > 0 && total < 1 << 60 && free < total
+}
+
+/// 볼륨 파일 시스템 이름 (NTFS, exFAT, ReFS …). root는 `C:\`처럼 `\`로 끝나야 한다.
+/// 장치에 묻으므로 UI 스레드에서는 부르지 않는다. 매체가 없거나 읽지 못하면 None
+pub fn volume_fs(root: &str) -> Option<String> {
+    let w = wide(root);
+    // 문서가 권하는 파일 시스템 이름 버퍼 크기 (MAX_PATH + 1)
+    let mut name = [0u16; MAX_PATH + 1];
+    let ok = unsafe {
+        GetVolumeInformationW(
+            w.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            name.as_mut_ptr(),
+            name.len() as u32,
+        )
+    };
+    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    (ok != 0 && len > 0).then(|| String::from_utf16_lossy(&name[..len]))
 }
 
 /// (현재 working set, 최대 working set) 바이트
@@ -1071,6 +1167,55 @@ mod tests {
             assert_eq!(n.incomplete(), expected != 0, "{path}");
         }
         assert_eq!(tree.node(Tree::ROOT).logical, 300, "unread folders add nothing");
+    }
+
+    #[test]
+    fn rejects_sentinel_capacities() {
+        const GB: u64 = 1 << 30;
+        // 8192 PB = 2^63 B (클라우드·가상 드라이브의 표지값), 빈 값, 여유 = 전체, 1 EiB 이상
+        for (total, free) in [(1 << 63, 1 << 63), (0, 0), (100, 100), (1 << 60, 0), (100, 200)] {
+            assert!(!plausible_space(total, free), "{total} {free}");
+        }
+        assert!(plausible_space(476 * GB, 112 * GB));
+        assert!(plausible_space(64 * GB, 0), "가득 찬 드라이브");
+    }
+
+    #[test]
+    fn skips_mft_only_for_network_and_other_file_systems() {
+        assert_eq!(walk_only(DRIVE_REMOTE, Some("NTFS")), Some(Fallback::Network));
+        assert_eq!(walk_only(DRIVE_REMOTE, None), Some(Fallback::Network));
+        assert_eq!(walk_only(DRIVE_FIXED, Some("exFAT")), Some(Fallback::NotNtfs("exFAT".into())));
+        assert_eq!(walk_only(DRIVE_REMOVABLE, Some("FAT32")), Some(Fallback::NotNtfs("FAT32".into())));
+        // NTFS와 파일 시스템을 모르는 볼륨은 MFT를 시도해 본다
+        for (kind, fs) in [(DRIVE_FIXED, Some("NTFS")), (DRIVE_FIXED, Some("ntfs")), (DRIVE_REMOVABLE, Some("NTFS")), (DRIVE_FIXED, None)] {
+            assert_eq!(walk_only(kind, fs), None, "{kind} {fs:?}");
+        }
+    }
+
+    #[test]
+    fn fallback_reasons_read_as_sentences() {
+        let failed = Fallback::failed(&io::Error::from_raw_os_error(87));
+        let Fallback::Failed(msg) = &failed else { panic!("{failed:?}") };
+        assert!(msg.ends_with("(코드 87)"), "{msg}");
+        assert_eq!(Fallback::failed(&io::Error::other("$MFT 레코드 0 손상")), Fallback::Failed("$MFT 레코드 0 손상".into()));
+        let reasons = [Fallback::NotElevated, Fallback::Network, Fallback::NotNtfs("exFAT".into()), failed];
+        for r in &reasons {
+            let (short, full) = (r.short(), r.to_string());
+            assert!(!short.is_empty() && full.len() > short.len(), "{r:?}");
+            assert!(!short.contains("os error") && !full.contains("os error"), "{full}");
+        }
+        assert_eq!(reasons.map(|r| r.short()), ["관리자 권한 없음", "네트워크 드라이브", "exFAT 볼륨", "MFT 읽기 실패"]);
+        assert!(Fallback::NotNtfs("exFAT".into()).to_string().contains("MFT는 NTFS 전용"));
+    }
+
+    #[test]
+    fn short_drive_input_is_a_drive_root() {
+        for input in ["c:", "C:", "c:\\", "c:/", " \"d:\" "] {
+            assert!(is_drive_root(&normalize_root(input)), "{input}");
+        }
+        for input in ["C:\\Data", r"\\server\share", "C"] {
+            assert!(!is_drive_root(&normalize_root(input)), "{input}");
+        }
     }
 
     #[test]

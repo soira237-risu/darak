@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use darak_core::{Kind, ScanOptions, ScanProgress, Tree, flags, scan};
+use darak_core::{Kind, ScanMethod, ScanOptions, ScanProgress, Tree, flags, scan};
 
 struct TempDir(PathBuf);
 
@@ -56,6 +56,9 @@ fn scans_sizes_hardlinks_and_junctions() {
     let res = scan(root.to_str().unwrap(), &ScanOptions::default(), &progress).unwrap();
     let tree = &res.tree;
     assert!(!res.stats.cancelled && tree.nodes.iter().all(|n| !n.incomplete()), "complete walk has no unread folders");
+    // 폴더는 MFT 대상이 아니므로 대체 이유가 없다
+    assert_eq!((res.stats.method, &res.stats.fallback_reason), (ScanMethod::Walk, &None));
+    assert!(progress.current.lock().unwrap().ends_with("트리 구성 중"), "last stage is shown while the tree is built");
 
     let r = tree.node(Tree::ROOT);
     assert_eq!(r.logical, 10_000 + 50_000 + 300_000 + 5, "하드링크는 한 번만, junction은 따라가지 않음");
@@ -133,6 +136,16 @@ fn cancelled_drive_scan_does_not_fall_back_to_walk() {
     progress.cancel();
     let err = scan(&root, &ScanOptions::default(), &progress).err().expect("stopped MFT scan must not walk the drive");
     assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err}");
+}
+
+#[test]
+fn drive_list_names_roots_and_kinds_only() {
+    use darak_core::scan::{is_drive_root, list_drives};
+    use darak_core::sys::{DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE};
+    // 어떤 드라이브가 있는지와 상관없이: 문자 순서의 드라이브 루트, 고정·이동식·네트워크만
+    let drives = list_drives();
+    assert!(drives.iter().all(|d| is_drive_root(&d.root) && matches!(d.kind, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_REMOTE)), "{drives:?}");
+    assert!(drives.windows(2).all(|w| w[0].root < w[1].root), "{drives:?}");
 }
 
 #[test]

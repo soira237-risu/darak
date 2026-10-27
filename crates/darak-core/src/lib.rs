@@ -13,7 +13,7 @@ mod sort;
 pub mod sys;
 pub mod tree;
 
-pub use scan::{ScanMethod, ScanOptions, ScanProgress, ScanResult, ScanStats, scan};
+pub use scan::{Fallback, ScanMethod, ScanOptions, ScanProgress, ScanResult, ScanStats, scan};
 pub use tree::{Kind, NO_NODE, Node, NodeId, SizeMode, Tree, flags};
 
 /// 사람이 읽기 쉬운 크기 (1024 단위)

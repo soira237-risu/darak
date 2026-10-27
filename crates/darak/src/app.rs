@@ -7,16 +7,17 @@ use std::time::{Duration, Instant};
 
 use darak_core::category::runs_code;
 use darak_core::remove::Guard;
-use darak_core::scan::{Drive, disk_space, is_drive_root, is_elevated, list_drives, normalize_root};
-use darak_core::sys::DRIVE_REMOTE;
+use darak_core::scan::{Drive, is_drive_root, is_elevated, list_drives, normalize_root};
+use darak_core::sys::{DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE};
 use darak_core::{
-    Kind, NodeId, ScanMethod, ScanOptions, ScanProgress, ScanResult, SizeMode, Tree, flags, format_time, human_size,
-    scan, thousands,
+    Fallback, Kind, NodeId, ScanMethod, ScanOptions, ScanProgress, ScanResult, ScanStats, SizeMode, Tree, flags,
+    format_time, human_size, scan, thousands,
 };
 use eframe::egui::{self, Color32, Key, PointerButton, RichText};
 
 use crate::delete::{self, Dialog, Stage};
 use crate::doc::{Doc, RemovalApply};
+use crate::drives::{Space, Volumes};
 use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
 use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
 use darak_core::search::{Query, now_secs2000};
@@ -36,6 +37,10 @@ pub struct App {
     removal_released: bool,
     next_fence: u64,
     drives: Vec<Drive>,
+    /// 드라이브 목록을 읽은 시각
+    drives_at: Instant,
+    /// 용량·파일 시스템 캐시 (UI 스레드는 장치에 묻지 않는다)
+    volumes: Volumes,
     root_input: String,
     scanning: Option<Scanning>,
     doc: Option<Doc>,
@@ -79,6 +84,9 @@ struct PendingRemoval {
 
 /// 반환 알림 뒤에도 트리를 다른 소유자가 붙잡고 있으면, 이 시간이 지난 뒤 복제해서 반영한다.
 const REMOVAL_DETACH_AFTER: Duration = Duration::from_secs(2);
+
+/// 환영 화면이 보이는 동안 드라이브 목록을 다시 읽는 간격 (나중에 꽂은 USB)
+const DRIVE_LIST_TTL: Duration = Duration::from_secs(3);
 
 /// 잠깐 보여 줄 안내. 되돌릴 수 있는 동작이면 '되돌리기' 버튼이 붙고 더 오래 보인다.
 struct Toast {
@@ -131,7 +139,7 @@ struct Scanning {
     progress: Arc<ScanProgress>,
     rx: mpsc::Receiver<io::Result<ScanResult>>,
     started: Instant,
-    /// 드라이브 사용량 (진행률 표시용)
+    /// 진행률 기준 바이트: 같은 경로의 지난 일반 순회 크기, 드라이브 루트면 볼륨 사용량 (모르면 None)
     used: Option<u64>,
     /// 부드럽게 만든 남은 시간 (초, 계산한 시각)
     eta: Option<(f64, Instant)>,
@@ -154,12 +162,15 @@ impl App {
         #[cfg(feature = "perf")]
         if let Some(trace) = &trace { search.set_release_observer(trace.release_observer()); }
         let drives = list_drives();
-        let root_input = drives.first().map(|d| d.root.clone()).unwrap_or_else(|| "C:\\".into());
+        // 매체 없는 A:\나 카드 리더가 목록 앞에 올 수 있으므로 첫 고정 디스크
+        let root_input = drives.iter().find(|d| d.kind == DRIVE_FIXED).map_or_else(|| "C:\\".into(), |d| d.root.clone());
         let mut app = Self {
             preview, next_scan_id: 1,
             search, search_key: None, search_generation: 0, search_submitted: false,
             search_failed: None, pending_removal: None, removal_released: false, next_fence: 0,
             drives,
+            drives_at: Instant::now(),
+            volumes: Volumes::new(Some(cc.egui_ctx.clone())),
             root_input,
             scanning: None,
             doc: None,
@@ -252,14 +263,35 @@ impl App {
             std::thread::Builder::new()
                 .name("scan".into())
                 .spawn(move || {
-                    let res = scan(&root, &ScanOptions::default(), &progress);
+                    // 패닉하면 원인을 오류로 남긴다 (그냥 끝나면 '비정상 종료'만 알 수 있다)
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        scan(&root, &ScanOptions::default(), &progress)
+                    }))
+                    .unwrap_or_else(|p| Err(io::Error::other(format!("스캔 중 내부 오류: {}", panic_text(&*p)))));
                     let _ = tx.send(res);
                 })
                 .expect("스캔 스레드 생성 실패");
         }
-        let is_drive_root = root.len() == 3 && root.ends_with(":\\");
-        let used = is_drive_root.then(|| disk_space(&root)).flatten().map(|(t, f)| t - f);
+        // 드라이브 루트의 볼륨 사용량은 장치에 물어야 하므로 fill_progress_basis가 캐시에서 채운다
+        let used = previous_walk_size(self.doc.as_ref(), &root);
         self.begin_scan(root, progress, rx, used);
+    }
+
+    /// 드라이브 목록을 다시 읽는다 (장치에 묻지 않아 가볍다)
+    fn refresh_drives(&mut self) {
+        self.drives = list_drives();
+        self.drives_at = Instant::now();
+    }
+
+    /// 드라이브 루트 스캔의 진행률 기준(볼륨 사용량)을 용량 캐시에서 채운다. 답이 오기 전에는 기준 없이 그린다.
+    fn fill_progress_basis(&mut self) {
+        let Some(s) = &mut self.scanning else { return };
+        if s.used.is_none()
+            && is_drive_root(&s.root)
+            && let Space::Known(total, free) = self.volumes.space(&s.root)
+        {
+            s.used = Some(total - free);
+        }
     }
 
     fn begin_scan(&mut self, root: String, progress: Arc<ScanProgress>, rx: mpsc::Receiver<io::Result<ScanResult>>, used: Option<u64>) {
@@ -343,18 +375,19 @@ impl App {
         }
     }
 
-    /// 스캔 결과를 받는다.
+    /// 스캔 결과를 받는다. 사용자가 중지하지 않은 스캔이 이번 프레임에 끝났으면(성공·실패) true.
     ///
     /// 중지했고 이전 문서가 있으면 결과를 기다리지 않고 바로 이전 문서(위치·삭제 표시 그대로)로 돌아간다.
     /// 받는 쪽(rx)을 버리므로 스캔 스레드가 나중에 보내는 부분 결과는 들어올 수 없다. 이 복원 경로는 이전 문서를
-    /// 그대로 쓰므로 보호 수준(Guard)을 다시 정하지 않고, 최근 경로에도 기록하지 않는다 (뒤 PR에서 이 함수가
-    /// '새 문서를 받았는지'를 돌려주면 false다). 검색 재개는 다른 경로와 같이 끝의 공용 처리가 맡는다.
+    /// 그대로 쓰므로 보호 수준(Guard)을 다시 정하지 않고, 최근 경로에도 기록하지 않으며, false를 돌려준다.
+    /// 검색 재개는 다른 경로와 같이 끝의 공용 처리가 맡는다.
     ///
     /// 이전 문서가 없으면(첫 스캔) 읽은 데까지의 결과를 문서로 만든다(stats.cancelled, 배너·⚠, 삭제 표시 불가).
     /// 하나도 읽지 못했거나 MFT처럼 부분 결과가 없으면 환영 화면으로 돌아가고 안내만 띄운다.
-    fn poll_scan(&mut self) {
-        let Some(s) = &self.scanning else { return };
+    fn poll_scan(&mut self) -> bool {
+        let Some(s) = &self.scanning else { return false };
         let stopped = s.progress.is_cancelled();
+        let mut finished = false;
         let resumed_at = Instant::now();
         if stopped && let Some(doc) = &self.doc {
             self.preview.invalidate(s.scan_id);
@@ -399,23 +432,32 @@ impl App {
                     self.next_doc_id += 1;
                     self.scanning = None;
                     self.layout.invalidate();
-                    self.drives = list_drives();
+                    finished = !stopped;
+                    // 스캔이 쓴 만큼 여유 공간도 바뀌었을 수 있다
+                    self.volumes.mark_stale();
                 }
                 Ok(Err(e)) => {
                     self.error = Some(format!("{}: {e}", s.root));
                     self.scanning = None;
+                    finished = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.error = Some("스캔 스레드가 비정상 종료했습니다".into());
                     self.scanning = None;
+                    finished = true;
                 }
+            }
+            // 스캔하는 동안 드라이브를 꽂거나 뺐을 수 있다 (목록은 장치에 묻지 않아 가볍다)
+            if self.scanning.is_none() {
+                self.refresh_drives();
             }
         }
         // Fresh resume event excludes suspension but includes subsequent UI work.
         if self.scanning.is_none() && let Some(doc) = &mut self.doc {
             doc.search.note_edit(resumed_at);
         }
+        finished
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -684,6 +726,8 @@ impl App {
         }
         let fence = pending.fence;
         if applied == RemovalApply::Applied {
+            // 상태 바·카드의 여유 공간을 다시 묻는다
+            self.volumes.mark_stale();
             self.layout.invalidate();
             self.anim = None;
             self.morph.reset();
@@ -720,8 +764,11 @@ impl App {
         { self.perf_highlight_draw = None; }
         #[cfg(feature = "perf")]
         let mut table_draw = None;
+        self.volumes.poll();
+        // TODO(PR9): 끝났으면 창이 비활성일 때 작업 표시줄로 알리고 창 제목을 바꾼다
         self.poll_scan();
         self.poll_preview();
+        self.fill_progress_basis();
         if self.scanning.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -812,13 +859,12 @@ impl App {
             let mut chosen = None;
             why(ui.add_enabled_ui(can_scan, |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
                 for d in &self.drives {
-                    let txt = format!(
-                        "{}  {}  ({} 여유 / {})",
-                        d.root,
-                        d.kind_label(),
-                        human_size(d.free),
-                        human_size(d.total)
-                    );
+                    // 용량은 캐시에서 읽는다 (환영 카드와 같은 규칙으로 매체 없는 이동식은 숨긴다)
+                    let space = self.volumes.space(&d.root);
+                    if !shows_drive(d.kind, space) {
+                        continue;
+                    }
+                    let txt = format!("{}  {}  ({})", d.root, d.kind_label(), space_note(space));
                     if ui.selectable_label(false, txt).clicked() {
                         chosen = Some(d.root.clone());
                     }
@@ -1025,19 +1071,10 @@ impl App {
                 return;
             };
             let st = &doc.stats;
-            let method = match st.method {
-                ScanMethod::Mft => "⚡ MFT",
-                ScanMethod::Walk => "일반 스캔",
-            };
-            let r = ui.label(format!(
-                "{method} · {} 파일 · {} 폴더 · {:.2}s",
-                thousands(st.files),
-                thousands(st.dirs),
-                st.elapsed.as_secs_f64()
-            ));
-            if let Some(reason) = &st.fallback_reason {
-                r.on_hover_text(reason);
-            }
+            ui.label(format!("{} 파일 · {} 폴더 · {:.2}s", thousands(st.files), thousands(st.dirs), st.elapsed.as_secs_f64()));
+            // 일반 스캔으로 바꾼 이유는 호버하지 않아도 배지에 보인다
+            let (badge, hint) = method_badge(st);
+            theme::badge(ui, badge).on_hover_text(hint);
             ui.label(RichText::new(format!("· {} 스캔", scanned_label(doc.scanned_at))).weak());
             if st.errors > 0 {
                 let label = if st.method == ScanMethod::Mft { "연결 끊긴 레코드" } else { "접근 실패" };
@@ -1056,9 +1093,20 @@ impl App {
                     rescan = true;
                 }
             }
-            if let Some((total, free)) = disk_space(doc.tree.name(Tree::ROOT)) {
-                ui.separator();
-                ui.label(format!("여유 공간 {} / {}", human_size(free), human_size(total)));
+            // 장치에 묻지 않고 캐시를 읽는다 (끊긴 네트워크 경로에서도 프레임이 멈추지 않게).
+            // 가짜 문서(perf 픽스처)의 루트는 실제 경로가 아니므로 묻지 않는다
+            let space = if filesystem_actions_enabled(doc) { self.volumes.space(doc.tree.name(Tree::ROOT)) } else { Space::Unavailable };
+            match space {
+                Space::Known(total, free) => {
+                    ui.separator();
+                    ui.label(format!("여유 공간 {} / {}", human_size(free), human_size(total)));
+                }
+                Space::Unknown => {
+                    ui.separator();
+                    ui.label(RichText::new("여유 공간 정보 없음").weak());
+                }
+                // 답이 오기 전이나 읽지 못했으면 비워 둔다
+                Space::Checking | Space::Unavailable => {}
             }
             if let Some(h) = doc.hovered {
                 ui.separator();
@@ -1071,6 +1119,12 @@ impl App {
     }
 
     fn welcome(&mut self, ui: &mut egui::Ui) {
+        // 나중에 꽂은 USB도 나타나게 목록을 자주 다시 읽는다 (장치에 묻지 않아 가볍다)
+        if self.drives_at.elapsed() >= DRIVE_LIST_TTL {
+            self.refresh_drives();
+        }
+        ui.ctx().request_repaint_after(DRIVE_LIST_TTL);
+        let can_scan = self.can_start_scan();
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
             ui.heading("어느 드라이브를 살펴볼까요?");
@@ -1084,8 +1138,18 @@ impl App {
             ui.add_space(16.0);
             let mut chosen = None;
             for d in &self.drives {
-                let used = d.total.saturating_sub(d.free);
-                let frac = if d.total > 0 { used as f32 / d.total as f32 } else { 0.0 };
+                // 용량은 캐시에서 읽는다. 매체 없는 카드 리더는 답이 오기 전과 읽지 못했을 때 숨긴다 (깜빡이지 않게)
+                let space = self.volumes.space(&d.root);
+                if !shows_drive(d.kind, space) {
+                    continue;
+                }
+                let sub = drive_subtitle(d, self.volumes.fs(&d.root));
+                let note = space_note(space);
+                let used = match space {
+                    Space::Known(total, free) => Some((total - free) as f32 / total as f32),
+                    _ => None,
+                };
+                let full = used.is_some_and(|f| f >= 0.9);
                 // 카드 전체가 버튼이다. 호버 모양은 지난 프레임의 응답으로 정해서 내용 뒤에 깐다.
                 let card_id = ui.id().with(("drive-card", &d.root));
                 let hovered = ui.ctx().read_response(card_id).is_some_and(|r| r.hovered());
@@ -1100,19 +1164,27 @@ impl App {
                     ui.set_width(420.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&d.root).size(18.0).strong());
-                        ui.label(RichText::new(d.kind_label()).weak());
+                        ui.label(RichText::new(&sub).weak());
                     });
-                    // 사용량 막대는 회색, 90% 이상이면 warn
-                    ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(if frac >= 0.9 { t.warn } else { t.text_secondary }));
-                    ui.label(
-                        RichText::new(format!("{} 사용 / {} · {} 여유", human_size(used), human_size(d.total), human_size(d.free)))
-                            .weak(),
-                    );
+                    // 사용량 막대는 회색, 90% 이상이면 warn. 믿을 수 있는 용량일 때만 그린다
+                    if let Some(frac) = used {
+                        ui.add(egui::ProgressBar::new(frac).desired_height(6.0).fill(if full { t.warn } else { t.text_secondary }));
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&note).weak());
+                        // 색만으로 전하지 않게 글자도 붙인다
+                        if full {
+                            ui.colored_label(t.warn, "· 거의 가득 참");
+                        }
+                    });
                 });
                 let rect = frame.response.rect;
                 let resp = ui
                     .interact(rect, card_id, egui::Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
+                // 화면 낭독기가 읽을 카드 이름 (Frame만으로는 이름 없는 버튼이다)
+                let name = format!("{} {sub} · {note}{}", d.root, if full { " · 거의 가득 참" } else { "" });
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, can_scan, &name));
                 if resp.hovered() != hovered {
                     ui.ctx().request_repaint();
                 }
@@ -1120,6 +1192,13 @@ impl App {
                     chosen = Some(d.root.clone());
                 }
                 ui.add_space(6.0);
+            }
+            // 드라이브 전체가 아니라 폴더 하나를 볼 때 (툴바의 '폴더…'와 같다)
+            ui.add_space(4.0);
+            if ui.add_enabled(can_scan, egui::Button::new("📁 폴더 선택…")).clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                chosen = Some(dir.display().to_string());
             }
             if let Some(r) = chosen {
                 self.request_scan(r);
@@ -1856,6 +1935,61 @@ fn open_item(doc: &Doc, id: NodeId, elevated: bool) -> Option<&'static str> {
     refusal
 }
 
+/// 드라이브를 목록(환영 카드·콤보)에 보일지: 매체 없는 이동식(카드 리더)은 용량 답이 오기 전과 읽지 못했을 때 숨긴다
+fn shows_drive(kind: u32, space: Space) -> bool {
+    kind != DRIVE_REMOVABLE || matches!(space, Space::Known(..) | Space::Unknown)
+}
+
+/// 카드·콤보의 용량 문구. 믿을 수 없는 값(8192 PB 같은 표지값)은 숫자 없이 '용량 정보 없음'
+fn space_note(space: Space) -> String {
+    match space {
+        Space::Known(total, free) => format!("여유 공간 {} / {}", human_size(free), human_size(total)),
+        Space::Checking => "용량 확인 중…".into(),
+        Space::Unknown => "용량 정보 없음".into(),
+        Space::Unavailable => "용량을 읽을 수 없습니다".into(),
+    }
+}
+
+/// 드라이브 카드의 부제: 종류와 파일 시스템 ('로컬 디스크 · NTFS'). 네트워크는 느릴 수 있다고 알린다
+fn drive_subtitle(d: &Drive, fs: Option<&str>) -> String {
+    if d.kind == DRIVE_REMOTE {
+        "네트워크 · 일반 스캔이라 느릴 수 있음".into()
+    } else {
+        fs.map_or_else(|| d.kind_label().into(), |fs| format!("{} · {fs}", d.kind_label()))
+    }
+}
+
+/// 상태 바의 스캔 방법 배지 (글자, 툴팁). 일반 스캔으로 바꾼 이유는 배지 글자에 들어간다
+fn method_badge(st: &ScanStats) -> (String, String) {
+    match (st.method, &st.fallback_reason) {
+        (ScanMethod::Mft, _) => ("MFT".into(), "NTFS의 $MFT를 직접 읽어 스캔했습니다".into()),
+        (ScanMethod::Walk, Some(r)) => (
+            format!("일반 스캔 · {}", r.short()),
+            match r {
+                Fallback::NotElevated => format!("{r}\n관리자로 실행하면 $MFT를 직접 읽어 몇 초 안에 끝납니다"),
+                _ => r.to_string(),
+            },
+        ),
+        (ScanMethod::Walk, None) => ("일반 스캔".into(), "폴더를 하나씩 열어 셉니다 (MFT는 드라이브 루트 전용)".into()),
+    }
+}
+
+/// 같은 경로를 다시 스캔하면 지난 일반 순회 결과의 할당 크기가 가장 가까운 진행률 기준이다.
+/// MFT 결과(볼륨 전체를 셈)와 중지한 일부 결과는 쓰지 않는다
+fn previous_walk_size(doc: Option<&Doc>, root: &str) -> Option<u64> {
+    let doc = doc?;
+    (doc.tree.name(Tree::ROOT).eq_ignore_ascii_case(root) && doc.stats.method == ScanMethod::Walk && !doc.stats.cancelled)
+        .then(|| doc.tree.node(Tree::ROOT).alloc)
+}
+
+/// 스캔 스레드 패닉의 내용 (panic!에 넘긴 문장)
+fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "알 수 없는 오류".into())
+}
+
 /// 네트워크 위치인지: UNC 경로(`\\server\share`, `\\?\UNC\..`)이거나 네트워크 드라이브 문자
 fn is_network(root: &str, drives: &[Drive]) -> bool {
     let path = root.strip_prefix(r"\\?\").unwrap_or(root);
@@ -2057,6 +2191,7 @@ mod tests {
     use super::*;
     use crate::delete::{Finished, Method, Outcome};
     use crate::doc::tests::{doc, fixture, node};
+    use crate::drives::Probe;
     use darak_core::NO_NODE;
     use darak_core::remove::RecycleBin;
 
@@ -2070,6 +2205,9 @@ mod tests {
             search, search_key: None, search_generation: 0, search_submitted: false,
             search_failed: None, pending_removal: None, removal_released: false, next_fence: 0,
             drives: Vec::new(),
+            drives_at: Instant::now(),
+            // 테스트는 장치에 묻지 않는다 (용량을 읽지 못한 것으로 답한다)
+            volumes: Volumes::with_probe(None, Arc::new(|_| Probe::default())),
             root_input: "C:\\Data".into(),
             scanning: None,
             doc: Some(doc),
@@ -2546,7 +2684,8 @@ mod tests {
         let output = removal_status_frame(&ctx, &mut app, 0.2);
         assert!(has_removal_text(&output, "⚠ 일부만 지워진 폴더 1개 · 크기가 실제와 다를 수 있음"));
         assert!(has_removal_text(&output, "다시 스캔"));
-        assert!(has_removal_text(&output, "일반 스캔 · 1 파일 · 2 폴더"));
+        assert!(has_removal_text(&output, "1 파일 · 2 폴더"));
+        assert!(has_removal_text(&output, "일반 스캔"), "스캔 방법은 따로 배지로 보인다");
     }
 
     #[test]
@@ -3991,8 +4130,8 @@ mod tests {
         assert_eq!(app.admin_relaunch(), AdminRelaunch::Ready(None));
 
         app.drives = vec![
-            Drive { root: "Z:\\".into(), kind: DRIVE_REMOTE, total: 0, free: 0 },
-            Drive { root: "Y:\\".into(), kind: darak_core::sys::DRIVE_FIXED, total: 0, free: 0 },
+            Drive { root: "Z:\\".into(), kind: DRIVE_REMOTE },
+            Drive { root: "Y:\\".into(), kind: DRIVE_FIXED },
         ];
         for (root, network) in [
             (r"\\server\share", true),
@@ -4495,5 +4634,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    const GB: u64 = 1 << 30;
+
+    /// 가짜 용량 조회의 답: (경로, (전체, 여유), 파일 시스템)
+    type Answer = (&'static str, Option<(u64, u64)>, Option<&'static str>);
+
+    /// 경로마다 정해 둔 답을 돌려주는 가짜 용량 조회 (장치에 묻지 않는다)
+    fn answering(answers: &'static [Answer]) -> Volumes {
+        Volumes::with_probe(None, Arc::new(|path: &str| {
+            let (_, space, fs) = answers.iter().find(|a| a.0 == path).copied().unwrap_or(("", None, None));
+            Probe { space, fs: fs.map(Into::into) }
+        }))
+    }
+
+    #[test]
+    fn status_bar_shows_fallback_reason_without_hover() {
+        let not_elevated = "일반 스캔 · 관리자 권한 없음";
+        for (method, reason, badge) in [
+            (ScanMethod::Walk, Some(Fallback::NotElevated), not_elevated),
+            (ScanMethod::Walk, Some(Fallback::Network), "일반 스캔 · 네트워크 드라이브"),
+            (ScanMethod::Walk, Some(Fallback::NotNtfs("exFAT".into())), "일반 스캔 · exFAT 볼륨"),
+            (ScanMethod::Walk, None, "일반 스캔"),
+            (ScanMethod::Mft, None, "MFT"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app(fixture(1));
+            let st = &mut app.doc.as_mut().unwrap().stats;
+            (st.method, st.fallback_reason) = (method, reason.clone());
+            removal_status_frame(&ctx, &mut app, 0.0);
+            let output = removal_status_frame(&ctx, &mut app, 0.1);
+            assert!(has_removal_text(&output, badge), "{reason:?}");
+            assert_eq!(has_removal_text(&output, "일반 스캔"), method == ScanMethod::Walk, "{reason:?}");
+            assert_eq!(has_removal_text(&output, not_elevated), reason == Some(Fallback::NotElevated), "{reason:?}");
+        }
+        // 툴팁은 전체 문장이고, 권한 때문이면 관리자로 실행하라고 권한다
+        let mut st = fixture(1).stats;
+        st.fallback_reason = Some(Fallback::NotElevated);
+        let (_, hint) = method_badge(&st);
+        assert!(hint.starts_with("관리자 권한이 없어 일반 스캔을 사용") && hint.contains("관리자로 실행하면"), "{hint}");
+        st.fallback_reason = Some(Fallback::Network);
+        assert!(!method_badge(&st).1.contains("관리자로 실행"));
+    }
+
+    #[test]
+    fn status_bar_never_waits_for_disk_space() {
+        let ctx = egui::Context::default();
+        // 끊긴 네트워크 드라이브처럼 문이 열릴 때까지 답하지 않는다
+        let (open, gate) = mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let mut blocked = app(fixture(1));
+        blocked.volumes = Volumes::with_probe(None, Arc::new(move |_: &str| {
+            let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            Probe { space: Some((476 * GB, 112 * GB)), fs: None }
+        }));
+        let started = Instant::now();
+        for frame in 0..5 {
+            let output = removal_status_frame(&ctx, &mut blocked, frame as f64 * 0.1);
+            assert!(!has_removal_text(&output, "여유 공간"));
+        }
+        assert!(started.elapsed() < Duration::from_secs(5), "the UI thread waited for the probe");
+        open.send(()).unwrap();
+        blocked.volumes.wait_reply();
+        let output = removal_status_frame(&ctx, &mut blocked, 0.6);
+        assert!(has_removal_text(&output, &format!("여유 공간 {} / {}", human_size(112 * GB), human_size(476 * GB))));
+
+        // 믿을 수 없는 값(2^63 B)은 숫자 없이 알린다
+        let mut sentinel = app(fixture(1));
+        sentinel.volumes = answering(&[("C:\\Data", Some((1 << 63, 1 << 63)), None)]);
+        removal_status_frame(&ctx, &mut sentinel, 1.0);
+        sentinel.volumes.wait_reply();
+        let output = removal_status_frame(&ctx, &mut sentinel, 1.1);
+        assert!(has_removal_text(&output, "여유 공간 정보 없음"));
+        assert!(!has_removal_text(&output, "PB"));
+    }
+
+    #[test]
+    fn welcome_cards_read_cached_capacity() {
+        static ANSWERS: &[Answer] = &[
+            ("C:\\", Some((476 * GB, 112 * GB)), Some("NTFS")),
+            ("D:\\", Some((100 * GB, 5 * GB)), Some("NTFS")),
+            ("E:\\", Some((64 * GB, 32 * GB)), Some("exFAT")),
+            // 매체 없는 카드 리더
+            ("R:\\", None, None),
+            // 클라우드·가상 네트워크 드라이브의 표지값 (8192 PB)
+            ("Y:\\", Some((1 << 63, 1 << 63)), None),
+        ];
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut app = app(fixture(1));
+        app.doc = None;
+        app.volumes = answering(ANSWERS);
+        app.drives = ANSWERS
+            .iter()
+            .map(|&(root, ..)| Drive {
+                root: root.into(),
+                kind: match root {
+                    "E:\\" | "R:\\" => DRIVE_REMOVABLE,
+                    "Y:\\" => DRIVE_REMOTE,
+                    _ => DRIVE_FIXED,
+                },
+            })
+            .collect();
+        app.drives_at = Instant::now();
+        // 답이 오기 전: 기다리지 않고 '확인 중'으로 그린다. 이동식은 답이 올 때까지 숨긴다
+        let output = full_frame(&ctx, &mut app, vec![], 0.0);
+        assert!(has_removal_text(&output, "용량 확인 중…"));
+        assert!(!has_removal_text(&output, "E:\\") && !has_removal_text(&output, "R:\\"));
+        for _ in ANSWERS {
+            app.volumes.wait_reply();
+        }
+        full_frame(&ctx, &mut app, vec![], 0.1);
+        let output = full_frame(&ctx, &mut app, vec![], 0.2);
+        let free = |total: u64, free: u64| format!("여유 공간 {} / {}", human_size(free * GB), human_size(total * GB));
+        for text in ["로컬 디스크 · NTFS", "이동식 · exFAT", &free(476, 112), &free(100, 5), "· 거의 가득 참", "네트워크 · 일반 스캔이라 느릴 수 있음", "용량 정보 없음"] {
+            assert!(has_removal_text(&output, text), "{text}");
+        }
+        assert!(!has_removal_text(&output, "PB"), "표지값을 용량처럼 보여 주지 않는다");
+        assert!(!has_removal_text(&output, "R:\\"), "매체 없는 카드 리더는 숨긴다");
+        assert!(!has_removal_text(&output, "용량 확인 중…"));
+        // 카드는 화면 낭독기에 이름 있는 버튼이다
+        let update = output.platform_output.accesskit_update.expect("accesskit tree");
+        let names: Vec<_> = update.nodes.iter().filter(|(_, n)| n.role() == egui::accesskit::Role::Button).filter_map(|(_, n)| n.label()).collect();
+        for name in [format!("C:\\ 로컬 디스크 · NTFS · {}", free(476, 112)), format!("D:\\ 로컬 디스크 · NTFS · {} · 거의 가득 참", free(100, 5)),
+            "Y:\\ 네트워크 · 일반 스캔이라 느릴 수 있음 · 용량 정보 없음".into()] {
+            assert!(names.contains(&name.as_str()), "{name}: {names:?}");
+        }
+    }
+
+    #[test]
+    fn drive_lists_hide_removables_until_media_answers() {
+        for (kind, space, shown) in [
+            (DRIVE_REMOVABLE, Space::Checking, false),
+            (DRIVE_REMOVABLE, Space::Unavailable, false),
+            (DRIVE_REMOVABLE, Space::Unknown, true),
+            (DRIVE_REMOVABLE, Space::Known(64 * GB, GB), true),
+            (DRIVE_FIXED, Space::Checking, true),
+            (DRIVE_REMOTE, Space::Unavailable, true),
+        ] {
+            assert_eq!(shows_drive(kind, space), shown, "{kind} {space:?}");
+        }
+        assert_eq!(space_note(Space::Unavailable), "용량을 읽을 수 없습니다");
+        let net = Drive { root: "Z:\\".into(), kind: DRIVE_REMOTE };
+        assert_eq!(drive_subtitle(&net, Some("NTFS")), "네트워크 · 일반 스캔이라 느릴 수 있음");
+        assert_eq!(drive_subtitle(&Drive { root: "C:\\".into(), kind: DRIVE_FIXED }, None), "로컬 디스크");
+    }
+
+    #[test]
+    fn drive_scan_progress_basis_arrives_from_the_cache() {
+        let mut app = app(fixture(1));
+        app.volumes = answering(&[("D:\\", Some((100 * GB, 40 * GB)), Some("NTFS"))]);
+        let _tx = install_scan(&mut app);
+        app.fill_progress_basis();
+        assert_eq!(app.scanning.as_ref().unwrap().used, None, "폴더는 볼륨 사용량을 기준으로 쓰지 않는다");
+        app.scanning.as_mut().unwrap().root = "D:\\".into();
+        app.fill_progress_basis();
+        assert_eq!(app.scanning.as_ref().unwrap().used, None, "답이 오기 전에는 기다리지 않는다");
+        app.volumes.wait_reply();
+        app.fill_progress_basis();
+        assert_eq!(app.scanning.as_ref().unwrap().used, Some(60 * GB));
+    }
+
+    #[test]
+    fn rescanning_the_same_walk_uses_its_size_as_progress_basis() {
+        let mut d = fixture(1);
+        let alloc = d.tree.node(Tree::ROOT).alloc;
+        assert_eq!(previous_walk_size(Some(&d), "C:\\Data"), Some(alloc));
+        assert_eq!(previous_walk_size(Some(&d), "c:\\data"), Some(alloc));
+        assert_eq!(previous_walk_size(Some(&d), "C:\\Other"), None);
+        assert_eq!(previous_walk_size(None, "C:\\Data"), None);
+        d.stats.cancelled = true;
+        assert_eq!(previous_walk_size(Some(&d), "C:\\Data"), None, "중지한 일부 결과");
+        d.stats.cancelled = false;
+        d.stats.method = ScanMethod::Mft;
+        assert_eq!(previous_walk_size(Some(&d), "C:\\Data"), None, "MFT는 볼륨 전체를 센다");
+    }
+
+    #[test]
+    fn finished_scans_and_applied_removals_ask_disk_space_again() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let probe: crate::drives::ProbeFn = Arc::new(move |_: &str| {
+            counted.fetch_add(1, Relaxed);
+            Probe { space: Some((100 * GB, 40 * GB)), fs: None }
+        });
+        let ask = |app: &mut App, expected: usize| {
+            assert_eq!(app.volumes.space("C:\\Data") == Space::Checking, expected == 1, "the old value stays while asking again");
+            app.volumes.wait_reply();
+            assert_eq!(app.volumes.space("C:\\Data"), Space::Known(100 * GB, 40 * GB));
+            assert_eq!(calls.load(Relaxed), expected);
+        };
+        // 삭제 결과를 반영하면 여유 공간을 다시 묻는다
+        let mut removing = app(fixture(1));
+        removing.volumes = Volumes::with_probe(None, Arc::clone(&probe));
+        ask(&mut removing, 1);
+        removing.begin_removal(1, vec![1]);
+        let fence = removing.pending_removal.as_ref().unwrap().fence;
+        removing.search_control(SearchControlEvent::Released(fence));
+        removing.finish_removal();
+        assert_eq!(removing.doc.as_ref().unwrap().tree.version, 1);
+        ask(&mut removing, 2);
+
+        calls.store(0, Relaxed);
+        let mut app = app(fixture(1));
+        app.volumes = Volumes::with_probe(None, probe);
+        ask(&mut app, 1);
+        // 사용자가 중지하지 않은 스캔이 끝났다 (성공·실패 모두)
+        let tx = install_scan(&mut app);
+        assert!(!app.poll_scan());
+        tx.send(scan_result(fixture(2))).unwrap();
+        assert!(app.poll_scan());
+        ask(&mut app, 2);
+        install_scan(&mut app).send(Err(io::Error::other("injected scan failure"))).unwrap();
+        assert!(app.poll_scan());
+        drop(install_scan(&mut app));
+        assert!(app.poll_scan(), "the scan thread ended without an answer");
+        // 중지한 스캔은 끝났다고 알리지 않는다 (이전 문서로 돌아가거나 첫 스캔의 일부 결과)
+        let _tx = install_scan(&mut app);
+        app.cancel_scan();
+        assert!(!app.poll_scan());
+        assert!(app.scanning.is_none());
+        app.doc = None;
+        let tx = install_scan(&mut app);
+        app.cancel_scan();
+        tx.send(scan_result(partial_result())).unwrap();
+        assert!(!app.poll_scan());
+        assert!(app.doc.as_ref().is_some_and(|d| d.stats.cancelled));
     }
 }
