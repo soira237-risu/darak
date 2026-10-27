@@ -32,6 +32,8 @@ pub mod flags {
     pub const REMOVED: u8 = 1 << 4;
     /// 실제 파일이 아닌 표시용 노드 (미리 보기의 "파일 n개" 묶음)
     pub const SYNTHETIC: u8 = 1 << 5;
+    /// 스캔을 중지했거나 접근이 거부되어 이 폴더 또는 하위 일부를 읽지 못함 (크기가 실제보다 작을 수 있다)
+    pub const INCOMPLETE: u8 = 1 << 6;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,6 +64,10 @@ impl Node {
     }
     pub fn has(&self, flag: u8) -> bool {
         self.flags & flag != 0
+    }
+    /// 접근 거부나 중지로 자신 또는 하위 일부를 읽지 못했다
+    pub fn incomplete(&self) -> bool {
+        self.has(flags::DENIED | flags::INCOMPLETE)
     }
     pub fn size(&self, mode: SizeMode) -> u64 {
         match mode {

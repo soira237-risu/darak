@@ -104,6 +104,37 @@ fn missing_root_is_error() {
 }
 
 #[test]
+fn cancelled_walk_returns_marked_empty_root() {
+    let t = TempDir::new("cancel");
+    fs::create_dir_all(t.0.join("a/b")).unwrap();
+    fs::write(t.0.join("a/b/f"), vec![0u8; 4096]).unwrap();
+    let progress = ScanProgress::default();
+    progress.cancel();
+    let opts = ScanOptions { use_mft: false, ..Default::default() };
+    let res = scan(t.0.to_str().unwrap(), &opts, &progress).unwrap();
+    let root = res.tree.node(Tree::ROOT);
+    assert!(res.stats.cancelled);
+    assert!(root.has(flags::INCOMPLETE) && !root.has(flags::DENIED), "{:#x}", root.flags);
+    assert!(root.incomplete());
+    assert_eq!((root.child_count, root.files, root.alloc), (0, 0, 0));
+    assert_eq!(res.stats.errors, 0, "unread folders are not access errors");
+}
+
+#[test]
+fn cancelled_drive_scan_does_not_fall_back_to_walk() {
+    // 중지 플래그를 먼저 세우므로 MFT 경로는 볼륨을 열지 않고 끝난다. 일반 순회로 넘어가면
+    // 루트만 있는 빈 트리가 Ok로 나온다.
+    let temp = std::env::temp_dir();
+    let temp = temp.to_str().unwrap();
+    assert_eq!(temp.as_bytes()[1], b':', "{temp}");
+    let root = format!("{}\\", &temp[..2]);
+    let progress = ScanProgress::default();
+    progress.cancel();
+    let err = scan(&root, &ScanOptions::default(), &progress).err().expect("stopped MFT scan must not walk the drive");
+    assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "{err}");
+}
+
+#[test]
 fn search_and_protection() {
     use darak_core::remove::{protected_reason, top_level_marks};
     use darak_core::search::{Query, now_secs2000, search};

@@ -29,8 +29,12 @@ const RECORD_IN_USE: u16 = 0x01;
 const RECORD_IS_DIR: u16 = 0x02;
 
 /// `root`가 `X:\` 형태의 NTFS 볼륨 루트일 때만 쓴다.
+/// 레코드를 다 읽기 전에 중지되면 부분 트리를 만들지 않고 Interrupted를 돌려준다.
 pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) -> io::Result<(Tree, ScanStats)> {
     let start = Instant::now();
+    if progress.is_cancelled() {
+        return Err(interrupted());
+    }
     let letter = root.chars().next().filter(|c| c.is_ascii_alphabetic()).ok_or_else(|| invalid("드라이브 루트가 아님"))?;
     let vol = open_volume(letter)?;
     let vd = volume_data(&vol)?;
@@ -124,6 +128,10 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
     if let Some(e) = read_err {
         return Err(e);
     }
+    // MFT 순서로 읽다 만 레코드는 폴더 단위로 의미가 없고, 트리를 만드는 데도 수 초가 걸린다
+    if progress.is_cancelled() {
+        return Err(interrupted());
+    }
 
     *progress.current.lock().unwrap() = format!("{root} 트리 구성 중");
     let display = format!("{}:\\", letter.to_ascii_uppercase());
@@ -135,7 +143,8 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
         dirs: tree.nodes.iter().filter(|n| n.kind == Kind::Dir).count() as u64,
         errors: orphans,
         hardlink_dups: dups,
-        cancelled: progress.is_cancelled(),
+        // 레코드를 다 읽은 뒤에 들어온 중지는 트리를 바꾸지 않는다
+        cancelled: false,
         method: ScanMethod::Mft,
         fallback_reason: None,
     };
@@ -177,6 +186,10 @@ fn validate_run_alignment(runs: &[(u64, u64)], cluster: u64, rec_size: usize, mf
 
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
+}
+
+fn interrupted() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "스캔을 중지했습니다")
 }
 
 fn open_volume(letter: char) -> io::Result<OwnedHandle> {

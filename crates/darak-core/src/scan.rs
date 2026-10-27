@@ -71,6 +71,7 @@ pub struct ScanStats {
     pub dirs: u64,
     pub errors: u64,
     pub hardlink_dups: u64,
+    /// 중지되어 일부 폴더를 읽지 못한 결과 (그 폴더와 조상에 INCOMPLETE)
     pub cancelled: bool,
     pub method: ScanMethod,
     /// MFT를 시도했다가 일반 순회로 바꾼 이유
@@ -83,12 +84,17 @@ pub struct ScanResult {
 }
 
 /// `root`(예: `C:\`, `D:\Games`)를 스캔한다.
+///
+/// 중지되면 일반 순회는 읽은 데까지의 트리(stats.cancelled, 읽지 않은 폴더와 조상에 INCOMPLETE)를,
+/// MFT는 부분 트리 없이 Err(대개 Interrupted)를 돌려준다. 중지한 뒤에는 일반 순회로 넘어가지 않는다.
 pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Result<ScanResult> {
     let display = normalize_root(root);
     let mut fallback_reason = None;
     if opts.use_mft && is_drive_root(&display) {
         match crate::mft::scan_volume(&display, progress, opts.dedupe_hardlinks) {
             Ok((tree, stats)) => return Ok(ScanResult { tree, stats }),
+            // 넘어가면 중지 플래그 때문에 루트만 있는 빈 트리가 나온다
+            Err(e) if progress.is_cancelled() => return Err(e),
             Err(e) => {
                 fallback_reason = Some(if e.kind() == io::ErrorKind::PermissionDenied {
                     "관리자 권한이 없어 일반 스캔을 사용".to_string()
@@ -289,6 +295,8 @@ struct DirBuf {
     logical: u64,
     file_count: u64,
     denied: bool,
+    /// 중지되어 읽지 않음
+    incomplete: bool,
 }
 
 fn open_dir(path_no_nul: &[u16]) -> io::Result<OwnedHandle> {
@@ -408,10 +416,10 @@ fn push_entry(info: &FILE_ID_BOTH_DIR_INFO, name: &[u16], d: &mut DirBuf, subdir
 }
 
 fn scan_dir(path: Vec<u16>, name: &str, live_parent: u32, depth: u16, ctx: &Ctx) -> DirBuf {
-    let mut d = DirBuf::default();
     if ctx.progress.is_cancelled() {
-        return d;
+        return DirBuf { incomplete: true, ..DirBuf::default() };
     }
+    let mut d = DirBuf::default();
     let mut subdirs = Vec::new();
     if read_dir(&path, &mut d, &mut subdirs, ctx).is_err() {
         d.denied = true;
@@ -657,6 +665,7 @@ fn preview_step(work: &mut usize, cancelled: &(dyn Fn() -> bool + Sync)) -> Resu
 }
 
 /// DirBuf 트리를 BFS로 아레나에 펼친다. 자식은 할당 크기 내림차순.
+/// 중지로 읽지 않은 폴더와, 읽지 못한 폴더(접근 거부 포함)의 조상에는 INCOMPLETE를 붙인다.
 fn build_tree(root_name: &str, root: DirBuf) -> Tree {
     let mut tree = Tree::default();
     tree.nodes.reserve((root.file_count as usize).saturating_add(root.file_count as usize / 8));
@@ -672,7 +681,7 @@ fn build_tree(root_name: &str, root: DirBuf) -> Tree {
         mtime: 0,
         name_len: root_name.len() as u16,
         kind: Kind::Dir,
-        flags: if root.denied { flags::DENIED } else { 0 },
+        flags: (if root.denied { flags::DENIED } else { 0 }) | (if root.incomplete { flags::INCOMPLETE } else { 0 }),
     });
 
     let mut queue = VecDeque::new();
@@ -726,12 +735,22 @@ fn build_tree(root_name: &str, root: DirBuf) -> Tree {
                 if b.denied {
                     n.flags |= flags::DENIED;
                 }
+                if b.incomplete {
+                    n.flags |= flags::INCOMPLETE;
+                }
             }
             tree.nodes.push(n);
         }
 
         for (i, (_, b)) in d.dirs.into_iter().enumerate() {
             queue.push_back((dir_ids[i], b));
+        }
+    }
+    // 읽지 못한 폴더의 조상에 INCOMPLETE. BFS라 부모가 항상 앞에 있으므로 역순 한 번이면 된다
+    for i in (1..tree.nodes.len()).rev() {
+        if tree.nodes[i].incomplete() {
+            let p = tree.nodes[i].parent as usize;
+            tree.nodes[p].flags |= flags::INCOMPLETE;
         }
     }
     tree.nodes.shrink_to_fit();
@@ -1007,5 +1026,55 @@ mod tests {
         let tree = build_tree("C:\\", d);
         assert_eq!(tree.node(1).flags & (flags::LOSSY_NAME | flags::DENIED), flags::LOSSY_NAME | flags::DENIED);
         assert_eq!(tree.node(1).child_count, 0);
+        assert!(tree.node(Tree::ROOT).has(flags::INCOMPLETE), "lossy directory was not read either");
+    }
+
+    fn push_dir(d: &mut DirBuf, name: &str, child: DirBuf) {
+        let name_off = d.names.len() as u32;
+        d.names.push_str(name);
+        let e = RawEntry { name_off, name_len: name.len() as u16, kind: Kind::Dir, flags: 0, alloc: 0, logical: 0, mtime: 0 };
+        d.alloc += child.alloc;
+        d.logical += child.logical;
+        d.file_count += child.file_count;
+        d.dirs.push((e, child));
+    }
+
+    #[test]
+    fn marks_unread_folders_and_ancestors_incomplete() {
+        // root ─ a ─ m ─ x (중지로 읽지 않음)
+        //      │   └ n
+        //      ├ b (접근 거부)
+        //      └ c
+        let mut m = DirBuf::default();
+        push_dir(&mut m, "x", DirBuf { incomplete: true, ..DirBuf::default() });
+        let mut a = DirBuf::default();
+        push_dir(&mut a, "m", m);
+        push_dir(&mut a, "n", live_bytes(4096, 100, 1));
+        let mut root = DirBuf::default();
+        push_dir(&mut root, "a", a);
+        push_dir(&mut root, "b", DirBuf { denied: true, ..DirBuf::default() });
+        push_dir(&mut root, "c", live_bytes(8192, 200, 2));
+        let tree = build_tree("C:\\", root);
+        let find = |path: &str| {
+            path.split('/').filter(|p| !p.is_empty())
+                .fold(Tree::ROOT, |cur, part| tree.children(cur).find(|&c| tree.name(c) == part).unwrap())
+        };
+        for (path, expected) in [("", flags::INCOMPLETE), ("a", flags::INCOMPLETE), ("a/m", flags::INCOMPLETE),
+            ("a/m/x", flags::INCOMPLETE), ("a/n", 0), ("b", flags::DENIED), ("c", 0)] {
+            let n = tree.node(find(path));
+            assert_eq!(n.flags, expected, "{path}");
+            assert_eq!(n.incomplete(), expected != 0, "{path}");
+        }
+        assert_eq!(tree.node(Tree::ROOT).logical, 300, "unread folders add nothing");
+    }
+
+    #[test]
+    fn complete_tree_has_no_incomplete_marks() {
+        let mut a = DirBuf::default();
+        push_dir(&mut a, "inner", live_bytes(4096, 10, 1));
+        let mut root = DirBuf::default();
+        push_dir(&mut root, "a", a);
+        let tree = build_tree("C:\\", root);
+        assert!(tree.nodes.iter().all(|n| !n.incomplete()));
     }
 }
