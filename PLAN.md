@@ -89,9 +89,9 @@ struct Node {            // Vec<Node> 아레나, u32 인덱스로 참조
 - 다음은 지울 수 없게 막는다: 드라이브 루트, `C:\Windows`, `Program Files*`, `ProgramData`, 사용자 홈 루트, 스캔 루트, reparse point 대상.
   실제 규칙(`remove::protected_reason`)은 아래와 같다. 표시할 때와 실행 직전에 같은 규칙으로 다시 검사한다.
   - **안쪽까지 모두 막음**: Windows 폴더(`%WINDIR%`), 각 드라이브의 `System Volume Information`·`$Recycle.Bin`·`Recovery`·`Boot`·`$Windows.~BT`·`$Windows.~WS`, 이름을 정확히 복원할 수 없는 항목(UTF-16 변환이 깨진 이름)과 그 안쪽.
-  - **그 폴더 자신만 막음**(안쪽의 앱·하위 폴더는 지울 수 있음): 시스템 드라이브의 `Program Files`·`Program Files (x86)`·`ProgramData`·`Users`·`Users\Public`·`Users\Default`, 현재 사용자의 홈과 그 안의 `AppData`·`AppData\Local`·`AppData\Roaming`·`Documents`·`Desktop`·`Downloads`. 예를 들어 `C:\Program Files\MyApp`은 지울 수 있다(테스트로 정한 동작).
+  - **그 폴더 자신만 막음**(안쪽의 앱·하위 폴더는 지울 수 있음): 모든 드라이브의 `Program Files`·`Program Files (x86)`, 시스템 드라이브의 `ProgramData`·`Users`·`Users\Public`·`Users\Default`, 현재 사용자의 홈과 그 안의 `AppData`·`AppData\Local`·`AppData\Roaming`·`Documents`·`Desktop`·`Downloads`. 예를 들어 `C:\Program Files\MyApp`은 지울 수 있다(테스트로 정한 동작).
   - **항상 막음**: 드라이브 루트, 스캔 루트, 따라가지 않은 junction·디렉터리 symlink·마운트 지점(링크 자체. 셸로 지우면 대상 폴더가 지워질 수 있음), 드라이브 루트 바로 아래의 `$`로 시작하는 항목과 `pagefile.sys`·`hiberfil.sys`·`swapfile.sys`·`DumpStack.log`, 보호 여부를 확인할 수 없는 경로(UNC, 장치 경로 등).
-  - **지금은 막지 않음**: 다른 드라이브의 `Program Files`·`ProgramData`, 다른 사용자의 홈 루트(`C:\Users\<다른 사용자>`)와 그 기본 폴더. 일반 권한에서는 대개 NTFS 권한이 막아 주지만 관리자 권한에서는 그렇지 않다. 그래서 관리자 권한일 때 모든 사용자의 프로필 루트·기본 폴더, 모든 드라이브의 `Program Files`·`Program Files (x86)` 직속 하위, `ProgramData` 직속 하위까지 막는 규칙을 수정 M1의 PR3·PR4에서 더한다(더 깊은 하위는 계속 허용, §7 '남은 일').
+  - **지금은 막지 않음**: 다른 드라이브의 `ProgramData`, 다른 사용자의 홈 루트(`C:\Users\<다른 사용자>`)와 그 기본 폴더. 일반 권한에서는 대개 NTFS 권한이 막아 주지만 관리자 권한에서는 그렇지 않다. 그래서 관리자 권한일 때 모든 사용자의 프로필 루트·기본 폴더, 모든 드라이브의 `Program Files`·`Program Files (x86)` 직속 하위, `ProgramData` 직속 하위까지 막는 규칙을 수정 M1의 PR3·PR4에서 더한다(더 깊은 하위는 계속 허용, §7 '남은 일'). 규칙은 PR3에서 `remove::Guard::Admin`(`protected_reason_as`)으로 들어갔고, 관리자 권한으로 만든 문서에 적용하는 일은 PR4에서 한다.
 - 삭제가 끝나면 트리에서 해당 노드를 빼고, 상위 크기를 증분으로 갱신한다(다시 스캔하지 않음).
 
 ## 4. 마일스톤

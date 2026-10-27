@@ -627,7 +627,8 @@ impl App {
                     .on_hover_text("관리자 권한이면 NTFS의 $MFT를 직접 읽어 드라이브 전체를 몇 초 안에 스캔합니다")
                     .clicked()
             {
-                if relaunch_as_admin(&format!("\"{}\"", self.root_input)) {
+                // TODO(PR4): admin_relaunch()로 문서 루트(없으면 None)를 넘기고 표시가 있으면 먼저 묻는다
+                if relaunch_as_admin(Some(&self.root_input)) {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 } else {
                     self.toast("관리자 권한으로 다시 실행하지 못했습니다");

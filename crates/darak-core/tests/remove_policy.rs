@@ -2,7 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
-use darak_core::remove::{RecycleBin, RecycleBlock, protected_reason, recycle_block, still_there};
+use darak_core::remove::{
+    Guard, RecycleBin, RecycleBlock, protected_reason, protected_reason_as, recycle_block, still_there,
+};
 use darak_core::tree::{NO_NODE, Node};
 use darak_core::{Kind, Tree, flags};
 
@@ -52,13 +54,17 @@ fn tree_with_child(root: &str, name: &str, kind: Kind, flags: u8) -> Tree {
 }
 
 fn reason_for_path(path: &str) -> Option<&'static str> {
+    reason_for_path_as(path, Guard::User)
+}
+
+fn reason_for_path_as(path: &str, guard: Guard) -> Option<&'static str> {
     let (root, name) = path.rsplit_once('\\').unwrap();
     let root = if root.ends_with(':') {
         format!("{root}\\")
     } else {
         root.to_owned()
     };
-    protected_reason(&tree_with_child(&root, name, Kind::Dir, 0), 1)
+    protected_reason_as(&tree_with_child(&root, name, Kind::Dir, 0), 1, guard)
 }
 
 fn ordinary_path(path: String) -> String {
@@ -136,6 +142,64 @@ fn allows_neighboring_names_and_nondefault_children() {
         for path in [path.clone(), format!(r"\\?\{path}")] {
             assert!(reason_for_path(&path).is_none(), "{path}");
         }
+    }
+}
+
+#[test]
+fn admin_guard_protects_profiles_and_program_folders() {
+    const PROGRAM: &str = "설치된 프로그램 폴더 (관리자 권한)";
+    const DATA: &str = "공용 프로그램 데이터 (관리자 권한)";
+    const PROFILE: &str = "사용자 프로필 기본 폴더 (관리자 권한)";
+    let drive = ordinary_path(std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+    // 이 PC의 사용자 이름과 겹치지 않을 다른 프로필
+    let other = format!("{drive}\\Users\\Darak Test Other");
+    for (path, reason) in [
+        (format!("{drive}\\Program Files\\MyApp"), PROGRAM),
+        (format!("{drive}\\Program Files (x86)\\MyApp"), PROGRAM),
+        (r"Z:\Program Files\App".to_owned(), PROGRAM),
+        (r"Z:\Program Files (x86)\App".to_owned(), PROGRAM),
+        (format!("{drive}\\ProgramData\\Microsoft"), DATA),
+        (other.clone(), PROFILE),
+        (format!("{other}\\AppData"), PROFILE),
+        (format!("{other}\\AppData\\Local"), PROFILE),
+        (format!("{other}\\AppData\\Roaming"), PROFILE),
+        (format!("{other}\\Documents"), PROFILE),
+        (format!("{other}\\Desktop"), PROFILE),
+        (format!("{other}\\Downloads"), PROFILE),
+    ] {
+        for path in [path.clone(), format!(r"\\?\{path}"), format!("{}\\", path.to_uppercase())] {
+            assert_eq!(reason_for_path_as(&path, Guard::Admin), Some(reason), "{path}");
+            assert_eq!(reason_for_path_as(&path, Guard::User), None, "{path}");
+        }
+    }
+    // 더 깊은 하위와 다른 드라이브의 ProgramData는 두 수준 모두 지울 수 있다
+    for path in [
+        format!("{drive}\\Program Files\\MyApp\\cache"),
+        format!("{drive}\\Program Files-old\\MyApp"),
+        format!("{drive}\\ProgramData\\Microsoft\\cache"),
+        format!("{other}\\Downloads\\big.iso"),
+        format!("{other}\\AppData\\Local\\Temp"),
+        format!("{other}\\Videos"),
+        r"Z:\ProgramData\App".to_owned(),
+        r"Z:\Users\Other".to_owned(),
+        r"Z:\MyApp\Program Files".to_owned(),
+    ] {
+        for guard in [Guard::User, Guard::Admin] {
+            assert_eq!(reason_for_path_as(&path, guard), None, "{path} {guard:?}");
+        }
+    }
+    // 어느 드라이브의 Program Files든 그 폴더 자신은 두 수준 모두 막는다
+    for path in [r"Z:\Program Files", r"Z:\Program Files (x86)", r"\\?\z:\program files"] {
+        for guard in [Guard::User, Guard::Admin] {
+            assert_eq!(reason_for_path_as(path, guard), Some("시스템/사용자 기본 폴더"), "{path} {guard:?}");
+        }
+    }
+    // 공통 규칙은 관리자 수준에서도 그대로다
+    assert_eq!(Guard::default(), Guard::User);
+    for drive in [r"C:\", r"Z:\"] {
+        let tree = tree_with_child(drive, "pagefile.sys", Kind::File, 0);
+        assert_eq!(protected_reason_as(&tree, 1, Guard::Admin), Some("시스템 파일"));
+        assert!(protected_reason_as(&tree, Tree::ROOT, Guard::Admin).is_some());
     }
 }
 

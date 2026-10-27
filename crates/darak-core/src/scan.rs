@@ -157,19 +157,63 @@ pub fn shell_open(path: &str) -> bool {
     r as isize > 32
 }
 
-/// 같은 실행 파일을 관리자 권한으로 다시 실행한다. 성공하면 true (호출한 쪽은 종료하면 된다)
-pub fn relaunch_as_admin(args: &str) -> bool {
+/// `%SystemRoot%\explorer.exe`. 이름만으로 찾으면 실행 파일 옆에 놓인 같은 이름의 파일이
+/// (관리자 권한으로) 대신 실행될 수 있다.
+pub fn explorer_exe() -> std::path::PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; MAX_PATH];
+    // 성공하면 NUL을 뺀 길이, 버퍼가 작으면 필요한 크기(NUL 포함)를 돌려준다
+    let n = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    let dir = if (1..buf.len()).contains(&n) {
+        std::ffi::OsString::from_wide(&buf[..n]).into()
+    } else {
+        std::path::PathBuf::from(r"C:\Windows")
+    };
+    dir.join("explorer.exe")
+}
+
+/// 인자 하나를 Windows 명령줄 규칙(CommandLineToArgvW·Rust std와 같음)에 맞게 따옴표로 감싼다.
+/// 따옴표 앞과 끝의 백슬래시만 두 배로 쓴다 (`C:\` → `"C:\\"`, `E:\Claude` → `"E:\Claude"`).
+pub fn quote_arg(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut slashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n('\\', slashes * 2));
+    out.push('"');
+    out
+}
+
+/// 같은 실행 파일을 관리자 권한으로 다시 실행한다. root가 있으면 새 창이 그 경로를 바로 스캔하고,
+/// None이면 처음 화면에서 시작한다. 성공하면 true (호출한 쪽은 종료하면 된다)
+pub fn relaunch_as_admin(root: Option<&str>) -> bool {
+    use std::os::windows::ffi::OsStrExt;
     let Ok(exe) = std::env::current_exe() else { return false };
-    let exe = wide(&exe.to_string_lossy());
+    let exe: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let op = wide("runas");
-    let params = wide(args);
-    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), exe.as_ptr(), params.as_ptr(), std::ptr::null(), 1) };
+    let args = root.map(|r| wide(&quote_arg(r)));
+    let params = args.as_ref().map_or(std::ptr::null(), |a| a.as_ptr());
+    let r = unsafe { ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), exe.as_ptr(), params, std::ptr::null(), 1) };
     r as isize > 32
 }
 
-/// `c:` → `C:\`, 끝의 `\` 정리
+/// `c:` → `C:\`, 끝의 `\` 정리. 붙여 넣은 경로의 앞뒤 따옴표(`"E:\Claude"`)도 지운다.
 pub fn normalize_root(root: &str) -> String {
-    let mut s = root.trim().replace('/', "\\");
+    let mut s = root.trim().trim_matches('"').trim().replace('/', "\\");
     let drive_offset = if s.starts_with(r"\\?\") { 4 } else { 0 };
     let drive = s.as_bytes().get(drive_offset..).is_some_and(|b| b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':');
     if drive {
@@ -883,6 +927,69 @@ mod tests {
             (r"\\?\c:\", r"\\?\C:\"), (r"\\?\c:\\", r"\\?\C:\"), (r"\\?\c:\folder\", r"\\?\C:\folder")] {
             assert_eq!(normalize_root(input), expected);
         }
+    }
+
+    #[test]
+    fn normalize_root_strips_pasted_quotes() {
+        // 탐색기 '경로로 복사'의 따옴표, 예전 재실행 버그가 넘기던 `C:"`
+        for (input, expected) in [("\"E:\\Claude\"", r"E:\Claude"), ("C:\"", r"C:\"), ("\"d:\\\"", r"D:\"),
+            (" \"D:\\My Games\\\" ", r"D:\My Games")] {
+            assert_eq!(normalize_root(input), expected, "{input}");
+        }
+    }
+
+    #[link(name = "shell32")]
+    unsafe extern "system" {
+        fn CommandLineToArgvW(cmd: *const u16, argc: *mut i32) -> *mut *mut u16;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LocalFree(mem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+
+    /// Windows가 명령줄을 나누는 결과
+    fn split_command_line(cmd: &str) -> Vec<String> {
+        let cmd = wide(cmd);
+        let mut argc = 0;
+        unsafe {
+            let argv = CommandLineToArgvW(cmd.as_ptr(), &mut argc);
+            assert!(!argv.is_null());
+            let args = (0..argc as usize)
+                .map(|i| {
+                    let a = *argv.add(i);
+                    let len = (0..).take_while(|&j| *a.add(j) != 0).count();
+                    String::from_utf16(std::slice::from_raw_parts(a, len)).unwrap()
+                })
+                .collect();
+            LocalFree(argv.cast());
+            args
+        }
+    }
+
+    #[test]
+    fn quote_arg_round_trips_through_command_line_to_argv() {
+        for arg in [r"C:\", r"c:\\", r"E:\Claude", r"D:\My Games\", r"\\server\share\", r"\\?\C:\", r"C:\한글 폴더\",
+            r#"a"b"#, r#"a\"b"#, r#"a\\"b\"#, "", r"tail\\", " "] {
+            assert_eq!(split_command_line(&format!("darak.exe {}", quote_arg(arg))), ["darak.exe", arg], "{arg}");
+        }
+    }
+
+    #[test]
+    fn quote_arg_escapes_only_backslashes_before_quotes() {
+        assert_eq!(quote_arg(r"C:\"), r#""C:\\""#);
+        assert_eq!(quote_arg(r"E:\Claude"), r#""E:\Claude""#);
+        assert_eq!(quote_arg(r"\\server\share"), r#""\\server\share""#);
+        assert_eq!(quote_arg(r"D:\My Games\"), r#""D:\My Games\\""#);
+        assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_arg(""), r#""""#);
+    }
+
+    #[test]
+    fn explorer_is_absolute() {
+        let exe = explorer_exe();
+        assert!(exe.is_absolute(), "{exe:?}");
+        assert_eq!(exe.file_name().and_then(|n| n.to_str()), Some("explorer.exe"));
     }
 
     #[test]

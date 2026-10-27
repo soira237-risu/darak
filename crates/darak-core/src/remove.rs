@@ -36,8 +36,23 @@ fn protection_key(path: &str) -> Option<String> {
     Some(key.to_lowercase())
 }
 
-/// 이 노드를 지우면 안 되는 이유. 지워도 되면 None.
+/// 삭제 보호 수준. 관리자 권한이면 NTFS 권한이 막아 주던 곳을 직접 막는다.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Guard {
+    /// 일반 권한
+    #[default]
+    User,
+    /// 관리자 권한: 모든 사용자의 프로필 루트·기본 폴더, Program Files·(x86)와 ProgramData의 직속 하위까지 막는다
+    Admin,
+}
+
+/// 일반 권한 기준으로 이 노드를 지우면 안 되는 이유. 지워도 되면 None.
 pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
+    protected_reason_as(tree, id, Guard::User)
+}
+
+/// 보호 수준 guard에서 이 노드를 지우면 안 되는 이유. 지워도 되면 None.
+pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'static str> {
     if id == Tree::ROOT {
         return Some("스캔한 루트 폴더");
     }
@@ -76,6 +91,8 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
         _ => String::new(),
     };
 
+    // 이 항목이 있는 드라이브 (`d:`)
+    let drive = &lower[..2];
     let inside =
         |base: &str| !base.is_empty() && (lower == base || lower.starts_with(&format!("{base}\\")));
     if inside(&windir) {
@@ -89,13 +106,13 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
         "$windows.~bt",
         "$windows.~ws",
     ] {
-        if inside(&format!("{}\\{name}", &lower[..2])) {
+        if inside(&format!("{drive}\\{name}")) {
             return Some("시스템 보호 폴더");
         }
     }
     let exact = [
-        format!("{sys_drive}\\program files"),
-        format!("{sys_drive}\\program files (x86)"),
+        format!("{drive}\\program files"),
+        format!("{drive}\\program files (x86)"),
         format!("{sys_drive}\\programdata"),
         format!("{sys_drive}\\users"),
         format!("{sys_drive}\\users\\public"),
@@ -110,6 +127,11 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
     ];
     if exact.iter().any(|e| !e.is_empty() && lower == *e) {
         return Some("시스템/사용자 기본 폴더");
+    }
+    if guard == Guard::Admin
+        && let Some(reason) = admin_reason(&lower, sys_drive)
+    {
+        return Some(reason);
     }
     // 드라이브 바로 아래의 시스템 파일과 NTFS 메타 파일
     if tree.parent(id) == Some(Tree::ROOT)
@@ -126,6 +148,27 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// 관리자 권한에서만 더 막는 곳 (일반 권한이면 NTFS 권한이 막아 준다). lower는 protection_key 결과이고,
+/// 더 깊은 하위 항목(`program files\app\cache`, 다른 프로필의 `downloads\big.iso`)은 막지 않는다.
+fn admin_reason(lower: &str, sys_drive: &str) -> Option<&'static str> {
+    let (parent, _) = lower.rsplit_once('\\')?;
+    // 부모가 어느 드라이브든 `x:\program files` 또는 `x:\program files (x86)`
+    if matches!(parent.get(3..), Some("program files" | "program files (x86)")) {
+        return Some("설치된 프로그램 폴더 (관리자 권한)");
+    }
+    if parent == format!("{sys_drive}\\programdata") {
+        return Some("공용 프로그램 데이터 (관리자 권한)");
+    }
+    // {sys}\users\<이름> 아래의 꼬리
+    let tail: Vec<&str> = lower.strip_prefix(&format!("{sys_drive}\\users\\"))?.split('\\').skip(1).collect();
+    match tail[..] {
+        [] | ["appdata"] | ["appdata", "local" | "roaming"] | ["documents" | "desktop" | "downloads"] => {
+            Some("사용자 프로필 기본 폴더 (관리자 권한)")
+        }
+        _ => None,
+    }
 }
 
 /// 볼륨의 휴지통 상태

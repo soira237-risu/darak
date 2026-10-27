@@ -78,3 +78,36 @@ pub fn categorize(name: &str) -> Category {
         _ => Category::Other,
     }
 }
+
+/// 열면 프로그램이나 스크립트가 실행되는 확장자 (실행 파일·스크립트·설치 패키지·바로 가기).
+/// Category::Executable과 다르다: dll·sys는 열어도 실행되지 않고, cmd·vbs·py·lnk는 실행된다.
+const RUNS_CODE: &[&str] = &[
+    "exe", "com", "scr", "pif", "cpl", "msc", "bat", "cmd", "ps1", "psm1", "vb", "vbs", "vbe", "js", "jse", "ws",
+    "wsf", "wsh", "wsc", "sct", "hta", "py", "pyw", "pyz", "pyzw", "jar", "msi", "msp", "msu", "msix", "msixbundle",
+    "appx", "appxbundle", "appinstaller", "application", "appref-ms", "diagcab", "lnk", "url", "website", "scf",
+    "reg", "chm", "settingcontent-ms",
+];
+
+/// 열면(더블클릭하면) 코드가 실행되는 파일인지. Win32 경로는 끝의 점·공백을 버리므로 그것도 떼고 본다.
+pub fn runs_code(name: &str) -> bool {
+    name.trim_end_matches(['.', ' '])
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| RUNS_CODE.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runs_code_matches_launchable_extensions() {
+        for name in ["SETUP.EXE", "Install.MsI", "run.bat", "x.ps1", "tool.py", "a.lnk", "b.appref-ms", ".exe",
+            "start.CMD", "old.vbs", "trailing.exe.", "spaced.bat "] {
+            assert!(runs_code(name), "{name}");
+        }
+        for name in ["movie.mkv", "notes.txt", "x.exe.txt", "archive.zip", "Makefile", "lib.dll", "driver.sys",
+            "exe", "setup.exe.bak", ""] {
+            assert!(!runs_code(name), "{name}");
+        }
+    }
+}
