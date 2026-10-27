@@ -126,6 +126,7 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
         progress,
         dedupe: opts.dedupe_hardlinks.then(|| (0..SHARDS).map(|_| Mutex::new(HashSet::new())).collect()),
         hardlink_dups: AtomicU64::new(0),
+        skipped: AtomicBool::new(false),
     };
     let root_buf = pool.install(|| scan_dir(os_path, &display, NO_NODE, 0, &ctx));
     drop(ctx.dedupe);
@@ -137,7 +138,8 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
         dirs: progress.dirs.load(Relaxed),
         errors: progress.errors.load(Relaxed),
         hardlink_dups: ctx.hardlink_dups.load(Relaxed),
-        cancelled: progress.is_cancelled(),
+        // 모든 폴더를 읽은 뒤에 들어온 중지는 트리를 바꾸지 않는다
+        cancelled: ctx.skipped.load(Relaxed),
         method: ScanMethod::Walk,
         fallback_reason,
     };
@@ -260,6 +262,8 @@ struct Ctx<'a> {
     progress: &'a ScanProgress,
     dedupe: Option<Vec<Mutex<HashSet<u64>>>>,
     hardlink_dups: AtomicU64,
+    /// 중지로 읽지 않고 건너뛴 폴더가 있음
+    skipped: AtomicBool,
 }
 
 impl Ctx<'_> {
@@ -417,6 +421,7 @@ fn push_entry(info: &FILE_ID_BOTH_DIR_INFO, name: &[u16], d: &mut DirBuf, subdir
 
 fn scan_dir(path: Vec<u16>, name: &str, live_parent: u32, depth: u16, ctx: &Ctx) -> DirBuf {
     if ctx.progress.is_cancelled() {
+        ctx.skipped.store(true, Relaxed);
         return DirBuf { incomplete: true, ..DirBuf::default() };
     }
     let mut d = DirBuf::default();
@@ -1014,7 +1019,7 @@ mod tests {
     #[test]
     fn does_not_recurse_into_lossy_directory() {
         let progress = ScanProgress::default();
-        let ctx = Ctx { progress: &progress, dedupe: None, hardlink_dups: AtomicU64::new(0) };
+        let ctx = Ctx { progress: &progress, dedupe: None, hardlink_dups: AtomicU64::new(0), skipped: AtomicBool::new(false) };
         let mut d = DirBuf::default();
         let mut subdirs = Vec::new();
         let info = FILE_ID_BOTH_DIR_INFO { FileAttributes: FILE_ATTRIBUTE_DIRECTORY, ..unsafe { std::mem::zeroed() } };

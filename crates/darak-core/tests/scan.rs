@@ -55,6 +55,7 @@ fn scans_sizes_hardlinks_and_junctions() {
     let progress = ScanProgress::default();
     let res = scan(root.to_str().unwrap(), &ScanOptions::default(), &progress).unwrap();
     let tree = &res.tree;
+    assert!(!res.stats.cancelled && tree.nodes.iter().all(|n| !n.incomplete()), "complete walk has no unread folders");
 
     let r = tree.node(Tree::ROOT);
     assert_eq!(r.logical, 10_000 + 50_000 + 300_000 + 5, "하드링크는 한 번만, junction은 따라가지 않음");
