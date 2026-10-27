@@ -875,12 +875,17 @@ pub fn list_drives() -> Vec<Drive> {
 }
 
 /// (전체, 여유) 바이트. 장치에 묻으므로 끊긴 네트워크 경로에서는 오래 막힐 수 있다 (UI 스레드에서 부르지 않는다).
-/// UNC 경로는 끝에 `\`가 있어야 한다. 값은 검사하지 않으므로 표시하기 전에 plausible_space로 거른다.
+/// 값은 검사하지 않으므로 표시하기 전에 plausible_space로 거른다.
 pub fn disk_space(path: &str) -> Option<(u64, u64)> {
-    let w = wide(path);
+    let w = wide(&space_query_path(path));
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, &mut total, &mut free) };
     (ok != 0).then_some((total, free))
+}
+
+/// GetDiskFreeSpaceExW에 넘길 경로. UNC 경로(`\\server\share`, `\\?\..`)는 끝에 `\`가 있어야 한다
+fn space_query_path(path: &str) -> std::borrow::Cow<'_, str> {
+    if path.starts_with(r"\\") && !path.ends_with('\\') { format!("{path}\\").into() } else { path.into() }
 }
 
 /// 믿을 만한 용량인지. 클라우드·가상 네트워크 드라이브가 돌려주는 2^63 B(8192 PB) 같은 표지값,
@@ -1178,6 +1183,19 @@ mod tests {
         }
         assert!(plausible_space(476 * GB, 112 * GB));
         assert!(plausible_space(64 * GB, 0), "가득 찬 드라이브");
+    }
+
+    #[test]
+    fn space_query_adds_trailing_slash_only_to_unc() {
+        for (path, expected) in [
+            (r"\\server\share", r"\\server\share\"),
+            (r"\\server\share\", r"\\server\share\"),
+            (r"\\?\UNC\server\share", r"\\?\UNC\server\share\"),
+            (r"C:\", r"C:\"),
+            (r"D:\Games", r"D:\Games"),
+        ] {
+            assert_eq!(space_query_path(path), expected, "{path}");
+        }
     }
 
     #[test]

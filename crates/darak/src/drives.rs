@@ -134,13 +134,7 @@ impl Volumes {
 
 /// 실제 조회: 용량과 (드라이브 루트면) 파일 시스템
 fn probe(path: &str) -> Probe {
-    // UNC 경로(`\\server\share`, `\\?\..`)는 끝에 \가 있어야 한다
-    let space = if path.starts_with(r"\\") && !path.ends_with('\\') {
-        disk_space(&format!("{path}\\"))
-    } else {
-        disk_space(path)
-    };
-    Probe { space, fs: is_drive_root(path).then(|| volume_fs(path)).flatten() }
+    Probe { space: disk_space(path), fs: is_drive_root(path).then(|| volume_fs(path)).flatten() }
 }
 
 fn space_of(v: Option<(u64, u64)>) -> Space {

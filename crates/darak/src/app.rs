@@ -1000,10 +1000,17 @@ impl App {
                     if i > 0 {
                         ui.label(RichText::new("›").weak());
                     }
-                    let name = doc.tree.name(n).trim_end_matches('\\').to_string();
                     let last = i + 1 == chain.len();
+                    // 크기를 다 세지 못한 조상에도 ⚠ (현재 위치는 아래 크기 옆에 붙인다)
+                    let note = if last { None } else { incomplete_note(doc, n) };
+                    let name = format!("{}{}", doc.tree.name(n).trim_end_matches('\\'), if note.is_some() { " ⚠" } else { "" });
                     let txt = if last { RichText::new(name).strong() } else { RichText::new(name) };
-                    if ui.add(egui::Button::new(txt).frame(false)).clicked() && !last {
+                    let crumb = ui.add(egui::Button::new(txt).frame(false));
+                    let crumb = match note {
+                        Some(note) => crumb.on_hover_text(note),
+                        None => crumb,
+                    };
+                    if crumb.clicked() && !last {
                         go = Some(n);
                     }
                 }
@@ -4573,6 +4580,21 @@ mod tests {
         let output = removal_status_frame(&ctx, &mut app, 2.3);
         let at = scanned_label(app.doc.as_ref().unwrap().scanned_at);
         assert!(has_removal_text(&output, &format!("· {at} 스캔")), "{at}");
+    }
+
+    #[test]
+    fn breadcrumb_marks_incomplete_ancestors() {
+        let ctx = egui::Context::default();
+        let mut d = fixture(1);
+        Arc::get_mut(&mut d.tree).unwrap().nodes[0].flags |= flags::INCOMPLETE;
+        d.navigate(1);
+        let mut app = app(d);
+        toolbar_frame(&ctx, &mut app, 0.0);
+        let output = toolbar_frame(&ctx, &mut app, 0.1);
+        // 루트(조상)는 다 세지 못했고, 현재 위치 folder는 다 셌다
+        assert!(has_removal_text(&output, "C:\\Data ⚠"));
+        assert!(!has_removal_text(&output, "folder ⚠"));
+        assert!(!has_removal_text(&output, " ⚠  ·"));
     }
 
     #[test]
