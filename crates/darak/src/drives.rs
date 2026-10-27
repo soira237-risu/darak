@@ -36,7 +36,7 @@ pub type ProbeFn = Arc<dyn Fn(&str) -> Probe + Send + Sync>;
 struct Entry {
     space: Space,
     fs: Option<String>,
-    /// 마지막으로 조회를 시작한 시각 (None이면 다음에 바로 묻는다)
+    /// 마지막 답을 받은 시각, 조회 중이면 시작한 시각 (None이면 다음에 바로 묻는다)
     asked: Option<Instant>,
     /// 조회 스레드가 아직 답하지 않음
     busy: bool,
@@ -75,6 +75,11 @@ impl Volumes {
     fn apply(&mut self, path: &str, p: Probe) {
         let Some(e) = self.entries.get_mut(path) else { return };
         e.busy = false;
+        // TTL은 답이 온 때부터 센다 (끊긴 네트워크 드라이브는 조회가 TTL보다 오래 걸려 쉬지 않고 다시 묻게 된다).
+        // 조회 중에 mark_stale 했으면(None) 이 답은 바뀌기 전 값일 수 있으므로 다음에 다시 묻게 둔다
+        if e.asked.is_some() {
+            e.asked = Some(Instant::now());
+        }
         e.space = space_of(p.space);
         if p.fs.is_some() {
             e.fs = p.fs;
@@ -224,5 +229,30 @@ mod tests {
             v.wait_reply();
             assert_eq!(v.space("D:\\"), Space::Known(100 * GB, 70 * GB));
         }
+    }
+
+    #[test]
+    fn ttl_counts_from_the_reply_unless_marked_stale_while_asking() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let mut v = Volumes::with_probe(None, Arc::new(move |_| {
+            counted.fetch_add(1, Relaxed);
+            Probe { space: None, fs: None }
+        }));
+        // 끊긴 네트워크 드라이브처럼 답이 TTL보다 늦게 와도 받자마자 다시 묻지 않는다
+        v.space("Z:\\");
+        v.entries.get_mut("Z:\\").unwrap().asked = Some(Instant::now() - SPACE_TTL);
+        v.wait_reply();
+        assert_eq!(v.space("Z:\\"), Space::Unavailable);
+        assert!(!v.entries["Z:\\"].busy && calls.load(Relaxed) == 1, "asked again right after a slow reply");
+        // 조회 중에 바뀐 것으로 표시하면 그 답을 받은 뒤 다시 묻는다
+        v.mark_stale();
+        v.space("Z:\\");
+        v.mark_stale();
+        v.wait_reply();
+        v.space("Z:\\");
+        assert!(v.entries["Z:\\"].busy, "a reply that started before mark_stale is not fresh");
+        v.wait_reply();
+        assert_eq!(calls.load(Relaxed), 3);
     }
 }

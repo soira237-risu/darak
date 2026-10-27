@@ -4737,7 +4737,8 @@ mod tests {
                 },
             })
             .collect();
-        app.drives_at = Instant::now();
+        // 느린 기기에서 3초가 지나도 welcome이 이 기기의 실제 목록으로 바꾸지 않게 한다
+        app.drives_at = Instant::now() + Duration::from_secs(3600);
         // 답이 오기 전: 기다리지 않고 '확인 중'으로 그린다. 이동식은 답이 올 때까지 숨긴다
         let output = full_frame(&ctx, &mut app, vec![], 0.0);
         assert!(has_removal_text(&output, "용량 확인 중…"));
