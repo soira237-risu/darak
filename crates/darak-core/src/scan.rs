@@ -252,7 +252,7 @@ pub fn explorer_exe() -> std::path::PathBuf {
 }
 
 /// 인자 하나를 Windows 명령줄 규칙(CommandLineToArgvW·Rust std와 같음)에 맞게 따옴표로 감싼다.
-/// 따옴표 앞과 끝의 백슬래시만 두 배로 쓴다 (`C:\` → `"C:\\"`, `E:\Claude` → `"E:\Claude"`).
+/// 따옴표 앞과 끝의 백슬래시만 두 배로 쓴다 (`C:\` → `"C:\\"`, `D:\Projects` → `"D:\Projects"`).
 pub fn quote_arg(arg: &str) -> String {
     let mut out = String::with_capacity(arg.len() + 2);
     out.push('"');
@@ -290,7 +290,7 @@ pub fn relaunch_as_admin(root: Option<&str>) -> bool {
     r as isize > 32
 }
 
-/// `c:` → `C:\`, 끝의 `\` 정리. 붙여 넣은 경로의 앞뒤 따옴표(`"E:\Claude"`)도 지운다.
+/// `c:` → `C:\`, 끝의 `\` 정리. 붙여 넣은 경로의 앞뒤 따옴표(`"D:\Projects"`)도 지운다.
 pub fn normalize_root(root: &str) -> String {
     let mut s = root.trim().trim_matches('"').trim().replace('/', "\\");
     let drive_offset = if s.starts_with(r"\\?\") { 4 } else { 0 };
@@ -1057,7 +1057,7 @@ mod tests {
     #[test]
     fn normalize_root_strips_pasted_quotes() {
         // 탐색기 '경로로 복사'의 따옴표, 예전 재실행 버그가 넘기던 `C:"`
-        for (input, expected) in [("\"E:\\Claude\"", r"E:\Claude"), ("C:\"", r"C:\"), ("\"d:\\\"", r"D:\"),
+        for (input, expected) in [("\"D:\\Projects\"", r"D:\Projects"), ("C:\"", r"C:\"), ("\"d:\\\"", r"D:\"),
             (" \"D:\\My Games\\\" ", r"D:\My Games")] {
             assert_eq!(normalize_root(input), expected, "{input}");
         }
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn quote_arg_round_trips_through_command_line_to_argv() {
-        for arg in [r"C:\", r"c:\\", r"E:\Claude", r"D:\My Games\", r"\\server\share\", r"\\?\C:\", r"C:\한글 폴더\",
+        for arg in [r"C:\", r"c:\\", r"D:\Projects", r"D:\My Games\", r"\\server\share\", r"\\?\C:\", r"C:\한글 폴더\",
             r#"a"b"#, r#"a\"b"#, r#"a\\"b\"#, "", r"tail\\", " "] {
             assert_eq!(split_command_line(&format!("darak.exe {}", quote_arg(arg))), ["darak.exe", arg], "{arg}");
         }
@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn quote_arg_escapes_only_backslashes_before_quotes() {
         assert_eq!(quote_arg(r"C:\"), r#""C:\\""#);
-        assert_eq!(quote_arg(r"E:\Claude"), r#""E:\Claude""#);
+        assert_eq!(quote_arg(r"D:\Projects"), r#""D:\Projects""#);
         assert_eq!(quote_arg(r"\\server\share"), r#""\\server\share""#);
         assert_eq!(quote_arg(r"D:\My Games\"), r#""D:\My Games\\""#);
         assert_eq!(quote_arg(r#"a\"b"#), r#""a\\\"b""#);
