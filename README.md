@@ -37,6 +37,8 @@ cargo build --release -p darak
 
 MFT 스캔을 쓰려면 앱 안의 '관리자로 실행'을 누르거나 관리자 권한으로 실행합니다.
 
+직접 빌드하지 않아도 됩니다. GitHub Actions의 [Windows build](https://github.com/soira237-risu/darak/actions/workflows/build.yml) 실행 결과(Artifacts)에서 main의 최신 `darak.exe`를 받을 수 있습니다(GitHub 로그인 필요). 서명되지 않은 파일이라 처음 실행할 때 SmartScreen 경고가 뜰 수 있습니다.
+
 ## 키보드
 
 | 키 | 동작 |
@@ -74,7 +76,7 @@ docs/PLAN.md    설계 문서와 진행 상황
 
 ## 개발
 
-CI(`.github/workflows/windows.yml`)와 같은 검사입니다.
+PR과 main 푸시마다 GitHub Actions가 아래 검사(`windows.yml`)와 릴리스 빌드(`build.yml`)를 돌립니다. 로컬에서 같은 검사를 하려면:
 
 ```powershell
 cargo test --workspace

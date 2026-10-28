@@ -1,0 +1,89 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # 받는 사람 PC에 VC++ 재배포 패키지가 없어도 돌도록 CRT를 정적으로 링크한다.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0 --profile minimal
+      - name: Select Rust
+        run: rustup default 1.99.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-crt-static
+      - name: Build release
+        run: cargo build --locked --release -p darak -p darak-cli
+      - name: Check for no VC runtime dependency
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $dumpbin = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { throw 'dumpbin not found' }
+          foreach ($exe in 'darak.exe', 'darak-cli.exe') {
+            $deps = & $dumpbin /nologo /dependents "target/release/$exe" | Out-String
+            Write-Output "$exe`n$deps"
+            if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') { throw "$exe depends on the VC runtime" }
+          }
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $name = if ('${{ github.ref_type }}' -eq 'tag') { 'darak-${{ github.ref_name }}-windows-x64' } else { "darak-$('${{ github.sha }}'.Substring(0, 7))-windows-x64" }
+          $dir = "dist/$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target/release/darak.exe, target/release/darak-cli.exe, LICENSE, README.md $dir
+          Compress-Archive -Path "$dir/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Encoding ascii "dist/$name.zip.sha256"
+          Get-Content "dist/$name.zip.sha256"
+          "name=$name" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.name }}/
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: github.ref_type == 'tag'
+        with:
+          name: release-files
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  # 태그를 올리면 초안 릴리스만 만든다. 공개는 사람이 GitHub에서 직접 한다.
+  draft-release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-files
+          path: dist
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/* --repo "${{ github.repository }}" --draft --verify-tag --title "${{ github.ref_name }}" --generate-notes
