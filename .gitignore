@@ -1,3 +1,4 @@
 /target
 *.snap
 /ci-diagnostics
+/THIRD-PARTY-LICENSES.html

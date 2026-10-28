@@ -1,0 +1,18 @@
+# cargo-about 설정: 릴리스 zip에 넣을 THIRD-PARTY-LICENSES.html을 만든다 (build.yml).
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Zlib",
+    "Unlicense",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "ISC",
+    "0BSD",
+    "Unicode-3.0",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+]
+targets = ["x86_64-pc-windows-msvc"]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
