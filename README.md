@@ -38,7 +38,7 @@ cargo build --release -p darak
 
 MFT 스캔을 쓰려면 앱 안의 '관리자로 실행'을 누르거나 관리자 권한으로 실행합니다.
 
-직접 빌드하지 않아도 됩니다. GitHub Actions의 [Windows build](https://github.com/soira237-risu/darak/actions/workflows/build.yml) 실행 결과(Artifacts)에서 main의 최신 `darak.exe`를 받을 수 있습니다(GitHub 로그인 필요). 서명되지 않은 파일이라 처음 실행할 때 SmartScreen 경고가 뜰 수 있습니다.
+직접 빌드하지 않아도 됩니다. [Releases](https://github.com/soira237-risu/darak/releases/latest)에서 zip을 받아 풀고 `darak.exe`를 실행하세요. 설치나 VC++ 재배포 패키지가 필요 없습니다. 서명되지 않은 파일이라 처음 실행할 때 SmartScreen 경고가 뜰 수 있고, zip과 함께 올린 `.sha256`으로 파일이 맞는지 확인할 수 있습니다. 릴리스 전 main의 최신 빌드는 GitHub Actions의 [Windows build](https://github.com/soira237-risu/darak/actions/workflows/build.yml) 실행 결과(Artifacts)에 있습니다(GitHub 로그인 필요).
 
 ## 키보드
 

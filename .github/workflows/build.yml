@@ -43,6 +43,17 @@ jobs:
             Write-Output "$exe`n$deps"
             if ($deps -match '(?i)vcruntime|msvcp|api-ms-win-crt') { throw "$exe depends on the VC runtime" }
           }
+      - name: Check tag matches the crate version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --format-version 1 --no-deps | ConvertFrom-Json).packages | Where-Object name -eq 'darak' | ForEach-Object version
+          if ('${{ github.ref_name }}' -ne "v$version") { throw "Tag ${{ github.ref_name }} does not match darak $version" }
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+      - name: Collect third-party licenses
+        run: cargo about generate --locked -c .github/licenses/about.toml -o THIRD-PARTY-LICENSES.html .github/licenses/about.hbs
       - name: Package
         id: package
         shell: pwsh
@@ -50,7 +61,7 @@ jobs:
           $name = if ('${{ github.ref_type }}' -eq 'tag') { 'darak-${{ github.ref_name }}-windows-x64' } else { "darak-$('${{ github.sha }}'.Substring(0, 7))-windows-x64" }
           $dir = "dist/$name"
           New-Item -ItemType Directory -Force $dir | Out-Null
-          Copy-Item target/release/darak.exe, target/release/darak-cli.exe, LICENSE, README.md $dir
+          Copy-Item target/release/darak.exe, target/release/darak-cli.exe, LICENSE, README.md, THIRD-PARTY-LICENSES.html $dir
           Compress-Archive -Path "$dir/*" -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLower()
           "$hash  $name.zip" | Set-Content -Encoding ascii "dist/$name.zip.sha256"
