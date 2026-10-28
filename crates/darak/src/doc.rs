@@ -114,7 +114,7 @@ impl Doc {
         self.search.query = c.query;
         self.search.in_focus_only = c.in_focus_only;
         self.search.highlight = c.highlight;
-        // TODO(PR18): 범위를 복원한 focus에 고정한다 (self.set_search_scope(c.in_focus_only))
+        // TODO: 범위를 복원한 focus에 고정한다 (self.set_search_scope(c.in_focus_only))
     }
 
     pub fn navigate(&mut self, to: NodeId) {

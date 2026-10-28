@@ -488,7 +488,7 @@ impl App {
     }
 
     /// 표시를 모두 지우고, 6초 동안 되돌릴 수 있는 안내를 띄운다.
-    // TODO(PR13): 검토 창 왼쪽 아래의 '목록 비우기'도 이 함수를 부른다 (버튼 자리는 PR13에서 정한다)
+    // TODO: 검토 창 왼쪽 아래의 '목록 비우기'도 이 함수를 부른다
     fn clear_marks(&mut self) {
         if self.pending_removal.is_some() { return; }
         let Some(doc) = &mut self.doc else { return };
@@ -781,7 +781,7 @@ impl App {
         #[cfg(feature = "perf")]
         let mut table_draw = None;
         self.volumes.poll();
-        // TODO(PR9): 끝났으면 창이 비활성일 때 작업 표시줄로 알리고 창 제목을 바꾼다
+        // TODO: 끝났으면 창이 비활성일 때 작업 표시줄로 알리고 창 제목을 바꾼다
         self.poll_scan();
         self.poll_preview();
         self.fill_progress_basis();
@@ -903,7 +903,7 @@ impl App {
                 self.request_scan(self.root_input.clone());
             }
 
-            // 상태는 admin_relaunch()가 정한다 (자리는 PR12에서 환영 화면·상태 바로 옮긴다)
+            // 상태는 admin_relaunch()가 정한다
             let relaunch = tr("🛡 관리자로 실행", "🛡 Run as administrator");
             match self.admin_relaunch() {
                 AdminRelaunch::Hidden => {}
