@@ -1,0 +1,48 @@
+name: Commit identity
+
+# 커밋 작성자·커미터 메일이 공개용 주소(GitHub noreply 등)인지 확인한다.
+# 개인 메일이 들어간 커밋이 있으면 실패하고, 로그에는 메일 대신 커밋과 칸 이름만 남긴다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  identity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check commit emails
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -z "$BEFORE" ] || [ "$BEFORE" = 0000000000000000000000000000000000000000 ]; then
+            range="$AFTER"
+          else
+            range="$BEFORE..$AFTER"
+          fi
+          bad=0
+          while read -r sha author committer; do
+            for pair in "author:$author" "committer:$committer"; do
+              email="${pair#*:}"
+              case "$email" in
+                *@users.noreply.github.com|noreply@github.com|noreply@anthropic.com) ;;
+                *) echo "::error::${sha:0:7} ${pair%%:*} email is not a public noreply address"; bad=1 ;;
+              esac
+            done
+          done < <(git log --format='%H %ae %ce' "$range")
+          if [ "$bad" = 0 ]; then echo "All commit emails in $range are noreply addresses."; fi
+          exit "$bad"
