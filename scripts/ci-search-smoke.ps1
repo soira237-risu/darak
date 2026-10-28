@@ -2,7 +2,7 @@
 # This script intentionally requires PowerShell 7 (ProcessStartInfo.ArgumentList).
 param([Parameter(Mandatory = $true)][string]$OutDir)
 $ErrorActionPreference = 'Stop'
-$baselineSha = '67c7fe0026f113045562eb5727b4a580817f6bfe'
+$baselineSha = '6d5fd1ce0384a228401f74567d156e12f757fd85'
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $outPath = (Resolve-Path $OutDir).Path
