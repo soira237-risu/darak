@@ -52,7 +52,8 @@ pub struct Tokens {
     pub accent: Color32,
     /// 호버한 폴더 제목 바에 섞는 색
     pub accent_hover: Color32,
-    /// 앰버 면 위의 글자
+    /// 앰버 면 위의 글자 (보드 토큰, 앰버 면을 쓰는 화면이 아직 없다)
+    #[allow(dead_code)]
     pub on_accent: Color32,
     /// 강조 버튼 (화면당 하나)
     pub primary_fill: Color32,
@@ -206,11 +207,13 @@ pub const LIGHT: Tokens = Tokens {
 pub const BODY: f32 = 13.0;
 /// caption 12/16 · 상태 바 · 보조 설명
 pub const CAPTION: f32 = 12.0;
-/// heading 16/22/600 · 패널 제목
+/// heading 16/22/600 · 패널 제목 (보드의 사이드 패널은 아직 계획)
+#[allow(dead_code)]
 pub const HEADING: f32 = 16.0;
 /// title 20/28/600 · 환영 화면 · 대화상자 제목
 pub const TITLE: f32 = 20.0;
-/// display 28/34/600
+/// display 28/34/600 (드라이브 용량 카드, 아직 쓰는 화면 없음)
+#[allow(dead_code)]
 pub const DISPLAY: f32 = 28.0;
 /// mono 12/16 · 경로 · 바이트 수 · 검색 문법
 pub const MONO: f32 = 12.0;
@@ -339,12 +342,14 @@ pub fn title(ui: &Ui, text: impl Into<String>) -> RichText {
     semibold(ui, text).size(TITLE)
 }
 
-/// heading 16/600: 패널 제목 · 스캔 화면 제목
+/// heading 16/600: 패널 제목
+#[allow(dead_code)]
 pub fn heading(ui: &Ui, text: impl Into<String>) -> RichText {
     semibold(ui, text).size(HEADING)
 }
 
 /// display 28/600
+#[allow(dead_code)]
 pub fn display(ui: &Ui, text: impl Into<String>) -> RichText {
     semibold(ui, text).size(DISPLAY)
 }
@@ -615,8 +620,12 @@ pub fn crumb_separator(ui: &mut Ui) -> Response {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tone {
     Neutral,
+    // 보드 「배지」의 색조 배지. 지금 화면은 경고를 글자색으로만 쓴다.
+    #[allow(dead_code)]
     Danger,
+    #[allow(dead_code)]
     Warn,
+    #[allow(dead_code)]
     Ok,
 }
 
