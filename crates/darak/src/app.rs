@@ -24,7 +24,7 @@ use darak_core::search::{Query, now_secs2000};
 use crate::search_panel;
 use crate::settings::{self, LangPref};
 use crate::theme;
-use darak_core::i18n::{set_lang, tr};
+use darak_core::i18n::{plural, set_lang, tr};
 use darak_core::tr;
 use crate::treemap::{self, Detail, Highlights, Item, ItemKind, Layout, LayoutSource, Morph, MorphKey, Style, ZoomAnim};
 
@@ -221,11 +221,11 @@ impl App {
     /// 새 스캔을 시작할 수 없는 까닭 (스캔 시작 컨트롤의 툴팁). 시작할 수 있으면 None.
     fn scan_blocked(&self) -> Option<&'static str> {
         if self.scanning.is_some() {
-            Some("스캔 중에는 새로 시작할 수 없습니다 · 스캔 화면에서 먼저 중지하세요")
+            Some(tr("스캔 중에는 새로 시작할 수 없습니다 · 스캔 화면에서 먼저 중지하세요", "Can't start a new scan while scanning · Stop it on the scan screen first"))
         } else if self.delete_dialog.is_some() || self.pending_removal.is_some() {
-            Some("삭제를 마친 뒤에 스캔할 수 있습니다")
+            Some(tr("삭제를 마친 뒤에 스캔할 수 있습니다", "You can scan after the deletion finishes"))
         } else if self.confirm.is_some() {
-            Some("확인 창에 먼저 답하세요")
+            Some(tr("확인 창에 먼저 답하세요", "Answer the confirmation first"))
         } else {
             None
         }
@@ -273,7 +273,10 @@ impl App {
                     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         scan(&root, &ScanOptions::default(), &progress)
                     }))
-                    .unwrap_or_else(|p| Err(io::Error::other(format!("스캔 중 내부 오류: {}", panic_text(&*p)))));
+                    .unwrap_or_else(|p| {
+                        let p = panic_text(&*p);
+                        Err(io::Error::other(tr!("스캔 중 내부 오류: {p}", "Internal error during scan: {p}")))
+                    });
                     let _ = tx.send(res);
                 })
                 .expect("스캔 스레드 생성 실패");
@@ -400,7 +403,7 @@ impl App {
             self.morph.invalidate();
             self.root_input = doc.tree.name(Tree::ROOT).to_owned();
             self.scanning = None;
-            self.toast("스캔을 중지했습니다 · 이전 결과를 그대로 보여 줍니다");
+            self.toast(tr("스캔을 중지했습니다 · 이전 결과를 그대로 보여 줍니다", "Scan stopped · Showing the previous results"));
         } else {
             let result = s.rx.try_recv();
             if !matches!(result, Err(mpsc::TryRecvError::Empty)) {
@@ -410,11 +413,11 @@ impl App {
             match result {
                 Ok(Ok(res)) if stopped && res.tree.node(Tree::ROOT).child_count == 0 => {
                     self.scanning = None;
-                    self.toast("스캔을 중지했습니다");
+                    self.toast(tr("스캔을 중지했습니다", "Scan stopped"));
                 }
                 Ok(Err(_)) if stopped => {
                     self.scanning = None;
-                    self.toast("스캔을 중지했습니다");
+                    self.toast(tr("스캔을 중지했습니다", "Scan stopped"));
                 }
                 Ok(Ok(res)) => {
                     // 같은 루트를 다시 스캔했으면 보던 위치와 검색 설정을 이어 간다
@@ -449,7 +452,7 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.error = Some("스캔 스레드가 비정상 종료했습니다".into());
+                    self.error = Some(tr("스캔 스레드가 비정상 종료했습니다", "The scan thread exited unexpectedly").into());
                     self.scanning = None;
                     finished = true;
                 }
@@ -476,7 +479,10 @@ impl App {
         match doc.toggle_mark(id) {
             Ok(0) => {}
             // 상위 폴더 표시가 안쪽 표시를 흡수했다 (상위 표시를 풀어도 돌아오지 않으므로 알린다)
-            Ok(n) => self.toast(format!("안쪽 표시 {}개를 이 폴더 표시에 합쳤습니다", thousands(n as u64))),
+            Ok(n) => {
+                let (k, marks) = (thousands(n as u64), plural(n as u64, "mark", "marks"));
+                self.toast(tr!("안쪽 표시 {k}개를 이 폴더 표시에 합쳤습니다", "Merged {k} inner {marks} into this folder's mark"));
+            }
             Err(e) => self.toast(e),
         }
     }
@@ -489,8 +495,9 @@ impl App {
         if doc.marks.is_empty() { return; }
         let undo = ClearedMarks { doc_id: doc.id, version: doc.tree.version, marks: std::mem::take(&mut doc.marks) };
         doc.clear_marks();
+        let (k, marks) = (thousands(undo.marks.len() as u64), plural(undo.marks.len() as u64, "mark", "marks"));
         self.toast = Some(Toast {
-            msg: format!("표시 {}개를 모두 해제했습니다", thousands(undo.marks.len() as u64)),
+            msg: tr!("표시 {k}개를 모두 해제했습니다", "Cleared {k} {marks}"),
             at: Instant::now(),
             undo: Some(undo),
         });
@@ -524,16 +531,19 @@ impl App {
             return AdminRelaunch::Hidden;
         }
         if self.scanning.is_some() {
-            return AdminRelaunch::Blocked("스캔을 중지하거나 끝난 뒤에 다시 실행할 수 있습니다");
+            return AdminRelaunch::Blocked(tr("스캔을 중지하거나 끝난 뒤에 다시 실행할 수 있습니다", "You can relaunch after the scan stops or finishes"));
         }
         if self.delete_dialog.is_some() || self.pending_removal.is_some() {
-            return AdminRelaunch::Blocked("삭제를 마친 뒤에 다시 실행할 수 있습니다");
+            return AdminRelaunch::Blocked(tr("삭제를 마친 뒤에 다시 실행할 수 있습니다", "You can relaunch after the deletion finishes"));
         }
         let Some(doc) = &self.doc else { return AdminRelaunch::Ready(None) };
         let root = doc.tree.name(Tree::ROOT);
         if is_network(root, &self.drives) {
             return AdminRelaunch::Blocked(
-                "네트워크 위치는 관리자 권한으로 빨라지지 않고, 관리자 창에서는 연결된 드라이브가 보이지 않을 수 있습니다",
+                tr(
+                    "네트워크 위치는 관리자 권한으로 빨라지지 않고, 관리자 창에서는 연결된 드라이브가 보이지 않을 수 있습니다",
+                    "Administrator rights don't speed up network locations, and mapped drives may not show in an administrator window",
+                ),
             );
         }
         AdminRelaunch::Ready(Some(root.to_owned()))
@@ -553,7 +563,7 @@ impl App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         } else {
             // UAC 창에서 취소한 경우도 여기로 온다
-            self.toast("관리자 권한으로 다시 열지 않았습니다");
+            self.toast(tr("관리자 권한으로 다시 열지 않았습니다", "Didn't relaunch as administrator"));
         }
     }
 }
@@ -863,7 +873,7 @@ impl App {
         };
         ui.horizontal(|ui| {
             let mut chosen = None;
-            why(ui.add_enabled_ui(can_scan, |ui| egui::ComboBox::from_id_salt("drive").selected_text("드라이브").width(90.0).show_ui(ui, |ui| {
+            why(ui.add_enabled_ui(can_scan, |ui| egui::ComboBox::from_id_salt("drive").selected_text(tr("드라이브", "Drive")).width(90.0).show_ui(ui, |ui| {
                 for d in &self.drives {
                     // 용량은 캐시에서 읽는다 (환영 카드와 같은 규칙으로 매체 없는 이동식은 숨긴다)
                     let space = self.volumes.space(&d.root);
@@ -880,28 +890,28 @@ impl App {
                 self.request_scan(r);
             }
 
-            let edit = why(ui.add_enabled(can_scan, egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text("스캔할 경로")));
+            let edit = why(ui.add_enabled(can_scan, egui::TextEdit::singleline(&mut self.root_input).desired_width(260.0).hint_text(tr("스캔할 경로", "Path to scan"))));
             theme::focus_ring(ui, &edit);
             // Enter는 여기서 쓰고 지운다 (keyboard()가 선택한 항목을 열거나 확대하지 않게)
             let enter = edit.lost_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
 
-            if why(ui.add_enabled(can_scan, egui::Button::new("📁 폴더…"))).clicked()
+            if why(ui.add_enabled(can_scan, egui::Button::new(tr("📁 폴더…", "📁 Folder…")))).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.request_scan(dir.display().to_string());
                 }
-            if why(ui.add_enabled(can_scan, egui::Button::new("🔍 스캔"))).clicked() || enter {
+            if why(ui.add_enabled(can_scan, egui::Button::new(tr("🔍 스캔", "🔍 Scan")))).clicked() || enter {
                 self.request_scan(self.root_input.clone());
             }
 
             // 상태는 admin_relaunch()가 정한다 (자리는 PR12에서 환영 화면·상태 바로 옮긴다)
-            const RELAUNCH: &str = "🛡 관리자로 실행";
+            let relaunch = tr("🛡 관리자로 실행", "🛡 Run as administrator");
             match self.admin_relaunch() {
                 AdminRelaunch::Hidden => {}
                 AdminRelaunch::Blocked(why) => {
-                    ui.add_enabled(false, egui::Button::new(RELAUNCH)).on_disabled_hover_text(why);
+                    ui.add_enabled(false, egui::Button::new(relaunch)).on_disabled_hover_text(why);
                 }
                 AdminRelaunch::Ready(root) => {
-                    if ui.button(RELAUNCH).on_hover_text(relaunch_hint(root.as_deref())).clicked() {
+                    if ui.button(relaunch).on_hover_text(relaunch_hint(root.as_deref())).clicked() {
                         self.request_relaunch(ui.ctx(), root);
                     }
                 }
@@ -909,9 +919,9 @@ impl App {
 
             ui.separator();
             let before = self.mode;
-            ui.selectable_value(&mut self.mode, SizeMode::Allocated, "할당 크기")
-                .on_hover_text("디스크에서 실제로 차지하는 크기 (삭제하면 비는 공간)");
-            ui.selectable_value(&mut self.mode, SizeMode::Logical, "논리 크기").on_hover_text("파일 내용의 바이트 수");
+            ui.selectable_value(&mut self.mode, SizeMode::Allocated, tr("할당 크기", "Allocated size"))
+                .on_hover_text(tr("디스크에서 실제로 차지하는 크기 (삭제하면 비는 공간)", "Space actually used on disk (freed when deleted)"));
+            ui.selectable_value(&mut self.mode, SizeMode::Logical, tr("논리 크기", "Logical size")).on_hover_text(tr("파일 내용의 바이트 수", "Bytes of file content"));
             if before != self.mode {
                 if let Some(doc) = &mut self.doc { doc.search.note_edit(Instant::now()); }
                 self.layout.invalidate();
@@ -919,15 +929,16 @@ impl App {
             ui.separator();
             if ui
                 .add_enabled(self.detail.level() > Detail::MIN, egui::Button::new("－"))
-                .on_hover_text("덜 자세히: 큰 박스만 ([ 또는 -)")
+                .on_hover_text(tr("덜 자세히: 큰 박스만 ([ 또는 -)", "Less detail: large boxes only ([ or -)"))
                 .clicked()
             {
                 self.detail = self.detail.less();
             }
-            ui.label(format!("상세도 {}/{}", self.detail.level(), Detail::MAX));
+            let (level, max) = (self.detail.level(), Detail::MAX);
+            ui.label(tr!("상세도 {level}/{max}", "Detail {level}/{max}"));
             if ui
                 .add_enabled(self.detail.level() < Detail::MAX, egui::Button::new("＋"))
-                .on_hover_text("더 자세히: 작은 폴더와 파일까지 (] 또는 +)")
+                .on_hover_text(tr("더 자세히: 작은 폴더와 파일까지 (] 또는 +)", "More detail: down to small folders and files (] or +)"))
                 .clicked()
             {
                 self.detail = self.detail.more();
@@ -939,7 +950,7 @@ impl App {
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut doc.search.query)
                         .desired_width(240.0)
-                        .hint_text("🔎 검색  (예: *.mp4 size:>1gb)"),
+                        .hint_text(tr("🔎 검색  (예: *.mp4 size:>1gb)", "🔎 Search  (e.g. *.mp4 size:>1gb)")),
                 );
                 theme::focus_ring(ui, &resp);
                 if self.focus_search {
@@ -957,17 +968,19 @@ impl App {
                     doc.search.note_edit(Instant::now());
                     doc.search.query.clear();
                 }
-                resp.on_hover_text(
+                resp.on_hover_text(tr(
                     "이름 일부, *.확장자, ext:mp4;mkv, size:>1gb, size:<10mb,\ndm:<7d (최근 7일 수정), dm:>1y, path:단어, file:, folder:, !제외어",
-                );
+                    "Part of a name, *.ext, ext:mp4;mkv, size:>1gb, size:<10mb,\ndm:<7d (modified in the last 7 days), dm:>1y, path:word, file:, folder:, !exclude",
+                ));
 
                 if !doc.marks.is_empty() {
                     ui.separator();
-                    let txt = format!("🗑 표시 {}개 · {}  검토…", doc.marks.len(), human_size(doc.marked_size(self.mode)));
+                    let (n, size) = (doc.marks.len(), human_size(doc.marked_size(self.mode)));
+                    let txt = tr!("🗑 표시 {n}개 · {size}  검토…", "🗑 {n} marked · {size}  Review…");
                     if ui.add_enabled(filesystem_actions_enabled(doc) && self.scanning.is_none() && self.delete_dialog.is_none() && self.pending_removal.is_none(), egui::Button::new(RichText::new(txt).color(Color32::WHITE)).fill(theme::of(ui).danger_fill)).clicked() {
                         review = true;
                     }
-                    if ui.add_enabled(self.pending_removal.is_none(), egui::Button::new("표시 모두 해제").small()).clicked() {
+                    if ui.add_enabled(self.pending_removal.is_none(), egui::Button::new(tr("표시 모두 해제", "Clear all marks")).small()).clicked() {
                         clear = true;
                     }
                 }
@@ -985,21 +998,21 @@ impl App {
         if self.scanning.is_none() && let Some(doc) = &mut self.doc {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                if ui.add_enabled(!doc.back.is_empty(), egui::Button::new("⬅")).on_hover_text("뒤로 (Alt+←)").clicked() {
+                if ui.add_enabled(!doc.back.is_empty(), egui::Button::new("⬅")).on_hover_text(tr("뒤로 (Alt+←)", "Back (Alt+←)")).clicked() {
                     doc.go_back();
                 }
-                if ui.add_enabled(!doc.forward.is_empty(), egui::Button::new("➡")).on_hover_text("앞으로 (Alt+→)").clicked()
+                if ui.add_enabled(!doc.forward.is_empty(), egui::Button::new("➡")).on_hover_text(tr("앞으로 (Alt+→)", "Forward (Alt+→)")).clicked()
                 {
                     doc.go_forward();
                 }
                 if ui
                     .add_enabled(doc.focus != Tree::ROOT, egui::Button::new("⬆"))
-                    .on_hover_text("상위 폴더 (Alt+↑)")
+                    .on_hover_text(tr("상위 폴더 (Alt+↑)", "Up one level (Alt+↑)"))
                     .clicked()
                 {
                     doc.go_up();
                 }
-                rescan = why(ui.add_enabled(can_scan, egui::Button::new("↻")).on_hover_text("다시 스캔 (F5)")).clicked();
+                rescan = why(ui.add_enabled(can_scan, egui::Button::new("↻")).on_hover_text(tr("다시 스캔 (F5)", "Rescan (F5)"))).clicked();
                 ui.separator();
                 let chain = doc.tree.ancestry(doc.focus);
                 let mut go = None;
@@ -1026,14 +1039,10 @@ impl App {
                 }
                 let f = doc.tree.node(doc.focus);
                 let note = incomplete_note(doc, doc.focus);
+                let (amount, warn) = (human_size(f.size(self.mode)), if note.is_some() { " ⚠" } else { "" });
+                let (files, fw) = (thousands(f.files as u64), plural(f.files as u64, "file", "files"));
                 let size = ui.label(
-                    RichText::new(format!(
-                        "  {}{}  ·  {} 파일",
-                        human_size(f.size(self.mode)),
-                        if note.is_some() { " ⚠" } else { "" },
-                        thousands(f.files as u64)
-                    ))
-                    .weak(),
+                    RichText::new(tr!("  {amount}{warn}  ·  {files} 파일", "  {amount}{warn}  ·  {files} {fw}")).weak(),
                 );
                 if let Some(note) = note {
                     size.on_hover_text(note);
@@ -1078,56 +1087,64 @@ impl App {
         ui.horizontal(|ui| {
             // 아래의 조기 반환보다 앞이라 오류·스캔 중·문서 없음 상태에서도 보인다
             if self.elevated {
-                theme::badge(ui, "관리자 권한").on_hover_text(
+                theme::badge(ui, tr("관리자 권한", "Administrator")).on_hover_text(tr(
                     "관리자 권한으로 실행 중입니다. 파일은 직접 열지 않고 탐색기에서 위치를 보여 주며, \
                      설치된 프로그램 폴더와 다른 사용자의 프로필 기본 폴더는 삭제 표시할 수 없습니다",
-                );
+                    "Running as administrator. Files are shown in File Explorer instead of being opened, and \
+                     installed programs folders and other users' profile default folders can't be marked for deletion",
+                ));
             }
             if let Some(e) = &self.error {
                 ui.colored_label(theme::of(ui).danger_text, format!("⚠ {e}"));
                 return;
             }
             if self.pending_removal.is_some() {
-                ui.label("삭제 결과를 반영하는 중입니다…");
+                ui.label(tr("삭제 결과를 반영하는 중입니다…", "Applying the deletion results…"));
                 return;
             }
             // 진행 애니메이션은 스캔 화면의 막대 하나만 둔다
             if let Some(s) = &self.scanning {
                 if s.progress.is_cancelled() {
-                    ui.label("중지하는 중…");
+                    ui.label(tr("중지하는 중…", "Stopping…"));
                 } else {
-                    ui.label(format!("{} 스캔 중… {:.1}s", s.root, s.started.elapsed().as_secs_f32()));
+                    let (root, secs) = (&s.root, s.started.elapsed().as_secs_f32());
+                    ui.label(tr!("{root} 스캔 중… {secs:.1}s", "Scanning {root}… {secs:.1}s"));
                 }
                 // 스캔하는 동안 이전 문서를 들고 있다는 것을 알린다
                 if let Some(doc) = &self.doc {
-                    ui.label(RichText::new(format!("· 중지하면 {}의 이전 결과로 돌아갑니다", doc.tree.name(Tree::ROOT))).weak());
+                    let root = doc.tree.name(Tree::ROOT);
+                    ui.label(RichText::new(tr!("· 중지하면 {root}의 이전 결과로 돌아갑니다", "· Stopping returns to the previous results for {root}")).weak());
                 }
                 return;
             }
             let Some(doc) = &self.doc else {
-                ui.label("드라이브나 폴더를 골라 스캔하세요.");
+                ui.label(tr("드라이브나 폴더를 골라 스캔하세요.", "Pick a drive or folder to scan."));
                 return;
             };
             let st = &doc.stats;
-            ui.label(format!("{} 파일 · {} 폴더 · {:.2}s", thousands(st.files), thousands(st.dirs), st.elapsed.as_secs_f64()));
+            let (files, dirs, secs) = (thousands(st.files), thousands(st.dirs), st.elapsed.as_secs_f64());
+            let (fw, dw) = (plural(st.files, "file", "files"), plural(st.dirs, "folder", "folders"));
+            ui.label(tr!("{files} 파일 · {dirs} 폴더 · {secs:.2}s", "{files} {fw} · {dirs} {dw} · {secs:.2}s"));
             // 일반 스캔으로 바꾼 이유는 호버하지 않아도 배지에 보인다
             let (badge, hint) = method_badge(st);
             theme::badge(ui, badge).on_hover_text(hint);
-            ui.label(RichText::new(format!("· {} 스캔", scanned_label(doc.scanned_at))).weak());
+            let when = scanned_label(doc.scanned_at);
+            ui.label(RichText::new(tr!("· {when} 스캔", "· Scanned {when}")).weak());
             if st.errors > 0 {
-                let label = if st.method == ScanMethod::Mft { "연결 끊긴 레코드" } else { "접근 실패" };
+                let label = if st.method == ScanMethod::Mft { tr("연결 끊긴 레코드", "Orphaned records") } else { tr("접근 실패", "Access failures") };
                 ui.label(format!("· {label} {}", thousands(st.errors)));
             }
             if st.cancelled {
-                ui.label("· 중지됨(일부 결과)");
+                ui.label(tr("· 중지됨(일부 결과)", "· Stopped (partial results)"));
             }
             if !doc.stale.is_empty() {
                 ui.separator();
+                let (n, fw) = (thousands(doc.stale.len() as u64), plural(doc.stale.len() as u64, "folder", "folders"));
                 ui.colored_label(
                     theme::of(ui).warn,
-                    format!("⚠ 일부만 지워진 폴더 {}개 · 크기가 실제와 다를 수 있음", thousands(doc.stale.len() as u64)),
+                    tr!("⚠ 일부만 지워진 폴더 {n}개 · 크기가 실제와 다를 수 있음", "⚠ {n} partly deleted {fw} · Sizes may be off"),
                 );
-                if ui.small_button("다시 스캔").clicked() {
+                if ui.small_button(tr("다시 스캔", "Rescan")).clicked() {
                     rescan = true;
                 }
             }
@@ -1137,11 +1154,12 @@ impl App {
             match space {
                 Space::Known(total, free) => {
                     ui.separator();
-                    ui.label(format!("여유 공간 {} / {}", human_size(free), human_size(total)));
+                    let (free, total) = (human_size(free), human_size(total));
+                    ui.label(tr!("여유 공간 {free} / {total}", "Free space {free} / {total}"));
                 }
                 Space::Unknown => {
                     ui.separator();
-                    ui.label(RichText::new("여유 공간 정보 없음").weak());
+                    ui.label(RichText::new(tr("여유 공간 정보 없음", "No free space info")).weak());
                 }
                 // 답이 오기 전이나 읽지 못했으면 비워 둔다
                 Space::Checking | Space::Unavailable => {}
@@ -1165,12 +1183,18 @@ impl App {
         let can_scan = self.can_start_scan();
         ui.add_space(40.0);
         ui.vertical_centered(|ui| {
-            ui.heading("어느 드라이브를 살펴볼까요?");
+            ui.heading(tr("어느 드라이브를 살펴볼까요?", "Which drive would you like to explore?"));
             let hint = if self.elevated {
                 // 인자 없이 다시 연 관리자 창에서 다음에 할 일
-                "관리자 권한으로 실행 중 · 로컬 NTFS 드라이브는 $MFT로 몇 초 안에 스캔합니다"
+                tr(
+                    "관리자 권한으로 실행 중 · 로컬 NTFS 드라이브는 $MFT로 몇 초 안에 스캔합니다",
+                    "Running as administrator · Local NTFS drives scan in seconds via $MFT",
+                )
             } else {
-                "관리자로 실행하면 드라이브 전체를 훨씬 빠르게 스캔합니다 (⚡ MFT)"
+                tr(
+                    "관리자로 실행하면 드라이브 전체를 훨씬 빠르게 스캔합니다 (⚡ MFT)",
+                    "Run as administrator to scan whole drives much faster (⚡ MFT)",
+                )
             };
             ui.label(RichText::new(hint).weak());
             ui.add_space(16.0);
@@ -1212,7 +1236,7 @@ impl App {
                         ui.label(RichText::new(&note).weak());
                         // 색만으로 전하지 않게 글자도 붙인다
                         if full {
-                            ui.colored_label(t.warn, "· 거의 가득 참");
+                            ui.colored_label(t.warn, tr("· 거의 가득 참", "· Almost full"));
                         }
                     });
                 });
@@ -1221,7 +1245,7 @@ impl App {
                     .interact(rect, card_id, egui::Sense::click())
                     .on_hover_cursor(egui::CursorIcon::PointingHand);
                 // 화면 낭독기가 읽을 카드 이름 (Frame만으로는 이름 없는 버튼이다)
-                let name = format!("{} {sub} · {note}{}", d.root, if full { " · 거의 가득 참" } else { "" });
+                let name = format!("{} {sub} · {note}{}", d.root, if full { tr(" · 거의 가득 참", " · Almost full") } else { "" });
                 resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, can_scan, &name));
                 if resp.hovered() != hovered {
                     ui.ctx().request_repaint();
@@ -1233,7 +1257,7 @@ impl App {
             }
             // 드라이브 전체가 아니라 폴더 하나를 볼 때 (툴바의 '폴더…'와 같다)
             ui.add_space(4.0);
-            if ui.add_enabled(can_scan, egui::Button::new("📁 폴더 선택…")).clicked()
+            if ui.add_enabled(can_scan, egui::Button::new(tr("📁 폴더 선택…", "📁 Choose folder…"))).clicked()
                 && let Some(dir) = rfd::FileDialog::new().pick_folder()
             {
                 chosen = Some(dir.display().to_string());
@@ -1254,12 +1278,13 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(t.warn, "⚠");
                 ui.label(
-                    RichText::new(
+                    RichText::new(tr(
                         "스캔을 중지한 일부 결과입니다 · 읽지 않은 폴더는 크기에서 빠져 실제보다 작게 보이고, 삭제 표시는 할 수 없습니다",
-                    )
+                        "Partial results from a stopped scan · Unread folders are left out, so sizes look smaller than they are, and nothing can be marked for deletion",
+                    ))
                     .weak(),
                 );
-                rescan = ui.add_enabled(can_scan, egui::Button::new("↻ 다시 스캔")).clicked();
+                rescan = ui.add_enabled(can_scan, egui::Button::new(tr("↻ 다시 스캔", "↻ Rescan"))).clicked();
             });
         });
         if rescan {
@@ -1292,19 +1317,27 @@ impl App {
             s.eta = Some((prev * 0.9 + r * 0.1, Instant::now()));
         }
         let eta_text = match (frac, s.eta) {
-            (Some(f), _) if f >= 0.999 => "마무리하는 중…".to_string(),
-            (Some(_), Some((v, at))) => format!("남은 시간 약 {}", fmt_duration((v - at.elapsed().as_secs_f64()).max(1.0))),
-            (Some(_), None) => "남은 시간 계산 중…".to_string(),
-            (None, _) => "남은 시간을 알 수 없습니다".to_string(),
+            (Some(f), _) if f >= 0.999 => tr("마무리하는 중…", "Finishing…").to_string(),
+            (Some(_), Some((v, at))) => {
+                let left = fmt_duration((v - at.elapsed().as_secs_f64()).max(1.0));
+                tr!("남은 시간 약 {left}", "About {left} left")
+            }
+            (Some(_), None) => tr("남은 시간 계산 중…", "Estimating time left…").to_string(),
+            (None, _) => tr("남은 시간을 알 수 없습니다", "Time left unknown").to_string(),
         };
         let bar = || match frac {
             Some(f) => egui::ProgressBar::new(f as f32).show_percentage(),
             None => egui::ProgressBar::new(0.0).animate(true),
         };
         // 중지를 눌렀다: 이전 문서가 있으면 다음 프레임에 돌아가고, 없으면 스캔 스레드가 읽은 데까지 정리하는 중이다
-        const SETTLING: &str = "읽은 데까지 정리하는 중입니다";
+        let settling = tr("읽은 데까지 정리하는 중입니다", "Wrapping up what was read so far");
         let stopping = p.is_cancelled();
-        let title = if stopping { "중지하는 중…".to_owned() } else { format!("{} 스캔 중", s.root) };
+        let title = if stopping {
+            tr("중지하는 중…", "Stopping…").to_owned()
+        } else {
+            let root = &s.root;
+            tr!("{root} 스캔 중", "Scanning {root}")
+        };
         let stop = |ui: &mut egui::Ui, button: egui::Button| {
             if ui.add_enabled(!stopping, button).clicked() {
                 p.cancel();
@@ -1322,10 +1355,10 @@ impl App {
                 ui.add_space(16.0);
                 ui.add(bar().desired_width(420.0));
                 ui.add_space(8.0);
-                let eta = if stopping { RichText::new(SETTLING).weak() } else { RichText::new(&eta_text) };
+                let eta = if stopping { RichText::new(settling).weak() } else { RichText::new(&eta_text) };
                 ui.label(eta.size(16.0));
                 ui.add_space(16.0);
-                if stop(ui, egui::Button::new("중지")) {
+                if stop(ui, egui::Button::new(tr("중지", "Stop"))) {
                     self.preview.invalidate(s.scan_id);
                 }
             });
@@ -1336,8 +1369,8 @@ impl App {
             ui.add_space(6.0);
             ui.label(RichText::new(&title).strong());
             ui.add(bar().desired_width(260.0));
-            ui.label(if stopping { RichText::new(SETTLING).weak() } else { RichText::new(&eta_text) });
-            if stop(ui, egui::Button::new("중지").small()) {
+            ui.label(if stopping { RichText::new(settling).weak() } else { RichText::new(&eta_text) });
+            if stop(ui, egui::Button::new(tr("중지", "Stop")).small()) {
                 self.preview.invalidate(s.scan_id);
             }
         });
@@ -1378,7 +1411,8 @@ impl App {
                 ui.set_min_width(220.0);
                 ui.label(RichText::new(tree.name(it.node)).strong());
                 let n = tree.node(it.node);
-                ui.label(format!("{} · 파일 {}개 (스캔 중)", human_size(n.size(mode)), thousands(n.files as u64)));
+                let (size, files, fw) = (human_size(n.size(mode)), thousands(n.files as u64), plural(n.files as u64, "file", "files"));
+                ui.label(tr!("{size} · 파일 {files}개 (스캔 중)", "{size} · {files} {fw} (scanning)"));
             });
         }
     }
@@ -1576,36 +1610,40 @@ impl App {
             if ctx.input(|i| i.viewport().minimized == Some(true)) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
-            self.toast("삭제가 끝난 뒤에 닫을 수 있습니다");
+            self.toast(tr("삭제가 끝난 뒤에 닫을 수 있습니다", "You can close after the deletion finishes"));
         }
     }
 
     /// 공용 확인 모달. Esc·바깥 클릭은 취소다.
     fn confirm_ui(&mut self, ctx: &egui::Context) {
         let Some(confirm) = &self.confirm else { return };
-        let (marks, size) = self.doc.as_ref().map_or((0, 0), |doc| (doc.marks.len(), doc.marked_size(self.mode)));
-        let marks = format!("삭제 표시 {}개({})", thousands(marks as u64), human_size(size));
+        let (count, size) = self.doc.as_ref().map_or((0, 0), |doc| (doc.marks.len(), doc.marked_size(self.mode)));
+        let (n, w, size) = (thousands(count as u64), plural(count as u64, "item", "items"), human_size(size));
+        let marks = tr!("삭제 표시 {n}개({size})", "{n} {w} marked for deletion ({size})");
         // (제목, 본문, 흐린 안내, 진행 버튼)
         let (title, lines, note, ok) = match confirm {
             Confirm::Relaunch(root) => (
-                "관리자 권한으로 다시 열까요?",
+                tr("관리자 권한으로 다시 열까요?", "Relaunch as administrator?"),
                 [
-                    format!("{marks}는 새 창으로 넘어가지 않습니다."),
+                    tr!("{marks}는 새 창으로 넘어가지 않습니다.", "{marks} won't carry over to the new window."),
                     match root {
-                        Some(r) => format!("새 창에서 처음부터 다시 스캔합니다: {r}"),
-                        None => "새 창은 처음 화면에서 시작합니다.".into(),
+                        Some(r) => tr!("새 창에서 처음부터 다시 스캔합니다: {r}", "The new window will scan again from the start: {r}"),
+                        None => tr("새 창은 처음 화면에서 시작합니다.", "The new window will open on the start screen.").into(),
                     },
                 ],
                 None,
-                "관리자로 다시 열기",
+                tr("관리자로 다시 열기", "Relaunch as administrator"),
             ),
             Confirm::Scan(root) => {
                 let same = self.doc.as_ref().is_some_and(|doc| doc.tree.name(Tree::ROOT).eq_ignore_ascii_case(root));
                 (
-                    if same { "다시 스캔할까요?" } else { "새로 스캔할까요?" },
-                    [format!("{marks}는 스캔이 끝나면 사라집니다."), format!("스캔할 위치: {root}")],
-                    Some("스캔을 중지하면 지금 결과와 표시가 그대로 남습니다."),
-                    "스캔",
+                    if same { tr("다시 스캔할까요?", "Rescan?") } else { tr("새로 스캔할까요?", "Start a new scan?") },
+                    [
+                        tr!("{marks}는 스캔이 끝나면 사라집니다.", "{marks} will be cleared when the scan finishes."),
+                        tr!("스캔할 위치: {root}", "Location to scan: {root}"),
+                    ],
+                    Some(tr("스캔을 중지하면 지금 결과와 표시가 그대로 남습니다.", "If you stop the scan, the current results and marks stay as they are.")),
+                    tr("스캔", "Scan"),
                 )
             }
         };
@@ -1626,7 +1664,7 @@ impl App {
                 if ui.button(ok).clicked() {
                     answer = Some(true);
                 }
-                if ui.button("취소").clicked() {
+                if ui.button(tr("취소", "Cancel")).clicked() {
                     answer = Some(false);
                 }
             });
@@ -1666,7 +1704,7 @@ impl App {
                 egui::Frame::popup(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(&toast.msg);
-                        undo = can_undo && ui.button("되돌리기").clicked();
+                        undo = can_undo && ui.button(tr("되돌리기", "Undo")).clicked();
                     });
                 });
             });
@@ -1753,7 +1791,7 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
     let path = doc.tree.path(n);
     ui.label(RichText::new(doc.tree.name(n)).strong());
     ui.separator();
-    if doc.tree.node(n).kind == Kind::Dir && ui.button("🔍 여기로 확대").clicked() {
+    if doc.tree.node(n).kind == Kind::Dir && ui.button(tr("🔍 여기로 확대", "🔍 Zoom in here")).clicked() {
         doc.navigate(n);
         ui.close();
     }
@@ -1761,7 +1799,7 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
         Kind::File => {
             // 열지 않는 파일은 아래의 '위치 보기'를 쓰게 한다
             let refusal = open_refusal(doc.tree.name(n), elevated);
-            let open = ui.add_enabled(filesystem_actions_enabled(doc) && refusal.is_none(), egui::Button::new("📄 열기"));
+            let open = ui.add_enabled(filesystem_actions_enabled(doc) && refusal.is_none(), egui::Button::new(tr("📄 열기", "📄 Open")));
             let open = match refusal {
                 Some(why) => open.on_disabled_hover_text(why),
                 None => open,
@@ -1772,7 +1810,7 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
             }
         }
         Kind::Dir => {
-            if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("📂 폴더 열기")).clicked() {
+            if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new(tr("📂 폴더 열기", "📂 Open folder"))).clicked() {
                 // 관리자 권한이면 타사 폴더 처리기가 관리자 권한으로 뜨지 않게 탐색기로 직접 연다
                 shell(if elevated { Shell::Explore(path.clone()) } else { Shell::Open(path.clone()) });
                 ui.close();
@@ -1780,11 +1818,11 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
         }
         Kind::Link => {}
     }
-    if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new("🔎 탐색기에서 위치 보기")).clicked() {
+    if ui.add_enabled(filesystem_actions_enabled(doc), egui::Button::new(tr("🔎 탐색기에서 위치 보기", "🔎 Show in File Explorer"))).clicked() {
         shell(Shell::Reveal(path.clone()));
         ui.close();
     }
-    if ui.button("📋 경로 복사").clicked() {
+    if ui.button(tr("📋 경로 복사", "📋 Copy path")).clicked() {
         ui.ctx().copy_text(path.clone());
         ui.close();
     }
@@ -1792,18 +1830,22 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
     let state = doc.mark_state(n);
     let protected = doc.protected(n);
     if state == 1 {
-        if ui.button("↩ 삭제 표시 해제").clicked() {
+        if ui.button(tr("↩ 삭제 표시 해제", "↩ Unmark")).clicked() {
             toggle = true;
             ui.close();
         }
     } else if state == 2 {
-        ui.add_enabled(false, egui::Button::new("🗑 상위 폴더가 이미 표시됨"));
+        ui.add_enabled(false, egui::Button::new(tr("🗑 상위 폴더가 이미 표시됨", "🗑 Parent folder already marked")));
     } else if doc.stats.cancelled {
-        ui.add_enabled(false, egui::Button::new("🗑 삭제 표시"))
-            .on_disabled_hover_text("중지한 스캔의 일부 결과에서는 표시할 수 없습니다 · 다시 스캔하세요");
+        ui.add_enabled(false, egui::Button::new(tr("🗑 삭제 표시", "🗑 Mark for deletion")))
+            .on_disabled_hover_text(tr(
+                "중지한 스캔의 일부 결과에서는 표시할 수 없습니다 · 다시 스캔하세요",
+                "Can't mark items in partial results from a stopped scan · Rescan",
+            ));
     } else if let Some(r) = protected {
-        ui.add_enabled(false, egui::Button::new("🗑 삭제 표시")).on_disabled_hover_text(format!("보호된 항목: {r}"));
-    } else if ui.button("🗑 삭제 표시  (Space)").clicked() {
+        ui.add_enabled(false, egui::Button::new(tr("🗑 삭제 표시", "🗑 Mark for deletion")))
+            .on_disabled_hover_text(tr!("보호된 항목: {r}", "Protected item: {r}"));
+    } else if ui.button(tr("🗑 삭제 표시  (Space)", "🗑 Mark for deletion  (Space)")).clicked() {
         toggle = true;
         ui.close();
     }
@@ -1814,9 +1856,10 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
     let tree = &doc.tree;
     let n = tree.node(it.node);
     if let ItemKind::Group { count, size } = it.kind {
-        ui.label(RichText::new(format!("작은 항목 {count}개")).strong());
+        let items = plural(count as u64, "item", "items");
+        ui.label(RichText::new(tr!("작은 항목 {count}개", "{count} small {items}")).strong());
         ui.label(format!("{} · {}", human_size(size), tree.path(it.node)));
-        ui.label(RichText::new("폴더를 확대하면 보입니다").weak());
+        ui.label(RichText::new(tr("폴더를 확대하면 보입니다", "Zoom into the folder to see them")).weak());
         return;
     }
     ui.label(RichText::new(tree.name(it.node)).strong());
@@ -1828,38 +1871,42 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         if t > 0 { size as f64 * 100.0 / t as f64 } else { 0.0 }
     };
     egui::Grid::new("tip").num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
-        ui.label("크기");
+        ui.label(tr("크기", "Size"));
         ui.label(format!("{} ({} B)", human_size(size), thousands(size)));
         ui.end_row();
         let other = match mode {
-            SizeMode::Allocated => ("논리 크기", n.logical),
-            SizeMode::Logical => ("할당 크기", n.alloc),
+            SizeMode::Allocated => (tr("논리 크기", "Logical size"), n.logical),
+            SizeMode::Logical => (tr("할당 크기", "Allocated size"), n.alloc),
         };
         ui.label(other.0);
         ui.label(human_size(other.1));
         ui.end_row();
         if let Some(p) = tree.parent(it.node) {
-            ui.label("비율");
-            ui.label(format!("상위 폴더의 {:.1}% · 현재 보기의 {:.1}%", pct(p), pct(doc.focus)));
+            ui.label(tr("비율", "Share"));
+            let (of_parent, of_view) = (pct(p), pct(doc.focus));
+            ui.label(tr!(
+                "상위 폴더의 {of_parent:.1}% · 현재 보기의 {of_view:.1}%",
+                "{of_parent:.1}% of parent folder · {of_view:.1}% of current view"
+            ));
             ui.end_row();
         }
         if n.kind == Kind::Dir {
-            ui.label("파일 수");
+            ui.label(tr("파일 수", "Files"));
             ui.label(thousands(n.files as u64));
             ui.end_row();
         }
         if n.mtime > 0 {
-            ui.label("수정");
+            ui.label(tr("수정", "Modified"));
             ui.label(format_time(n.mtime));
             ui.end_row();
         }
     });
     match doc.mark_state(it.node) {
         1 => {
-            ui.colored_label(theme::of(ui).danger_text, "🗑 삭제 표시됨");
+            ui.colored_label(theme::of(ui).danger_text, tr("🗑 삭제 표시됨", "🗑 Marked for deletion"));
         }
         2 => {
-            ui.colored_label(theme::of(ui).danger_text, "🗑 상위 폴더가 삭제 표시됨");
+            ui.colored_label(theme::of(ui).danger_text, tr("🗑 상위 폴더가 삭제 표시됨", "🗑 Parent folder marked for deletion"));
         }
         _ => {}
     }
@@ -1870,13 +1917,16 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         }
     }
     if doc.stale_within(it.node) {
-        ui.colored_label(theme::of(ui).warn, "⚠ 일부만 지워진 폴더라 크기가 실제와 다를 수 있습니다 · 다시 스캔하세요");
+        ui.colored_label(
+            theme::of(ui).warn,
+            tr("⚠ 일부만 지워진 폴더라 크기가 실제와 다를 수 있습니다 · 다시 스캔하세요", "⚠ Partly deleted folder, so sizes may be off · Rescan"),
+        );
     }
     if n.has(flags::HARDLINK_DUP) {
-        ui.label(RichText::new("하드링크: 다른 경로에서 이미 세었으므로 0으로 계산").weak());
+        ui.label(RichText::new(tr("하드링크: 다른 경로에서 이미 세었으므로 0으로 계산", "Hard link: already counted at another path, so counted as 0")).weak());
     }
     if n.kind == Kind::Link {
-        ui.label(RichText::new("junction/심볼릭 링크: 따라가지 않음").weak());
+        ui.label(RichText::new(tr("junction/심볼릭 링크: 따라가지 않음", "Junction/symbolic link: not followed")).weak());
     }
 }
 
@@ -1890,14 +1940,14 @@ fn morph_items<'a>(morph: &mut Morph, items: &'a [Item], key: MorphKey, out: &'a
 fn incomplete_note(doc: &Doc, id: NodeId) -> Option<&'static str> {
     let (tree, n) = (&doc.tree, doc.tree.node(id));
     if n.has(flags::DENIED) {
-        Some("접근이 거부되어 일부 크기를 모릅니다")
+        Some(tr("접근이 거부되어 일부 크기를 모릅니다", "Access denied, so some sizes are unknown"))
     } else if !n.has(flags::INCOMPLETE) {
         None
     } else if doc.stats.cancelled && !tree.live_children(id).any(|c| tree.node(c).incomplete()) {
         // 중지 때문에 이 폴더 자체를 읽지 않았다 (끝까지 한 스캔이면 읽지 못한 하위 폴더를 지운 경우라 아래 문구)
-        Some("스캔을 중지해 읽지 못한 폴더라 실제 크기는 더 클 수 있습니다")
+        Some(tr("스캔을 중지해 읽지 못한 폴더라 실제 크기는 더 클 수 있습니다", "Not read because the scan was stopped, so the actual size may be larger"))
     } else {
-        Some("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다")
+        Some(tr("읽지 못한 하위 폴더가 있어 실제 크기는 더 클 수 있습니다", "Some subfolders couldn't be read, so the actual size may be larger"))
     }
 }
 
@@ -1910,8 +1960,11 @@ fn unread_children(tree: &Tree, id: NodeId) -> Option<String> {
     }
     let names = names.join(", ");
     Some(match unread.count() {
-        0 => format!("이어지는 하위 폴더: {names}"),
-        rest => format!("이어지는 하위 폴더: {names} 외 {}개", thousands(rest as u64)),
+        0 => tr!("이어지는 하위 폴더: {names}", "Incomplete subfolders: {names}"),
+        rest => {
+            let rest = thousands(rest as u64);
+            tr!("이어지는 하위 폴더: {names} 외 {rest}개", "Incomplete subfolders: {names} and {rest} more")
+        }
     })
 }
 
@@ -1922,7 +1975,12 @@ pub fn window_title(elevated: bool) -> &'static str {
 
 fn fmt_duration(secs: f64) -> String {
     let s = secs.round() as u64;
-    if s < 60 { format!("{s}초") } else { format!("{}분 {:02}초", s / 60, s % 60) }
+    if s < 60 {
+        tr!("{s}초", "{s}s")
+    } else {
+        let (m, s) = (s / 60, s % 60);
+        tr!("{m}분 {s:02}초", "{m}m {s:02}s")
+    }
 }
 
 /// 스캔 시각: 오늘이면 `14:32`, 아니면 `2026-10-03 16:42` (시각을 읽지 못하면 `-`)
@@ -1958,9 +2016,15 @@ fn wheel_delta(i: &egui::InputState) -> f32 {
 /// 관리자 권한이면 무엇을 열든 관리자 권한을 물려주므로 모두 거부하고, 일반 권한이면 코드가 실행되는 파일만 거부한다.
 fn open_refusal(name: &str, elevated: bool) -> Option<&'static str> {
     if elevated {
-        Some("관리자 권한으로 실행 중이라 파일은 열지 않고 탐색기에서 위치를 보여 줍니다")
+        Some(tr(
+            "관리자 권한으로 실행 중이라 파일은 열지 않고 탐색기에서 위치를 보여 줍니다",
+            "Running as administrator, so files are shown in File Explorer instead of being opened",
+        ))
     } else if runs_code(name) {
-        Some("실행 파일과 스크립트는 열지 않고 탐색기에서 위치를 보여 줍니다")
+        Some(tr(
+            "실행 파일과 스크립트는 열지 않고 탐색기에서 위치를 보여 줍니다",
+            "Executables and scripts are shown in File Explorer instead of being opened",
+        ))
     } else {
         None
     }
@@ -1986,17 +2050,20 @@ fn shows_drive(kind: u32, space: Space) -> bool {
 /// 카드·콤보의 용량 문구. 믿을 수 없는 값(8192 PB 같은 표지값)은 숫자 없이 '용량 정보 없음'
 fn space_note(space: Space) -> String {
     match space {
-        Space::Known(total, free) => format!("여유 공간 {} / {}", human_size(free), human_size(total)),
-        Space::Checking => "용량 확인 중…".into(),
-        Space::Unknown => "용량 정보 없음".into(),
-        Space::Unavailable => "용량을 읽을 수 없습니다".into(),
+        Space::Known(total, free) => {
+            let (free, total) = (human_size(free), human_size(total));
+            tr!("여유 공간 {free} / {total}", "Free space {free} / {total}")
+        }
+        Space::Checking => tr("용량 확인 중…", "Checking capacity…").into(),
+        Space::Unknown => tr("용량 정보 없음", "No capacity info").into(),
+        Space::Unavailable => tr("용량을 읽을 수 없습니다", "Can't read capacity").into(),
     }
 }
 
 /// 드라이브 카드의 부제: 종류와 파일 시스템 ('로컬 디스크 · NTFS'). 네트워크는 느릴 수 있다고 알린다
 fn drive_subtitle(d: &Drive, fs: Option<&str>) -> String {
     if d.kind == DRIVE_REMOTE {
-        "네트워크 · 일반 스캔이라 느릴 수 있음".into()
+        tr("네트워크 · 일반 스캔이라 느릴 수 있음", "Network · Standard scan, may be slow").into()
     } else {
         fs.map_or_else(|| d.kind_label().into(), |fs| format!("{} · {fs}", d.kind_label()))
     }
@@ -2005,15 +2072,24 @@ fn drive_subtitle(d: &Drive, fs: Option<&str>) -> String {
 /// 상태 바의 스캔 방법 배지 (글자, 툴팁). 일반 스캔으로 바꾼 이유는 배지 글자에 들어간다
 fn method_badge(st: &ScanStats) -> (String, String) {
     match (st.method, &st.fallback_reason) {
-        (ScanMethod::Mft, _) => ("MFT".into(), "NTFS의 $MFT를 직접 읽어 스캔했습니다".into()),
-        (ScanMethod::Walk, Some(r)) => (
-            format!("일반 스캔 · {}", r.short()),
-            match r {
-                Fallback::NotElevated => format!("{r}\n관리자로 실행하면 $MFT를 직접 읽어 몇 초 안에 끝납니다"),
-                _ => r.to_string(),
-            },
+        (ScanMethod::Mft, _) => ("MFT".into(), tr("NTFS의 $MFT를 직접 읽어 스캔했습니다", "Scanned by reading the NTFS $MFT directly").into()),
+        (ScanMethod::Walk, Some(r)) => {
+            let short = r.short();
+            (
+                tr!("일반 스캔 · {short}", "Standard scan · {short}"),
+                match r {
+                    Fallback::NotElevated => tr!(
+                        "{r}\n관리자로 실행하면 $MFT를 직접 읽어 몇 초 안에 끝납니다",
+                        "{r}\nRun as administrator to read $MFT directly and finish in seconds"
+                    ),
+                    _ => r.to_string(),
+                },
+            )
+        }
+        (ScanMethod::Walk, None) => (
+            tr("일반 스캔", "Standard scan").into(),
+            tr("폴더를 하나씩 열어 셉니다 (MFT는 드라이브 루트 전용)", "Counts by opening folders one by one (MFT is for drive roots only)").into(),
         ),
-        (ScanMethod::Walk, None) => ("일반 스캔".into(), "폴더를 하나씩 열어 셉니다 (MFT는 드라이브 루트 전용)".into()),
     }
 }
 
@@ -2030,7 +2106,7 @@ fn panic_text(p: &(dyn std::any::Any + Send)) -> String {
     p.downcast_ref::<&str>()
         .map(|s| s.to_string())
         .or_else(|| p.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "알 수 없는 오류".into())
+        .unwrap_or_else(|| tr("알 수 없는 오류", "Unknown error").into())
 }
 
 /// 네트워크 위치인지: UNC 경로(`\\server\share`, `\\?\UNC\..`)이거나 네트워크 드라이브 문자
@@ -2046,13 +2122,20 @@ fn is_network(root: &str, drives: &[Drive]) -> bool {
 /// '관리자로 실행' 툴팁: 새 창이 무엇을 하는지
 fn relaunch_hint(root: Option<&str>) -> String {
     match root {
-        None => "관리자 권한으로 다시 엽니다. 드라이브를 고르면 $MFT를 직접 읽어 몇 초 안에 스캔합니다".into(),
-        Some(r) if is_drive_root(r) => {
-            format!("관리자 권한으로 다시 열어 바로 스캔합니다: {r}\n$MFT를 직접 읽어 몇 초 안에 끝납니다")
-        }
-        Some(r) => format!(
+        None => tr(
+            "관리자 권한으로 다시 엽니다. 드라이브를 고르면 $MFT를 직접 읽어 몇 초 안에 스캔합니다",
+            "Relaunches as administrator. Pick a drive to scan it in seconds by reading $MFT directly",
+        )
+        .into(),
+        Some(r) if is_drive_root(r) => tr!(
+            "관리자 권한으로 다시 열어 바로 스캔합니다: {r}\n$MFT를 직접 읽어 몇 초 안에 끝납니다",
+            "Relaunches as administrator and scans right away: {r}\nReads $MFT directly and finishes in seconds"
+        ),
+        Some(r) => tr!(
             "관리자 권한으로 다시 열어 바로 스캔합니다: {r}\n\
-             접근이 거부된 폴더까지 읽습니다. $MFT 빠른 스캔은 드라이브 전체를 고를 때만 씁니다"
+             접근이 거부된 폴더까지 읽습니다. $MFT 빠른 스캔은 드라이브 전체를 고를 때만 씁니다",
+            "Relaunches as administrator and scans right away: {r}\n\
+             Also reads folders that deny access. The fast $MFT scan is only used when you pick a whole drive"
         ),
     }
 }

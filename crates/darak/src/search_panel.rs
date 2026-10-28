@@ -1,6 +1,8 @@
 //! 검색 결과 패널 (가상 스크롤 표)
 
+use darak_core::i18n::{plural, tr};
 use darak_core::{Kind, NodeId, SizeMode, format_time, human_size, thousands};
+use darak_core::tr;
 use eframe::egui::{self, RichText, Sense};
 use crate::doc::Doc;
 use crate::theme;
@@ -9,11 +11,11 @@ pub fn controls(ui: &mut egui::Ui, doc: &mut Doc) -> bool {
     let mut changed = false;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        changed = ui.checkbox(&mut doc.search.in_focus_only, "현재 폴더 안에서만").changed();
+        changed = ui.checkbox(&mut doc.search.in_focus_only, tr("현재 폴더 안에서만", "Only in current folder")).changed();
         if changed && doc.focus != darak_core::Tree::ROOT {
             doc.search.note_edit(std::time::Instant::now());
         }
-        ui.checkbox(&mut doc.search.highlight, "treemap에 강조");
+        ui.checkbox(&mut doc.search.highlight, tr("treemap에 강조", "Highlight in treemap"));
     });
     changed
 }
@@ -34,15 +36,12 @@ pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
         return action;
     }
     let Some(res) = &s.result else {
-        ui.label(RichText::new("검색 중…").weak());
+        ui.label(RichText::new(tr("검색 중…", "Searching…")).weak());
         return action;
     };
-    ui.label(format!(
-        "{}개 · {} · {:.0} ms",
-        thousands(res.total as u64),
-        human_size(res.total_size),
-        s.elapsed_ms
-    ));
+    let (n, size, ms) = (thousands(res.total as u64), human_size(res.total_size), s.elapsed_ms);
+    let results = plural(res.total as u64, "result", "results");
+    ui.label(tr!("{n}개 · {size} · {ms:.0} ms", "{n} {results} · {size} · {ms:.0} ms"));
     ui.separator();
 
     let row_h = 20.0;

@@ -1,8 +1,10 @@
 //! SpaceSniffer식 중첩 treemap: 레이아웃 계산(캐시)과 그리기, 히트 테스트.
 
 use darak_core::category::{Category, categorize};
+use darak_core::i18n::{plural, tr};
 use darak_core::layout::{self, squarify};
 use darak_core::{Kind, NodeId, SizeMode, Tree, flags, human_size};
+use darak_core::tr;
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2,
     text::{LayoutJob, TextFormat, TextWrapping},
@@ -784,8 +786,11 @@ pub fn paint(
                     let tc = fa(if dim { text_on(bg).gamma_multiply(0.5) } else { text_on(bg) });
                     let clip = painter.with_clip_rect(r.shrink(2.0).intersect(clip));
                     let (title, sub) = match it.kind {
-                        ItemKind::Group { count, size } => (format!("작은 항목 {count}개"), human_size(size)),
-                        ItemKind::Link => (format!("{name} →"), "링크".to_string()),
+                        ItemKind::Group { count, size } => {
+                            let w = plural(u64::from(count), "small item", "small items");
+                            (tr!("작은 항목 {count}개", "{count} {w}"), human_size(size))
+                        }
+                        ItemKind::Link => (format!("{name} →"), tr("링크", "Link").to_string()),
                         ItemKind::ClosedDir if n.incomplete() => (name.to_string(), format!("{} ⚠", human_size(n.size(mode)))),
                         _ => (name.to_string(), human_size(n.size(mode))),
                     };

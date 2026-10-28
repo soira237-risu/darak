@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 
+use crate::i18n::{plural, tr};
 use crate::sys::*;
+use crate::tr;
 use crate::tree::{Kind, NO_NODE, Node, Tree, filetime_to_secs2000, flags};
 
 #[derive(Clone, Debug)]
@@ -83,7 +85,7 @@ impl Fallback {
     fn failed(e: &io::Error) -> Self {
         let text = e.to_string();
         Self::Failed(match (e.raw_os_error(), text.rsplit_once(" (os error ")) {
-            (Some(code), Some((msg, _))) => format!("{msg} (코드 {code})"),
+            (Some(code), Some((msg, _))) => tr!("{msg} (코드 {code})", "{msg} (code {code})"),
             _ => text,
         })
     }
@@ -91,10 +93,10 @@ impl Fallback {
     /// 상태 바 배지에 붙이는 짧은 이유
     pub fn short(&self) -> String {
         match self {
-            Self::NotElevated => "관리자 권한 없음".into(),
-            Self::Network => "네트워크 드라이브".into(),
-            Self::NotNtfs(fs) => format!("{fs} 볼륨"),
-            Self::Failed(_) => "MFT 읽기 실패".into(),
+            Self::NotElevated => tr("관리자 권한 없음", "No administrator rights").into(),
+            Self::Network => tr("네트워크 드라이브", "Network drive").into(),
+            Self::NotNtfs(fs) => tr!("{fs} 볼륨", "{fs} volume"),
+            Self::Failed(_) => tr("MFT 읽기 실패", "MFT read failed").into(),
         }
     }
 }
@@ -103,10 +105,10 @@ impl Fallback {
 impl fmt::Display for Fallback {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::NotElevated => f.write_str("관리자 권한이 없어 일반 스캔을 사용"),
-            Self::Network => f.write_str("네트워크 드라이브라 일반 스캔을 사용"),
-            Self::NotNtfs(fs) => write!(f, "{fs} 볼륨이라 일반 스캔을 사용 (MFT는 NTFS 전용)"),
-            Self::Failed(e) => write!(f, "MFT 읽기 실패, 일반 스캔 사용: {e}"),
+            Self::NotElevated => f.write_str(tr("관리자 권한이 없어 일반 스캔을 사용", "No administrator rights, so using a standard scan")),
+            Self::Network => f.write_str(tr("네트워크 드라이브라 일반 스캔을 사용", "Network drive, so using a standard scan")),
+            Self::NotNtfs(fs) => f.write_str(&tr!("{fs} 볼륨이라 일반 스캔을 사용 (MFT는 NTFS 전용)", "{fs} volume, so using a standard scan (MFT is NTFS only)")),
+            Self::Failed(e) => f.write_str(&tr!("MFT 읽기 실패, 일반 스캔 사용: {e}", "MFT read failed, using a standard scan: {e}")),
         }
     }
 }
@@ -186,7 +188,7 @@ pub fn scan(root: &str, opts: &ScanOptions, progress: &ScanProgress) -> io::Resu
     let root_buf = pool.install(|| scan_dir(os_path, &display, NO_NODE, 0, &ctx));
     drop(ctx.dedupe);
 
-    *progress.current.lock().unwrap() = format!("{display} 트리 구성 중");
+    *progress.current.lock().unwrap() = tr!("{display} 트리 구성 중", "Building the tree for {display}");
     let tree = build_tree(&display, root_buf);
     let stats = ScanStats {
         elapsed: start.elapsed(),
@@ -699,7 +701,9 @@ impl LiveSnapshot {
                         }
                     }
                     None => {
-                        let label = format!("파일 {}개", crate::thousands(d.direct_files));
+                        let n = crate::thousands(d.direct_files);
+                        let files = plural(d.direct_files, "file", "files");
+                        let label = tr!("파일 {n}개", "{n} {files}");
                         tree.names.push_str(&label);
                         Node {
                             alloc: d.direct_alloc,
@@ -852,10 +856,10 @@ pub struct Drive {
 impl Drive {
     pub fn kind_label(&self) -> &'static str {
         match self.kind {
-            DRIVE_FIXED => "로컬 디스크",
-            DRIVE_REMOVABLE => "이동식",
-            DRIVE_REMOTE => "네트워크",
-            _ => "기타",
+            DRIVE_FIXED => tr("로컬 디스크", "Local disk"),
+            DRIVE_REMOVABLE => tr("이동식", "Removable"),
+            DRIVE_REMOTE => tr("네트워크", "Network"),
+            _ => tr("기타", "Other"),
         }
     }
 }
