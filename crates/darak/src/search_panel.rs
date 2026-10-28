@@ -3,7 +3,7 @@
 use darak_core::i18n::{plural, tr};
 use darak_core::{Kind, NodeId, SizeMode, format_time, human_size, thousands};
 use darak_core::tr;
-use eframe::egui::{self, RichText, Sense};
+use eframe::egui::{self, RichText, Sense, text::{LayoutJob, TextFormat, TextWrapping}};
 use crate::doc::Doc;
 use crate::theme;
 
@@ -41,57 +41,60 @@ pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
     };
     let (n, size, ms) = (thousands(res.total as u64), human_size(res.total_size), s.elapsed_ms);
     let results = plural(res.total as u64, "result", "results");
-    ui.label(tr!("{n}개 · {size} · {ms:.0} ms", "{n} {results} · {size} · {ms:.0} ms"));
+    // 「검색 입력 중」 보드: caption 12, text.secondary
+    ui.label(theme::caption(tr!("결과 {n}개 · {size} · {ms:.0} ms", "{n} {results} · {size} · {ms:.0} ms")).weak());
     ui.separator();
 
-    let row_h = 20.0;
+    // 행 높이 24 (작은 컨트롤 · 최소 누름 영역). 안쪽 여백 8
+    let row_h = theme::H_SMALL;
     let hits = &res.hits;
     let tree = &doc.tree;
     let selected = doc.selected;
+    let t = theme::of(ui);
     egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, row_h, hits.len(), |ui, range| {
         let w = ui.available_width();
         for &id in &hits[range] {
             let n = tree.node(id);
             let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, row_h), Sense::click());
             let painter = ui.painter_at(rect);
-            let visuals = ui.visuals();
+            let radius = egui::CornerRadius::same(theme::R_CONTROL);
             if selected == Some(id) {
-                painter.rect_filled(rect, 3.0, visuals.selection.bg_fill);
+                painter.rect_filled(rect, radius, t.line);
             } else if resp.hovered() {
-                painter.rect_filled(rect, 3.0, visuals.widgets.hovered.weak_bg_fill);
+                painter.rect_filled(rect, radius, t.surface_raised);
             }
-            let text = visuals.text_color();
-            let weak = visuals.weak_text_color();
             let icon = match n.kind {
                 Kind::Dir => "📁",
                 Kind::Link => "🔗",
                 Kind::File => "📄",
             };
-            let size_w = 74.0;
-            let date_w = if w > 420.0 { 112.0 } else { 0.0 };
-            let name_w = (w - size_w - date_w - 12.0).max(40.0);
-            let clip = painter.with_clip_rect(egui::Rect::from_min_size(rect.min, egui::vec2(name_w, row_h)));
-            clip.text(
-                rect.left_center() + egui::vec2(4.0, 0.0),
-                egui::Align2::LEFT_CENTER,
+            // [8][이름 …][8][크기 74][날짜 112][8]: 넓을 때만 날짜
+            let (size_w, date_w) = (74.0, if w > 420.0 { 112.0 } else { 0.0 });
+            let right = rect.max.x - 8.0;
+            let size_right = right - date_w;
+            let name_w = (size_right - size_w - 8.0 - (rect.min.x + 8.0)).max(40.0);
+            let mut job = LayoutJob::single_section(
                 format!("{icon} {}", tree.name(id)),
-                egui::FontId::proportional(13.0),
-                text,
+                TextFormat::simple(egui::FontId::proportional(theme::BODY), t.text_primary),
             );
+            job.wrap = TextWrapping { max_width: name_w, max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+            let name = painter.layout_job(job);
+            let at = egui::Align2::LEFT_CENTER.anchor_size(egui::pos2(rect.min.x + 8.0, rect.center().y), name.size());
+            painter.galley(at.min, name, t.text_primary);
             painter.text(
-                egui::pos2(rect.min.x + name_w + size_w, rect.center().y),
+                egui::pos2(size_right, rect.center().y),
                 egui::Align2::RIGHT_CENTER,
                 human_size(n.size(mode)),
-                egui::FontId::monospace(12.0),
-                text,
+                egui::FontId::monospace(theme::MONO),
+                t.text_primary,
             );
             if date_w > 0.0 {
                 painter.text(
-                    egui::pos2(rect.max.x - 4.0, rect.center().y),
+                    egui::pos2(right, rect.center().y),
                     egui::Align2::RIGHT_CENTER,
                     if n.kind == Kind::File { format_time(n.mtime) } else { String::new() },
-                    egui::FontId::proportional(12.0),
-                    weak,
+                    egui::FontId::proportional(theme::CAPTION),
+                    t.text_secondary,
                 );
             }
             if resp.double_clicked() {
@@ -102,7 +105,7 @@ pub fn results(ui: &mut egui::Ui, doc: &mut Doc, mode: SizeMode) -> Action {
             if resp.secondary_clicked() {
                 action = Action::Context(id);
             }
-            resp.on_hover_ui(|ui| { ui.label(tree.path(id)); });
+            resp.on_hover_ui(|ui| { ui.label(theme::mono(tree.path(id))); });
         }
     });
     action
