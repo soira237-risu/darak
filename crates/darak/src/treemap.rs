@@ -6,7 +6,7 @@ use darak_core::layout::{self, squarify};
 use darak_core::{Kind, NodeId, SizeMode, Tree, flags, human_size};
 use darak_core::tr;
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2,
+    self, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Stroke, StrokeKind, Vec2,
     text::{LayoutJob, TextFormat, TextWrapping},
 };
 use std::collections::HashMap;
@@ -238,7 +238,7 @@ impl Builder<'_> {
                 let can_open = (depth == 0
                     || rect.width() >= self.min_w && rect.height() >= self.min_h && depth < self.max_depth)
                     && rect.width() >= 8.0
-                    && rect.height() >= HEADER_H + 4.0
+                    && rect.height() >= HEADER_H + PAD + 4.0
                     && n.child_count > 0
                     && self.out.len() < MAX_ITEMS;
                 if can_open { ItemKind::OpenDir } else { ItemKind::ClosedDir }
@@ -250,7 +250,7 @@ impl Builder<'_> {
         }
 
         let inner = Rect::from_min_max(
-            Pos2::new(rect.min.x + PAD, rect.min.y + HEADER_H),
+            Pos2::new(rect.min.x + PAD, rect.min.y + HEADER_H + PAD),
             Pos2::new(rect.max.x - PAD, rect.max.y - PAD),
         );
         if inner.width() <= 1.0 || inner.height() <= 1.0 {
@@ -578,57 +578,96 @@ pub struct Style {
     pub dark: bool,
 }
 
+const fn hex(v: u32) -> Color32 {
+    Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+/// 타일 데이터 색 (「색」·「트리맵 타일」 보드의 dir.* · cat.* · tile.*). 크롬 토큰이 아니라서 여기 둔다.
+struct Palette {
+    /// 깊이 0 → 10 사이를 보간하는 램프 (양 끝)
+    dir_header: [Color32; 2],
+    dir_body: [Color32; 2],
+    dir_closed: [Color32; 2],
+    /// cat.media, doc, dev, program, bulk, other
+    cat: [Color32; 6],
+    /// tile.border: 다크 검정 63%, 라이트 검정 35%
+    border: Color32,
+    /// tile.link (두 테마 같은 값)
+    link: Color32,
+    /// tile.group
+    group: Color32,
+}
+
+const DARK: Palette = Palette {
+    dir_header: [hex(0x3A4452), hex(0x606A78)],
+    dir_body: [hex(0x202328), hex(0x32363C)],
+    dir_closed: [hex(0x545E6C), hex(0x767E8A)],
+    cat: [hex(0xB57D5C), hex(0xB3A066), hex(0x7E9A72), hex(0x6E8AAB), hex(0x8F7FAA), hex(0x878079)],
+    border: Color32::from_rgba_premultiplied(0, 0, 0, 160),
+    link: hex(0x6E6E78),
+    group: hex(0x46464C),
+};
+
+const LIGHT: Palette = Palette {
+    dir_header: [hex(0x96A0AF), hex(0xC4CAD4)],
+    dir_body: [hex(0xDEE1E6), hex(0xF0F2F5)],
+    dir_closed: [hex(0xAAB2BE), hex(0xCCD0D8)],
+    cat: [hex(0xC59A80), hex(0xC4B588), hex(0x9AB091), hex(0x8EA4BD), hex(0xA89BBD), hex(0xA19C96)],
+    border: Color32::from_rgba_premultiplied(0, 0, 0, 90),
+    link: hex(0x6E6E78),
+    group: hex(0xBEBEC4),
+};
+
+/// tile.text.dark / tile.text.light: 바탕과 대비가 높은 쪽을 고른다. 선택 테두리 안쪽 선도 dark.
+const TILE_INK: Color32 = hex(0x141418);
+const TILE_INK_LIGHT: Color32 = hex(0xF0F0F4);
+/// tile.highlight: 흰색 5.5% (두 테마)
+const TILE_HIGHLIGHT: Color32 = Color32::from_rgba_premultiplied(14, 14, 14, 14);
+/// tile.group.hatch: 검정 16% (α40), 1px, 7px 간격
+const GROUP_HATCH: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 40);
+/// 호버 때 섞는 흰색 (파일 35%, 폴더 몸통 25%)
+const HOVER_GLOW: Color32 = Color32::WHITE;
+/// 삭제 빗금: mark 55%, 2px, 8px 간격
+const MARK_HATCH_ALPHA: u8 = 140;
+
+/// 글자 크기: 폴더 제목 11.5/600, 타일 이름 12/600, 크기 11/400
+const DIR_TITLE: f32 = 11.5;
+const TILE_NAME: f32 = 12.0;
+const TILE_SIZE: f32 = 11.0;
+
 impl Style {
+    fn palette(&self) -> &'static Palette {
+        if self.dark { &DARK } else { &LIGHT }
+    }
+
+    fn ramp(ends: [Color32; 2], depth: u16) -> Color32 {
+        lerp(ends[0], ends[1], (depth.min(10) as f32) / 10.0)
+    }
+
     fn dir_header(&self, depth: u16) -> Color32 {
-        let t = (depth.min(10) as f32) / 10.0;
-        if self.dark {
-            lerp(Color32::from_rgb(58, 68, 82), Color32::from_rgb(96, 106, 120), t)
-        } else {
-            lerp(Color32::from_rgb(150, 160, 175), Color32::from_rgb(196, 202, 212), t)
-        }
+        Self::ramp(self.palette().dir_header, depth)
     }
 
     fn dir_body(&self, depth: u16) -> Color32 {
-        let t = (depth.min(10) as f32) / 10.0;
-        if self.dark {
-            lerp(Color32::from_rgb(32, 35, 40), Color32::from_rgb(50, 54, 60), t)
-        } else {
-            lerp(Color32::from_rgb(222, 225, 230), Color32::from_rgb(240, 242, 245), t)
-        }
+        Self::ramp(self.palette().dir_body, depth)
     }
 
     fn closed_dir(&self, depth: u16) -> Color32 {
-        let t = (depth.min(10) as f32) / 10.0;
-        if self.dark {
-            lerp(Color32::from_rgb(84, 94, 108), Color32::from_rgb(118, 126, 138), t)
-        } else {
-            lerp(Color32::from_rgb(170, 178, 190), Color32::from_rgb(204, 208, 216), t)
-        }
+        Self::ramp(self.palette().dir_closed, depth)
     }
 
     /// 범주 10개를 채도 낮은 5색 + 회색으로 묶는다 (디자인 시스템 `cat.*`).
     /// 밝기를 고르게 맞춰서 타일 글자는 모두 어두운 색이 된다.
     pub fn category(&self, c: Category) -> Color32 {
-        let (dark, light) = match c {
-            // 미디어 (주황)
-            Category::Video | Category::Audio | Category::Image => ((181, 125, 92), (197, 154, 128)),
-            // 문서 (노랑)
-            Category::Document => ((179, 160, 102), (196, 181, 136)),
-            // 개발 (초록)
-            Category::Code => ((126, 154, 114), (154, 176, 145)),
-            // 프로그램 (파랑)
-            Category::Executable | Category::System => ((110, 138, 171), (142, 164, 189)),
-            // 덩어리 파일 (보라)
-            Category::Archive | Category::Data => ((143, 127, 170), (168, 155, 189)),
-            // 기타 (따뜻한 회색)
-            Category::Other => ((135, 128, 121), (161, 156, 150)),
+        let i = match c {
+            Category::Video | Category::Audio | Category::Image => 0,
+            Category::Document => 1,
+            Category::Code => 2,
+            Category::Executable | Category::System => 3,
+            Category::Archive | Category::Data => 4,
+            Category::Other => 5,
         };
-        let (r, g, b) = if self.dark { dark } else { light };
-        Color32::from_rgb(r, g, b)
-    }
-
-    fn border(&self) -> Color32 {
-        if self.dark { Color32::from_black_alpha(160) } else { Color32::from_black_alpha(90) }
+        self.palette().cat[i]
     }
 }
 
@@ -639,11 +678,9 @@ fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
 
 /// 어두운 글자와 밝은 글자 중 바탕과 대비(WCAG)가 더 높은 쪽
 fn text_on(bg: Color32) -> Color32 {
-    const DARK: Color32 = Color32::from_rgb(20, 20, 24);
-    const LIGHT: Color32 = Color32::from_rgb(240, 240, 244);
     let contrast = |a: f32, b: f32| (a.max(b) + 0.05) / (a.min(b) + 0.05);
     let l = luminance(bg);
-    if contrast(l, luminance(DARK)) >= contrast(l, luminance(LIGHT)) { DARK } else { LIGHT }
+    if contrast(l, luminance(TILE_INK)) >= contrast(l, luminance(TILE_INK_LIGHT)) { TILE_INK } else { TILE_INK_LIGHT }
 }
 
 fn luminance(c: Color32) -> f32 {
@@ -654,13 +691,13 @@ fn luminance(c: Color32) -> f32 {
     0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
 }
 
-/// 한 줄로 자르고 넘치면 `…`. `center`면 x가 가운데 기준
-fn label(painter: &Painter, pos: Pos2, text: String, size: f32, color: Color32, max_w: f32, center: bool) {
-    let mut job = LayoutJob::single_section(text, TextFormat::simple(FontId::proportional(size), color));
+/// 한 줄로 자르고 넘치면 `…`. `align`은 `pos`에 대한 글자 상자의 기준점
+fn label(painter: &Painter, pos: Pos2, text: String, font: FontId, color: Color32, max_w: f32, align: Align2) {
+    let mut job = LayoutJob::single_section(text, TextFormat::simple(font, color));
     job.wrap = TextWrapping { max_width: max_w.max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
     let galley = painter.layout_job(job);
-    let pos = if center { Pos2::new(pos.x - galley.size().x / 2.0, pos.y) } else { pos };
-    painter.galley(pos, galley, color);
+    let rect = align.anchor_size(pos, galley.size());
+    painter.galley(rect.min, galley, color);
 }
 
 pub struct Highlights<'a> {
@@ -681,10 +718,12 @@ pub fn paint(
     mode: SizeMode,
     hl: &Highlights,
 ) {
-    let border = style.border();
+    let pal = style.palette();
+    let border = pal.border;
     let t = theme::tokens(style.dark);
     let mark_color = t.mark;
-    let hover_glow = Color32::WHITE;
+    let bold = crate::fonts::semibold_family(painter.ctx());
+    let font = |size: f32, bold_name: bool| FontId::new(size, if bold_name { bold.clone() } else { FontFamily::Proportional });
     let clip = painter.clip_rect();
     for it in items {
         let r = match camera {
@@ -714,31 +753,28 @@ pub fn paint(
                 }
                 if hovered {
                     head_bg = lerp(head_bg, t.accent_hover, 0.55);
-                    body_bg = lerp(body_bg, hover_glow, 0.25);
+                    body_bg = lerp(body_bg, HOVER_GLOW, 0.25);
                 } else if in_chain {
                     head_bg = lerp(head_bg, t.accent_hover, 0.28);
                 }
                 painter.rect_filled(r, CornerRadius::ZERO, fa(body_bg));
                 let head = Rect::from_min_max(r.min, Pos2::new(r.max.x, (r.min.y + HEADER_H).min(r.max.y)));
                 painter.rect_filled(head, CornerRadius::ZERO, fa(head_bg));
-                if r.width() > 24.0 {
+                if r.width() >= 24.0 {
                     let tc = fa(text_on(head_bg));
-                    let size_txt = human_size(n.size(mode));
                     let clip = painter.with_clip_rect(head.shrink2(Vec2::new(3.0, 0.0)).intersect(clip));
-                    let wide = head.width() > 120.0;
-                    let size_w = (size_txt.chars().count() as f32) * 6.6 + 6.0;
-                    let name_max = (head.width() - 8.0 - if wide { size_w } else { 0.0 }).max(10.0);
+                    // 폭 120 이상이면 오른쪽에 크기 (재어서 이름 자리를 정한다)
+                    let size_g = (head.width() >= 120.0)
+                        .then(|| painter.layout_no_wrap(human_size(n.size(mode)), font(TILE_SIZE, false), tc.gamma_multiply(0.85)));
+                    let size_w = size_g.as_ref().map_or(0.0, |g| g.size().x + 6.0);
+                    let name_max = (head.width() - 8.0 - size_w).max(10.0);
                     // 접근 거부·중지로 읽지 못한 폴더가 안에 있다 (따라 내려가면 그 폴더에 닿는다)
                     let warn = if n.incomplete() { " ⚠" } else { "" };
-                    label(&clip, Pos2::new(head.min.x + 4.0, head.min.y + 1.5), format!("{name}{warn}"), 11.5, tc, name_max, false);
-                    if wide {
-                        clip.text(
-                            Pos2::new(head.max.x - 4.0, head.center().y),
-                            Align2::RIGHT_CENTER,
-                            size_txt,
-                            FontId::proportional(11.0),
-                            tc.gamma_multiply(0.85),
-                        );
+                    let at = Pos2::new(head.min.x + 4.0, head.center().y);
+                    label(&clip, at, format!("{name}{warn}"), font(DIR_TITLE, true), tc, name_max, Align2::LEFT_CENTER);
+                    if let Some(g) = size_g {
+                        let rect = Align2::RIGHT_CENTER.anchor_size(Pos2::new(head.max.x - 4.0, head.center().y), g.size());
+                        clip.galley(rect.min, g, tc);
                     }
                 }
                 painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, border), StrokeKind::Inside);
@@ -747,37 +783,32 @@ pub fn paint(
                 let mut bg = match it.kind {
                     ItemKind::ClosedDir => style.closed_dir(it.depth),
                     ItemKind::File => style.category(categorize(name)),
-                    ItemKind::Link => Color32::from_rgb(110, 110, 120),
-                    _ => {
-                        if style.dark {
-                            Color32::from_rgb(70, 70, 76)
-                        } else {
-                            Color32::from_rgb(190, 190, 196)
-                        }
-                    }
+                    ItemKind::Link => pal.link,
+                    _ => pal.group,
                 };
+                // 60% 밝기로 (불투명하게). 지금은 크기 0이라 그려지지 않는다
                 if n.has(flags::HARDLINK_DUP) {
-                    bg = bg.gamma_multiply(0.6);
+                    bg = lerp(bg, Color32::BLACK, 0.4);
                 }
                 if dim {
                     bg = lerp(bg, t.bg_app, 0.75);
                 }
                 if hovered {
-                    bg = lerp(bg, hover_glow, 0.35);
+                    bg = lerp(bg, HOVER_GLOW, 0.35);
                 }
                 painter.rect_filled(r, CornerRadius::ZERO, fa(bg));
                 // 위쪽이 밝은 약한 입체감
                 if r.width() > 6.0 && r.height() > 6.0 {
                     let hi = Rect::from_min_size(r.min, Vec2::new(r.width(), (r.height() * 0.45).min(14.0)));
-                    painter.rect_filled(hi, CornerRadius::ZERO, fa(Color32::from_white_alpha(14)));
+                    painter.rect_filled(hi, CornerRadius::ZERO, fa(TILE_HIGHLIGHT));
                 }
                 painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(1.0, border), StrokeKind::Inside);
                 if is_group {
-                    hatch(painter, r, Color32::from_black_alpha(40), 7.0, 1.0);
+                    hatch(painter, r, fa(GROUP_HATCH), 7.0, 1.0);
                 }
                 // 삭제 표시는 색을 섞지 않고 빨간 빗금과 테두리를 겹친다 (어떤 범주색 위에서도 같게 보이도록)
                 if marked {
-                    let m = Color32::from_rgba_unmultiplied(mark_color.r(), mark_color.g(), mark_color.b(), 140);
+                    let m = Color32::from_rgba_unmultiplied(mark_color.r(), mark_color.g(), mark_color.b(), MARK_HATCH_ALPHA);
                     hatch(painter, r, fa(m), 8.0, 2.0);
                     painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.0, fa(mark_color)), StrokeKind::Inside);
                 }
@@ -798,9 +829,10 @@ pub fn paint(
                     let two_lines = r.height() >= 32.0;
                     let y = if two_lines { r.center().y - 14.0 } else { r.center().y - 8.0 };
                     let max_w = r.width() - 6.0;
-                    label(&clip, Pos2::new(r.center().x, y), title, 12.0, tc, max_w, true);
+                    label(&clip, Pos2::new(r.center().x, y), title, font(TILE_NAME, true), tc, max_w, Align2::CENTER_TOP);
                     if two_lines {
-                        label(&clip, Pos2::new(r.center().x, y + 15.0), sub, 11.0, tc.gamma_multiply(0.8), max_w, true);
+                        let sub_c = tc.gamma_multiply(0.8);
+                        label(&clip, Pos2::new(r.center().x, y + 15.0), sub, font(TILE_SIZE, false), sub_c, max_w, Align2::CENTER_TOP);
                     }
                 }
             }
@@ -810,16 +842,17 @@ pub fn paint(
     // 선택 테두리는 맨 위에
     if let Some(s) = hl.selected.and_then(|s| items.iter().find(|it| it.node == s && !matches!(it.kind, ItemKind::Group { .. }))) {
         let r = camera.map_or(s.rect, |c| c.map(s.rect));
-        painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.5, theme::tokens(style.dark).accent), StrokeKind::Inside);
+        painter.rect_stroke(r, CornerRadius::ZERO, Stroke::new(2.5, t.accent), StrokeKind::Inside);
         // 안쪽의 어두운 선: 노란·주황 타일 위에서도 앰버 테두리가 보이게
         if r.width() > 10.0 && r.height() > 10.0 {
-            painter.rect_stroke(r.shrink(2.5), CornerRadius::ZERO, Stroke::new(1.5, Color32::from_rgb(20, 20, 24)), StrokeKind::Inside);
+            painter.rect_stroke(r.shrink(2.5), CornerRadius::ZERO, Stroke::new(1.5, TILE_INK), StrokeKind::Inside);
         }
     }
 }
 
-/// 45° 빗금. `step`은 선 사이 가로 간격
-fn hatch(painter: &Painter, r: Rect, color: Color32, step: f32, width: f32) {
+/// 45° 빗금. `period`는 선에 수직으로 잰 간격 (CSS repeating-linear-gradient와 같다)
+fn hatch(painter: &Painter, r: Rect, color: Color32, period: f32, width: f32) {
+    let step = period * std::f32::consts::SQRT_2;
     if r.width() < 6.0 || r.height() < 6.0 {
         return;
     }

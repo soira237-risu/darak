@@ -15,7 +15,7 @@ use darak_core::remove::{
 use darak_core::scan::disk_space;
 use darak_core::tr;
 use darak_core::{Kind, NodeId, SizeMode, Tree, flags, human_size, thousands};
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText, Stroke};
 
 use crate::doc::Doc;
 use crate::theme;
@@ -118,71 +118,89 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
     }
     let mut open = true;
     let mut next: Option<Stage> = None;
-    let modal = egui::Modal::new(egui::Id::new("delete-review")).show(ctx, |ui| {
+    let modal = egui::Modal::new(egui::Id::new("delete-review")).frame(theme::dialog_frame(ctx)).show(ctx, |ui| {
         ui.set_width(640.0);
         let t = theme::of(ui);
         match &mut dlg.stage {
             Stage::Review { method, confirmed, error, bin } => {
                 let doc = doc.as_mut().expect("review document identity checked");
                 let items = review_items(doc, mode);
-                ui.heading(tr("삭제 검토", "Review deletion"));
+                let title = theme::title(ui, tr("삭제 검토", "Review deletion"));
+                ui.label(title);
                 if items.is_empty() {
                     ui.label(RichText::new(tr("검토할 항목이 없습니다.", "Nothing to review.")).weak());
-                    ui.add_space(6.0);
-                    if ui.button(tr("닫기", "Close")).clicked() {
-                        open = false;
-                    }
+                    theme::dialog_footer(ui, |ui| {
+                        if theme::button(ui, true, tr("닫기", "Close")).clicked() {
+                            open = false;
+                        }
+                    });
                     return;
                 }
                 let total: u64 = items.iter().map(|&i| doc.tree.node(i).size(mode)).sum();
                 let files: u64 = items.iter().map(|&i| doc.tree.node(i).files as u64).sum();
-                let (count, size, nfiles) = (items.len(), human_size(total), thousands(files));
-                let (items_w, files_w) = (plural(count as u64, "item", "items"), plural(files, "file", "files"));
-                ui.label(tr!("{count}개 항목 · {size} · 파일 {nfiles}개", "{count} {items_w} · {size} · {nfiles} {files_w}"));
-                ui.add_space(6.0);
+                let (count, size, nfiles) = (thousands(items.len() as u64), human_size(total), thousands(files));
+                let (items_w, files_w) = (plural(items.len() as u64, "item", "items"), plural(files, "file", "files"));
+                ui.label(RichText::new(tr!("{count}개 항목 · {size} · 파일 {nfiles}개", "{count} {items_w} · {size} · {nfiles} {files_w}")).weak());
+                ui.add_space(8.0);
                 let mut unmark = None;
-                egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for &id in &items {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("✖").on_hover_text(tr("표시 해제", "Unmark")).clicked() {
-                                unmark = Some(id);
+                // 목록: 1px line 테두리, 모서리 4, 행 32
+                egui::Frame::new()
+                    .stroke(Stroke::new(1.0, t.line))
+                    .corner_radius(egui::CornerRadius::same(theme::R_CONTROL))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            for (row, &id) in items.iter().enumerate() {
+                                list_row(ui, row == 0, |ui| {
+                                    if theme::icon_button(ui, true, "✖", theme::H_SMALL).on_hover_text(tr("표시 해제", "Unmark")).clicked() {
+                                        unmark = Some(id);
+                                    }
+                                    let n = doc.tree.node(id);
+                                    size_cell(ui, n.size(mode));
+                                    // 배지는 경로 앞에 둔다 (긴 경로에 밀려 창 밖으로 나가지 않게, 경로는 가운데를 줄이고 호버하면 전체)
+                                    if let Some(r) = doc.protected(id) {
+                                        ui.label(theme::caption(format!("⚠ {r}")).color(t.warn_text));
+                                    }
+                                    // 볼륨 전체에 휴지통이 없으면 행마다 반복하지 않고 라디오 위에 한 번 알린다
+                                    if let Some(b @ (RecycleBlock::LongPath | RecycleBlock::TooLarge { .. })) =
+                                        recycle_block(&doc.tree, id, *bin)
+                                    {
+                                        ui.label(theme::caption(tr("⚠ 휴지통 불가", "⚠ Can't recycle")).color(t.warn_text)).on_hover_text(b.reason());
+                                    }
+                                    // 접근 거부로 읽지 못한 곳이 안에 있다 (트리 합계보다 더 지워진다)
+                                    if n.incomplete() {
+                                        ui.label(theme::caption(tr("⚠ 읽지 못한 하위 폴더 있음", "⚠ Has unread subfolders")).color(t.warn_text))
+                                            .on_hover_text(tr(
+                                                "실제로 지워지는 양은 보이는 크기보다 클 수 있습니다",
+                                                "More may be deleted than the size shown",
+                                            ));
+                                    }
+                                    let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
+                                    ui.label(icon);
+                                    path_label(ui, &doc.tree.path(id), false);
+                                });
                             }
-                            let n = doc.tree.node(id);
-                            ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new(human_size(n.size(mode))).monospace()));
-                            // 배지는 경로 앞에 둔다 (긴 경로에 밀려 창 밖으로 나가지 않게, 경로는 줄여 보이고 호버하면 전체)
-                            if let Some(r) = doc.protected(id) {
-                                ui.colored_label(t.warn, format!("⚠ {r}"));
-                            }
-                            // 볼륨 전체에 휴지통이 없으면 행마다 반복하지 않고 라디오 위에 한 번 알린다
-                            if let Some(b @ (RecycleBlock::LongPath | RecycleBlock::TooLarge { .. })) =
-                                recycle_block(&doc.tree, id, *bin)
-                            {
-                                ui.colored_label(t.warn, tr("⚠ 휴지통 불가", "⚠ Can't recycle")).on_hover_text(b.reason());
-                            }
-                            // 접근 거부로 읽지 못한 곳이 안에 있다 (트리 합계보다 더 지워진다)
-                            if n.incomplete() {
-                                ui.colored_label(t.warn, tr("⚠ 읽지 못한 하위 폴더 있음", "⚠ Has unread subfolders"))
-                                    .on_hover_text(tr(
-                                        "실제로 지워지는 양은 보이는 크기보다 클 수 있습니다",
-                                        "More may be deleted than the size shown",
-                                    ));
-                            }
-                            let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
-                            ui.add(egui::Label::new(format!("{icon} {}", doc.tree.path(id))).truncate());
                         });
-                    }
-                });
+                    });
                 if let Some(u) = unmark
                     && doc.toggle_mark(u).is_ok() {
                     *error = None;
                 }
-                ui.separator();
+                ui.add_space(8.0);
                 if let RecycleBin::Unavailable(r) = *bin {
-                    ui.colored_label(t.warn, tr!("⚠ {r}. 영구 삭제만 가능합니다.", "⚠ {r}. Only permanent deletion is possible."));
+                    ui.colored_label(t.warn_text, tr!("⚠ {r}. 영구 삭제만 가능합니다.", "⚠ {r}. Only permanent deletion is possible."));
                 }
-                let recycle = ui
-                    .add_enabled_ui(matches!(bin, RecycleBin::Available { .. }), |ui| {
-                        ui.radio_value(method, Method::Recycle, tr("휴지통으로 이동 (되돌릴 수 있음)", "Move to Recycle Bin (can be undone)"))
+                ui.label(theme::caption(tr("삭제 방법", "Method")).color(t.text_tertiary));
+                let (recycle, permanent) = ui
+                    .scope(|ui| {
+                        // 줄 사이 6. 라디오 점은 egui 그대로 text.primary (보드)
+                        ui.spacing_mut().item_spacing.y = 6.0;
+                        let recycle = ui
+                            .add_enabled_ui(matches!(bin, RecycleBin::Available { .. }), |ui| {
+                                ui.radio_value(method, Method::Recycle, tr("휴지통으로 이동 (되돌릴 수 있음)", "Move to Recycle Bin (can be undone)"))
+                            })
+                            .inner;
+                        (recycle, ui.radio_value(method, Method::Permanent, tr("영구 삭제 (되돌릴 수 없음)", "Delete permanently (cannot be undone)")))
                     })
                     .inner;
                 let recycle = match *bin {
@@ -193,61 +211,92 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     }
                     RecycleBin::Available { capacity: None } => recycle,
                 };
-                let permanent =
-                    ui.radio_value(method, Method::Permanent, tr("영구 삭제 (되돌릴 수 없음)", "Delete permanently (cannot be undone)"));
                 // 방법을 바꾸면 영구 삭제 확인도 처음부터 다시 받는다
                 if recycle.changed() || permanent.changed() {
                     *error = None;
                     *confirmed = false;
                 }
-                if *method == Method::Permanent
-                    && ui.checkbox(confirmed, RichText::new(tr("되돌릴 수 없다는 것을 이해했습니다", "I understand this cannot be undone")).color(t.danger_text)).changed() {
-                    *error = None;
+                if *method == Method::Permanent {
+                    ui.add_space(2.0);
+                    // 라디오 글자에 맞춰 24 들여 쓰고, 체크하면 mark 면에 흰 체크 (보드 accent-color #DC3C3C)
+                    let changed = ui
+                        .horizontal(|ui| {
+                            ui.add_space(24.0);
+                            if *confirmed {
+                                let w = &mut ui.visuals_mut().widgets;
+                                for s in [&mut w.inactive, &mut w.hovered, &mut w.active] {
+                                    (s.bg_fill, s.weak_bg_fill, s.bg_stroke.color, s.fg_stroke.color) = (t.mark, t.mark, t.mark, t.on_danger);
+                                }
+                            }
+                            let text = RichText::new(tr("되돌릴 수 없다는 것을 이해했습니다", "I understand this cannot be undone"));
+                            ui.checkbox(confirmed, text.color(t.danger_text)).changed()
+                        })
+                        .inner;
+                    if changed {
+                        *error = None;
+                    }
                 }
-                ui.add_space(6.0);
                 let blocker = run_blocker(doc, &items, *method, *confirmed, *bin);
-                ui.horizontal(|ui| {
+                theme::dialog_footer(ui, |ui| {
                     let label = match method {
                         Method::Recycle => tr!("🗑 휴지통으로 이동 ({size})", "🗑 Move to Recycle Bin ({size})"),
                         Method::Permanent => tr!("⚠ 영구 삭제 ({size})", "⚠ Delete permanently ({size})"),
                     };
-                    let btn = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(t.danger_fill);
-                    if ui.add_enabled(blocker.is_ok(), btn).clicked() {
+                    // 막힌 버튼은 hover만 받으므로 까닭은 on_hover_text로 붙인다
+                    let run = theme::danger_button(ui, blocker.is_ok(), label);
+                    let run = match &blocker {
+                        Err(Some(why)) => run.on_hover_text(why.as_str()),
+                        _ => run,
+                    };
+                    if run.clicked() {
                         let root = doc.tree.name(Tree::ROOT).to_owned();
                         match build_items(doc, &items, *method, *bin).and_then(|jobs| start(jobs, *method, owner_window(), root)) {
                             Ok(stage) => next = Some(stage),
                             Err(message) => *error = Some(message),
                         }
                     }
-                    if ui.button(tr("취소", "Cancel")).clicked() {
+                    if theme::button(ui, true, tr("취소", "Cancel")).clicked() {
                         open = false;
                     }
                 });
                 if let Err(Some(why)) = &blocker {
-                    ui.label(RichText::new(why).weak());
+                    ui.label(theme::caption(why.as_str()).weak());
                 }
+                // 시작 실패는 danger.text (보드)
                 if let Some(message) = error.as_deref() {
-                    ui.colored_label(t.warn, message);
+                    ui.colored_label(t.danger_text, message);
                 }
             }
             Stage::Running { method, items, done, cancel, started, rx } => {
-                ui.heading(match method {
+                let title = theme::title(ui, match method {
                     Method::Recycle => tr("휴지통으로 옮기는 중…", "Moving to Recycle Bin…"),
                     Method::Permanent => tr("영구 삭제 중…", "Deleting permanently…"),
                 });
+                ui.label(title);
                 let (d, total) = (done.load(Relaxed), items.len());
-                ui.add(egui::ProgressBar::new(d as f32 / total.max(1) as f32).text(format!("{d} / {total}")));
+                let width = ui.available_width();
+                theme::scan_progress(ui, width, Some(d as f32 / total.max(1) as f32));
+                let (dn, tn, secs) = (thousands(d as u64), thousands(total as u64), started.elapsed().as_secs());
+                // 왼쪽 개수, 오른쪽 경과 (12 text.secondary)
+                ui.horizontal(|ui| {
+                    ui.label(theme::caption(format!("{dn} / {tn}")).weak());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(theme::caption(tr!("경과 {secs}초", "Elapsed {secs}s")).weak());
+                    });
+                });
                 if let Some(it) = items.get(d.min(total.saturating_sub(1))) {
-                    ui.add(egui::Label::new(RichText::new(&it.path).monospace().weak()).truncate());
+                    path_label(ui, &it.path, true);
                 }
-                let secs = started.elapsed().as_secs();
-                ui.label(RichText::new(tr!("경과 {secs}초", "Elapsed {secs}s")).weak());
                 // 지금 항목 뒤에 남은 항목이 있을 때만
                 if d + 1 < total {
                     if cancel.load(Relaxed) {
-                        ui.label(RichText::new(tr("지금 항목이 끝나면 멈춥니다", "Stopping after the current item")).weak());
-                    } else if ui.button(tr("남은 항목 취소", "Cancel remaining")).clicked() {
-                        cancel.store(true, Relaxed);
+                        ui.label(theme::caption(tr("지금 항목이 끝나면 멈춥니다", "Stopping after the current item")).weak());
+                    } else {
+                        theme::dialog_footer(ui, |ui| {
+                            if theme::button(ui, true, tr("남은 항목 취소", "Cancel remaining")).clicked() {
+                                cancel.store(true, Relaxed);
+                            }
+                        });
                     }
                 }
                 ui.ctx().request_repaint_after(Duration::from_millis(100));
@@ -267,16 +316,17 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
             Stage::Report { method, finished } => {
                 let (ok, failed): (Vec<&Outcome>, Vec<&Outcome>) = finished.outcomes.iter().partition(|o| o.error.is_none());
                 let size: u64 = ok.iter().map(|o| o.size).sum();
-                ui.heading(tr("삭제 결과", "Deletion results"));
+                let title = theme::title(ui, tr("삭제 결과", "Deletion results"));
+                ui.label(title);
                 if !ok.is_empty() {
-                    let (n, amount) = (ok.len(), human_size(size));
-                    let items_w = plural(n as u64, "item", "items");
+                    let (n, amount) = (thousands(ok.len() as u64), human_size(size));
+                    let items_w = plural(ok.len() as u64, "item", "items");
                     match method {
                         Method::Recycle => {
                             ui.colored_label(t.ok, tr!("✔ 휴지통으로 옮김 {n}개 · {amount}", "✔ Moved {n} {items_w} to Recycle Bin · {amount}"));
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(tr("휴지통을 비우면 공간이 확보됩니다.", "Empty the Recycle Bin to free the space.")).weak());
-                                if ui.small_button(tr("휴지통 열기", "Open Recycle Bin")).clicked() {
+                                if theme::button(ui, true, tr("휴지통 열기", "Open Recycle Bin")).clicked() {
                                     fx.open_bin = true;
                                 }
                             });
@@ -291,41 +341,43 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                         }
                     }
                     let verb = if *method == Method::Recycle { tr("옮긴", "Moved") } else { tr("지운", "Deleted") };
-                    egui::CollapsingHeader::new(tr!("{verb} 항목 {n}개", "{verb} {n} {items_w}")).default_open(false).show(ui, |ui| {
+                    egui::CollapsingHeader::new(RichText::new(tr!("{verb} 항목 {n}개", "{verb} {n} {items_w}")).weak()).default_open(false).show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("done").max_height(160.0).show(ui, |ui| {
                             for o in &ok {
                                 ui.horizontal(|ui| {
-                                    ui.add_sized([80.0, 18.0], egui::Label::new(RichText::new(human_size(o.size)).monospace()));
-                                    ui.add(egui::Label::new(&o.path).truncate());
+                                    size_cell(ui, o.size);
+                                    path_label(ui, &o.path, false);
                                 });
                             }
                         });
                     });
                 }
                 if !failed.is_empty() {
-                    let n = failed.len();
-                    let items_w = plural(n as u64, "item", "items");
-                    ui.colored_label(t.warn, tr!("처리하지 못한 항목 {n}개", "Couldn't process {n} {items_w}"));
+                    let n = thousands(failed.len() as u64);
+                    let items_w = plural(failed.len() as u64, "item", "items");
+                    ui.colored_label(t.warn_text, tr!("처리하지 못한 항목 {n}개", "Couldn't process {n} {items_w}"));
                     egui::ScrollArea::vertical().id_salt("failed").max_height(240.0).show(ui, |ui| {
                         for o in &failed {
-                            ui.label(RichText::new(&o.path).strong());
-                            ui.label(RichText::new(o.error.as_deref().unwrap_or("")).weak());
+                            ui.label(theme::mono(o.path.as_str()).weak());
+                            ui.label(theme::caption(o.error.as_deref().unwrap_or("")).weak());
                             if o.partial {
-                                ui.label(RichText::new(partial_note()).small().color(t.warn));
+                                ui.label(theme::caption(partial_note()).color(t.warn_text));
                             }
                         }
                     });
                     ui.label(
-                        RichText::new(tr(
+                        theme::caption(tr(
                             "처리하지 못한 항목은 표시가 남아 있어 다시 검토할 수 있습니다.",
                             "Items that couldn't be processed stay marked, so you can review them again.",
                         ))
                         .weak(),
                     );
                 }
-                if ui.button(tr("닫기", "Close")).clicked() {
-                    open = false;
-                }
+                theme::dialog_footer(ui, |ui| {
+                    if theme::button(ui, true, tr("닫기", "Close")).clicked() {
+                        open = false;
+                    }
+                });
             }
         }
     });
@@ -336,6 +388,43 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
         open = false;
     }
     open
+}
+
+/// 목록 한 행: 높이 32, 좌우 8, 간격 10. 첫 행이 아니면 위에 line.row 구분선
+fn list_row(ui: &mut egui::Ui, first: bool, add: impl FnOnce(&mut egui::Ui)) {
+    let (x, line) = (ui.max_rect().x_range(), theme::of(ui).line_row);
+    let rect = egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 0))
+        .show(ui, |ui| {
+            theme::control_height(ui, 32.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.horizontal(add);
+        })
+        .response
+        .rect;
+    if !first {
+        ui.painter().hline(x, rect.top(), Stroke::new(1.0, line));
+    }
+}
+
+/// 크기 칸: 폭 80, mono 12, 오른쪽 정렬
+fn size_cell(ui: &mut egui::Ui, size: u64) {
+    let h = ui.spacing().interact_size.y;
+    ui.allocate_ui_with_layout(egui::vec2(80.0, h), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.set_min_width(80.0);
+        ui.label(theme::mono(human_size(size)));
+    });
+}
+
+/// 경로 (mono 12): 남은 폭에 맞춰 가운데를 줄이고, 줄였으면 호버에 전체 경로
+fn path_label(ui: &mut egui::Ui, path: &str, weak: bool) {
+    let shown = theme::middle_ellipsis(ui, path, &egui::FontId::monospace(theme::MONO), ui.available_width());
+    let cut = shown != path;
+    let text = if weak { theme::mono(shown).weak() } else { theme::mono(shown) };
+    let resp = ui.add(egui::Label::new(text).truncate());
+    if cut {
+        resp.on_hover_text(path);
+    }
 }
 
 /// 결과를 앱에 넘기고 결과 화면으로 간다. 표시는 지운 항목에서만 빠지므로 실패한 항목은 다시 검토할 수 있다.
