@@ -22,7 +22,10 @@ use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
 use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
 use darak_core::search::{Query, now_secs2000};
 use crate::search_panel;
+use crate::settings::{self, LangPref};
 use crate::theme;
+use darak_core::i18n::{set_lang, tr};
+use darak_core::tr;
 use crate::treemap::{self, Detail, Highlights, Item, ItemKind, Layout, LayoutSource, Morph, MorphKey, Style, ZoomAnim};
 
 pub struct App {
@@ -65,6 +68,8 @@ pub struct App {
     morph: Morph,
     morph_items: Vec<Item>,
     morph_until: Option<Instant>,
+    /// 화면 언어 고르기 (Windows 언어·한국어·영어)
+    lang_pref: LangPref,
     #[cfg(feature = "perf")]
     perf_trace: Option<crate::perf_trace::PerfTrace>,
     #[cfg(feature = "perf")]
@@ -151,7 +156,7 @@ struct Scanning {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext, mut search: SearchController, mut preview: PreviewController,
+    pub fn new(cc: &eframe::CreationContext, mut search: SearchController, mut preview: PreviewController, lang_pref: LangPref,
         #[cfg(feature = "perf")] fixture: Option<(Doc, String)>,
         #[cfg(feature = "perf")] trace: Option<crate::perf_trace::PerfTrace>,
     ) -> Self {
@@ -191,6 +196,7 @@ impl App {
             morph: Morph::default(),
             morph_items: Vec::new(),
             morph_until: None,
+            lang_pref,
             #[cfg(feature = "perf")] perf_trace: trace,
             #[cfg(feature = "perf")] perf_fixture_id: None,
             #[cfg(feature = "perf")] perf_measurement: None,
@@ -966,6 +972,7 @@ impl App {
                     }
                 }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.language_picker(ui));
         });
         if review {
             self.open_delete_review();
@@ -1037,6 +1044,30 @@ impl App {
             self.rescan();
         }
         ui.add_space(4.0);
+    }
+
+    /// 툴바 오른쪽 끝의 화면 언어. 바꾸면 바로 다시 그리고, 고른 값만 settings.toml에 남긴다.
+    fn language_picker(&mut self, ui: &mut egui::Ui) {
+        let before = self.lang_pref;
+        egui::ComboBox::from_id_salt("language")
+            .selected_text(format!("🌐 {}", self.lang_pref.label()))
+            .show_ui(ui, |ui| {
+                for pref in LangPref::ALL {
+                    ui.selectable_value(&mut self.lang_pref, pref, pref.label());
+                }
+            })
+            .response
+            .on_hover_text(tr("화면 언어", "Display language"));
+        if self.lang_pref == before {
+            return;
+        }
+        set_lang(self.lang_pref.resolve());
+        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Title(window_title(self.elevated).into()));
+        // 트리맵의 묶음 이름처럼 레이아웃에 들어간 문구도 새 언어로
+        self.layout.invalidate();
+        if let Err(e) = settings::save(self.lang_pref) {
+            self.toast(tr!("언어 설정을 저장하지 못했습니다: {e}", "Couldn't save the language setting: {e}"));
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1884,6 +1915,11 @@ fn unread_children(tree: &Tree, id: NodeId) -> Option<String> {
     })
 }
 
+/// 창 제목. 관리자 창은 Windows의 '관리자: 명령 프롬프트'와 같은 관례를 따른다.
+pub fn window_title(elevated: bool) -> &'static str {
+    if elevated { tr("관리자: Darak", "Administrator: Darak") } else { "Darak" }
+}
+
 fn fmt_duration(secs: f64) -> String {
     let s = secs.round() as u64;
     if s < 60 { format!("{s}초") } else { format!("{}분 {:02}초", s / 60, s % 60) }
@@ -2235,6 +2271,7 @@ mod tests {
             morph: Morph::default(),
             morph_items: Vec::new(),
             morph_until: None,
+            lang_pref: LangPref::Ko,
             #[cfg(feature = "perf")] perf_trace: None,
             #[cfg(feature = "perf")] perf_fixture_id: None,
             #[cfg(feature = "perf")] perf_measurement: None,

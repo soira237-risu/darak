@@ -173,6 +173,7 @@ unsafe extern "system" {
     pub fn GetSystemWindowsDirectoryW(buf: *mut u16, size: u32) -> u32;
     pub fn GetErrorMode() -> u32;
     pub fn SetErrorMode(mode: u32) -> u32;
+    pub fn GetUserDefaultUILanguage() -> u16;
 }
 
 #[link(name = "advapi32")]
