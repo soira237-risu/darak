@@ -70,9 +70,6 @@ crates/
   darak/        egui 앱: 트리맵, 검색 패널, 삭제 검토, 드라이브 정보
   darak-cli/    벤치마크·디버깅용 CLI
 scripts/        CI 스모크 테스트 (성능 측정, 검색 비교)
-tools/          아이콘 생성 스크립트
-design/icon/    아이콘 원본
-docs/PLAN.md    설계 문서와 진행 상황
 ```
 
 ## 개발
