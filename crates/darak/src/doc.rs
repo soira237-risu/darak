@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use crate::search_worker::{SearchCompletion, SearchKey};
 
+use darak_core::i18n::tr;
 use darak_core::remove::{Guard, protected_reason_as};
+use darak_core::tr;
 use darak_core::search::{SearchResult, now_secs2000};
 use darak_core::{Kind, NodeId, ScanStats, SizeMode, Tree};
 
@@ -192,13 +194,17 @@ impl Doc {
         }
         // 표시 해제는 위에서 끝났다. 새 표시만 막는다
         if self.stats.cancelled {
-            return Err("중지한 스캔의 일부 결과라 삭제 표시를 할 수 없습니다 · 다시 스캔하세요".into());
+            return Err(tr(
+                "중지한 스캔의 일부 결과라 삭제 표시를 할 수 없습니다 · 다시 스캔하세요",
+                "Partial results of a stopped scan can't be marked · Rescan",
+            )
+            .into());
         }
         if self.mark_state(id) == 2 {
-            return Err("상위 폴더가 이미 삭제 표시되어 있습니다".into());
+            return Err(tr("상위 폴더가 이미 삭제 표시되어 있습니다", "A parent folder is already marked").into());
         }
         if let Some(r) = self.protected(id) {
-            return Err(format!("보호된 항목: {r}"));
+            return Err(tr!("보호된 항목: {r}", "Protected item: {r}"));
         }
         // 이 항목 아래의 기존 표시는 흡수
         let (tree, before) = (&self.tree, self.marks.len());

@@ -12,8 +12,10 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
+use crate::i18n::{plural, tr};
 use crate::scan::{ScanMethod, ScanProgress, ScanStats};
 use crate::sys::*;
+use crate::tr;
 use crate::tree::{Kind, NO_NODE, Node, Tree, filetime_to_secs2000, flags};
 
 const ROOT_RECORD: u32 = 5;
@@ -35,37 +37,39 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
     if progress.is_cancelled() {
         return Err(interrupted());
     }
-    let letter = root.chars().next().filter(|c| c.is_ascii_alphabetic()).ok_or_else(|| invalid("드라이브 루트가 아님"))?;
+    let letter = root.chars().next().filter(|c| c.is_ascii_alphabetic()).ok_or_else(|| invalid(tr("드라이브 루트가 아님", "Not a drive root")))?;
     let vol = open_volume(letter)?;
     let vd = volume_data(&vol)?;
     let rec_size = vd.BytesPerFileRecordSegment as usize;
     let cluster = vd.BytesPerCluster as u64;
     if !(512..=65536).contains(&rec_size) || !rec_size.is_power_of_two() || !cluster.is_power_of_two() || cluster < 512 || cluster > CHUNK_BYTES as u64 {
-        return Err(invalid("지원하지 않는 NTFS 레코드 크기"));
+        return Err(invalid(tr("지원하지 않는 NTFS 레코드 크기", "Unsupported NTFS record size")));
     }
 
     // 레코드 0 = $MFT 자신. 클러스터 단위로 읽어 정렬 조건을 맞춘다.
     let mut first = AlignedBuf::new(rec_size.max(cluster as usize));
     let first_offset = u64::try_from(vd.MftStartLcn).ok().and_then(|lcn| lcn.checked_mul(cluster))
-        .ok_or_else(|| invalid("$MFT 시작 위치가 잘못됨"))?;
-    first_offset.checked_add(first.len as u64).ok_or_else(|| invalid("$MFT 시작 읽기 위치 오버플로"))?;
+        .ok_or_else(|| invalid(tr("$MFT 시작 위치가 잘못됨", "Invalid $MFT start position")))?;
+    first_offset.checked_add(first.len as u64).ok_or_else(|| invalid(tr("$MFT 시작 읽기 위치 오버플로", "$MFT start read position overflow")))?;
     read_at(&vol, first_offset, first.as_mut())?;
     let rec0 = &mut first.as_mut()[..rec_size];
     if !apply_fixup(rec0) {
-        return Err(invalid("$MFT 레코드 0 손상"));
+        return Err(invalid(tr("$MFT 레코드 0 손상", "$MFT record 0 is corrupt")));
     }
-    let runs = mft_runs(rec0).ok_or_else(|| invalid("$MFT data run을 찾지 못함 (조각이 너무 많을 수 있음)"))?;
-    let mft_bytes = u64::try_from(vd.MftValidDataLength).map_err(|_| invalid("$MFT 유효 길이가 잘못됨"))?;
+    let runs = mft_runs(rec0).ok_or_else(|| invalid(tr("$MFT data run을 찾지 못함 (조각이 너무 많을 수 있음)", "$MFT data runs not found (it may be too fragmented)")))?;
+    let mft_bytes = u64::try_from(vd.MftValidDataLength).map_err(|_| invalid(tr("$MFT 유효 길이가 잘못됨", "Invalid $MFT valid data length")))?;
     validate_run_alignment(&runs, cluster, rec_size, mft_bytes)?;
     drop(first);
-    let total_records = usize::try_from(mft_bytes / rec_size as u64).map_err(|_| invalid("$MFT 레코드 수가 너무 큼"))?;
+    let total_records = usize::try_from(mft_bytes / rec_size as u64).map_err(|_| invalid(tr("$MFT 레코드 수가 너무 큼", "Too many $MFT records")))?;
     if total_records <= ROOT_RECORD as usize || total_records > u32::MAX as usize {
-        return Err(invalid("지원하지 않는 $MFT 레코드 수"));
+        return Err(invalid(tr("지원하지 않는 $MFT 레코드 수", "Unsupported $MFT record count")));
     }
 
     let mut recs = Records::new(total_records);
     progress.total_hint.store(total_records as u64, Relaxed);
-    *progress.current.lock().unwrap() = format!("{root} $MFT 읽는 중 ({} 레코드)", crate::thousands(total_records as u64));
+    let count = crate::thousands(total_records as u64);
+    let records = plural(total_records as u64, "record", "records");
+    *progress.current.lock().unwrap() = tr!("{root} $MFT 읽는 중 ({count} 레코드)", "Reading {root} $MFT ({count} {records})");
 
     // 리더 스레드: data run을 따라 CHUNK_BYTES씩 읽어 보낸다
     let (tx, rx) = mpsc::sync_channel::<io::Result<(usize, AlignedBuf, usize)>>(3);
@@ -133,7 +137,7 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
         return Err(interrupted());
     }
 
-    *progress.current.lock().unwrap() = format!("{root} 트리 구성 중");
+    *progress.current.lock().unwrap() = tr!("{root} 트리 구성 중", "Building the tree for {root}");
     let display = format!("{}:\\", letter.to_ascii_uppercase());
     let (tree, orphans, dups) = recs.build_tree(&display, dedupe_hardlinks);
     let root_node = tree.node(Tree::ROOT);
@@ -154,32 +158,32 @@ pub fn scan_volume(root: &str, progress: &ScanProgress, dedupe_hardlinks: bool) 
 /// The reader parses each run independently; reject boundaries that split FILE records.
 fn validate_run_alignment(runs: &[(u64, u64)], cluster: u64, rec_size: usize, mft_bytes: u64) -> io::Result<()> {
     if !(512..=65536).contains(&rec_size) || !rec_size.is_power_of_two() {
-        return Err(invalid("지원하지 않는 NTFS 레코드 크기"));
+        return Err(invalid(tr("지원하지 않는 NTFS 레코드 크기", "Unsupported NTFS record size")));
     }
     if !cluster.is_power_of_two() || cluster < 512 || cluster > CHUNK_BYTES as u64
         || !CHUNK_BYTES.is_multiple_of(rec_size) || !(CHUNK_BYTES as u64).is_multiple_of(cluster) {
-        return Err(invalid("지원하지 않는 NTFS 읽기 chunk 정렬"));
+        return Err(invalid(tr("지원하지 않는 NTFS 읽기 chunk 정렬", "Unsupported NTFS read chunk alignment")));
     }
     if !mft_bytes.is_multiple_of(rec_size as u64) {
-        return Err(invalid("$MFT 유효 길이가 레코드 경계에 맞지 않음"));
+        return Err(invalid(tr("$MFT 유효 길이가 레코드 경계에 맞지 않음", "$MFT valid data length doesn't match record boundaries")));
     }
     let mut remaining = mft_bytes;
     for &(lcn, clusters) in runs {
         if remaining == 0 {
             break; // Unused allocation is not read or parsed.
         }
-        let offset = lcn.checked_mul(cluster).ok_or_else(|| invalid("$MFT run 위치 오버플로"))?;
-        let bytes = clusters.checked_mul(cluster).ok_or_else(|| invalid("$MFT run 길이 오버플로"))?;
+        let offset = lcn.checked_mul(cluster).ok_or_else(|| invalid(tr("$MFT run 위치 오버플로", "$MFT run position overflow")))?;
+        let bytes = clusters.checked_mul(cluster).ok_or_else(|| invalid(tr("$MFT run 길이 오버플로", "$MFT run length overflow")))?;
         let used = bytes.min(remaining);
         if !used.is_multiple_of(rec_size as u64) {
-            return Err(invalid("$MFT run 경계가 FILE 레코드를 나눔"));
+            return Err(invalid(tr("$MFT run 경계가 FILE 레코드를 나눔", "$MFT run boundary splits a FILE record")));
         }
-        let read_bytes = used.checked_next_multiple_of(cluster).ok_or_else(|| invalid("$MFT 읽기 길이 오버플로"))?;
-        offset.checked_add(read_bytes).ok_or_else(|| invalid("$MFT 읽기 위치 오버플로"))?;
+        let read_bytes = used.checked_next_multiple_of(cluster).ok_or_else(|| invalid(tr("$MFT 읽기 길이 오버플로", "$MFT read length overflow")))?;
+        offset.checked_add(read_bytes).ok_or_else(|| invalid(tr("$MFT 읽기 위치 오버플로", "$MFT read position overflow")))?;
         remaining -= used;
     }
     if remaining != 0 {
-        return Err(invalid("$MFT가 여러 레코드에 걸쳐 있음 (attribute list 미지원)"));
+        return Err(invalid(tr("$MFT가 여러 레코드에 걸쳐 있음 (attribute list 미지원)", "$MFT spans multiple records (attribute lists aren't supported)")));
     }
     Ok(())
 }
@@ -189,7 +193,7 @@ fn invalid(msg: &str) -> io::Error {
 }
 
 fn interrupted() -> io::Error {
-    io::Error::new(io::ErrorKind::Interrupted, "스캔을 중지했습니다")
+    io::Error::new(io::ErrorKind::Interrupted, tr("스캔을 중지했습니다", "Scan stopped"))
 }
 
 fn open_volume(letter: char) -> io::Result<OwnedHandle> {
@@ -244,7 +248,7 @@ fn read_at(vol: &OwnedHandle, offset: u64, buf: &mut [u8]) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         if read == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "볼륨 읽기가 끝에 도달"));
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, tr("볼륨 읽기가 끝에 도달", "Reached the end of the volume while reading")));
         }
         done += read as usize;
     }

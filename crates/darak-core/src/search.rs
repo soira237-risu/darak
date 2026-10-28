@@ -13,6 +13,7 @@
 use memchr::memmem;
 use rayon::prelude::*;
 
+use crate::tr;
 use crate::tree::{Kind, NodeId, SizeMode, Tree, flags};
 
 #[derive(Debug, Clone)]
@@ -49,11 +50,11 @@ impl Query {
                 )
             } else if let Some(v) = syntax.strip_prefix("size:") {
                 if let Some(n) = v.strip_prefix('>') {
-                    Term::SizeGt(parse_size(n).ok_or(format!("크기를 알 수 없음: {n}"))?)
+                    Term::SizeGt(parse_size(n).ok_or(tr!("크기를 알 수 없음: {n}", "Invalid size: {n}"))?)
                 } else if let Some(n) = v.strip_prefix('<') {
-                    Term::SizeLt(parse_size(n).ok_or(format!("크기를 알 수 없음: {n}"))?)
+                    Term::SizeLt(parse_size(n).ok_or(tr!("크기를 알 수 없음: {n}", "Invalid size: {n}"))?)
                 } else {
-                    Term::SizeGt(parse_size(v).ok_or(format!("크기를 알 수 없음: {v}"))?)
+                    Term::SizeGt(parse_size(v).ok_or(tr!("크기를 알 수 없음: {v}", "Invalid size: {v}"))?)
                 }
             } else if let Some(v) = syntax.strip_prefix("dm:") {
                 let (newer, n) = if let Some(n) = v.strip_prefix('<') {
@@ -64,7 +65,7 @@ impl Query {
                     (true, v)
                 };
                 let secs =
-                    parse_age(n).ok_or(format!("기간을 알 수 없음: {n} (예: 7d, 2w, 3m, 1y)"))?;
+                    parse_age(n).ok_or(tr!("기간을 알 수 없음: {n} (예: 7d, 2w, 3m, 1y)", "Invalid duration: {n} (e.g. 7d, 2w, 3m, 1y)"))?;
                 let cutoff = now_secs2000.saturating_sub(secs);
                 if newer {
                     Term::NewerThan(cutoff)

@@ -10,12 +10,16 @@ mod perf_trace;
 mod preview_worker;
 mod search_panel;
 mod search_worker;
+mod settings;
 mod theme;
 mod treemap;
 
 fn main() -> eframe::Result {
     // 매체 없는 카드 리더의 용량을 물어도 시스템 '디스크 없음' 창이 뜨지 않게
     darak_core::scan::suppress_drive_dialogs();
+    // 창 제목과 첫 화면부터 고른 언어로 그린다
+    let lang_pref = settings::load();
+    darak_core::i18n::set_lang(lang_pref.resolve());
     #[cfg(feature = "perf")]
     let fixture = std::env::var("DARAK_PERF_FIXTURE").ok().map(|s| {
         let parts: Vec<_> = s.split(',').collect();
@@ -36,8 +40,7 @@ fn main() -> eframe::Result {
     };
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            // 한국어 Windows의 '관리자: 명령 프롬프트'와 같은 관례
-            .with_title(if darak_core::scan::is_elevated() { "관리자: Darak" } else { "Darak" })
+            .with_title(app::window_title(darak_core::scan::is_elevated()))
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([640.0, 400.0])
             .with_icon(
@@ -49,7 +52,7 @@ fn main() -> eframe::Result {
     let (search, search_runtime) = search_worker::SearchRuntime::new();
     let (preview, preview_runtime) = preview_worker::PreviewRuntime::new();
     let result = eframe::run_native("darak", options, Box::new(move |cc| Ok(Box::new(app::App::new(
-        cc, search, preview,
+        cc, search, preview, lang_pref,
         #[cfg(feature = "perf")] fixture,
         #[cfg(feature = "perf")] trace,
     )))));

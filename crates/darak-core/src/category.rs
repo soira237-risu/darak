@@ -1,5 +1,7 @@
 //! 확장자 → 범주 (treemap 색상과 통계용)
 
+use crate::i18n::tr;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Category {
     Other,
@@ -30,16 +32,16 @@ impl Category {
 
     pub fn label(self) -> &'static str {
         match self {
-            Category::Other => "기타",
-            Category::Video => "동영상",
-            Category::Audio => "오디오",
-            Category::Image => "이미지",
-            Category::Document => "문서",
-            Category::Archive => "압축",
-            Category::Code => "코드",
-            Category::Executable => "실행 파일",
-            Category::System => "시스템",
-            Category::Data => "데이터",
+            Category::Other => tr("기타", "Other"),
+            Category::Video => tr("동영상", "Video"),
+            Category::Audio => tr("오디오", "Audio"),
+            Category::Image => tr("이미지", "Images"),
+            Category::Document => tr("문서", "Documents"),
+            Category::Archive => tr("압축", "Archives"),
+            Category::Code => tr("코드", "Code"),
+            Category::Executable => tr("실행 파일", "Executables"),
+            Category::System => tr("시스템", "System"),
+            Category::Data => tr("데이터", "Data"),
         }
     }
 }

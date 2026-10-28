@@ -4,6 +4,7 @@
 pub mod perf;
 
 pub mod category;
+pub mod i18n;
 pub mod layout;
 pub mod mft;
 pub mod remove;

@@ -2,10 +2,12 @@
 
 use std::io;
 
+use crate::i18n::tr;
 use crate::sys::{
     DRIVE_FIXED, DRIVE_REMOTE, DRIVE_REMOVABLE, GetActiveWindow, GetDriveTypeW, GetVolumeNameForVolumeMountPointW,
     GetVolumePathNameW, HANDLE, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, MAX_PATH, RRF_RT_REG_DWORD, RegGetValueW, wide,
 };
+use crate::tr;
 use crate::tree::{Kind, NodeId, Tree, flags};
 
 /// 보호 비교에만 쓰는 키. 실행 경로는 바꾸지 않는다.
@@ -54,39 +56,39 @@ pub fn protected_reason(tree: &Tree, id: NodeId) -> Option<&'static str> {
 /// 보호 수준 guard에서 이 노드를 지우면 안 되는 이유. 지워도 되면 None.
 pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'static str> {
     if id == Tree::ROOT {
-        return Some("스캔한 루트 폴더");
+        return Some(tr("스캔한 루트 폴더", "Scanned root folder"));
     }
     let n = tree.node(id);
     if n.kind == Kind::Link {
-        return Some("junction/심볼릭 링크 (대상 폴더가 지워질 수 있음)");
+        return Some(tr("junction/심볼릭 링크 (대상 폴더가 지워질 수 있음)", "Junction/symbolic link (its target folder could be deleted)"));
     }
     let mut cur = Some(id);
     while let Some(ancestor) = cur {
         if tree.node(ancestor).has(flags::LOSSY_NAME) {
-            return Some("이름을 정확히 복원할 수 없는 항목 또는 상위 폴더");
+            return Some(tr("이름을 정확히 복원할 수 없는 항목 또는 상위 폴더", "Item or parent folder whose name can't be restored exactly"));
         }
         cur = tree.parent(ancestor);
     }
     let Some(lower) = protection_key(&tree.path(id)) else {
-        return Some("삭제 보호를 확인할 수 없는 경로 (UNC/장치/상대 경로 등)");
+        return Some(tr("삭제 보호를 확인할 수 없는 경로 (UNC/장치/상대 경로 등)", "Path whose protection can't be checked (UNC, device, relative path, etc.)"));
     };
     if lower.len() == 3 {
-        return Some("드라이브 루트");
+        return Some(tr("드라이브 루트", "Drive root"));
     }
 
     let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
     let Some(sys_root) = protection_key(&format!("{}\\", sys_drive.trim_end_matches('\\'))) else {
-        return Some("시스템 경로의 삭제 보호를 확인할 수 없음");
+        return Some(tr("시스템 경로의 삭제 보호를 확인할 수 없음", "Can't check protection for system paths"));
     };
     let sys_drive = &sys_root[..2];
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| format!("{sys_drive}\\windows"));
     let Some(windir) = protection_key(&windir) else {
-        return Some("시스템 경로의 삭제 보호를 확인할 수 없음");
+        return Some(tr("시스템 경로의 삭제 보호를 확인할 수 없음", "Can't check protection for system paths"));
     };
     let home = match std::env::var("USERPROFILE") {
         Ok(home) if !home.is_empty() => match protection_key(&home) {
             Some(home) => home,
-            None => return Some("사용자 경로의 삭제 보호를 확인할 수 없음"),
+            None => return Some(tr("사용자 경로의 삭제 보호를 확인할 수 없음", "Can't check protection for user paths")),
         },
         _ => String::new(),
     };
@@ -96,7 +98,7 @@ pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'st
     let inside =
         |base: &str| !base.is_empty() && (lower == base || lower.starts_with(&format!("{base}\\")));
     if inside(&windir) {
-        return Some("Windows 시스템 폴더");
+        return Some(tr("Windows 시스템 폴더", "Windows system folder"));
     }
     for name in [
         "system volume information",
@@ -107,7 +109,7 @@ pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'st
         "$windows.~ws",
     ] {
         if inside(&format!("{drive}\\{name}")) {
-            return Some("시스템 보호 폴더");
+            return Some(tr("시스템 보호 폴더", "Protected system folder"));
         }
     }
     let exact = [
@@ -126,7 +128,7 @@ pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'st
         format!("{home}\\downloads"),
     ];
     if exact.iter().any(|e| !e.is_empty() && lower == *e) {
-        return Some("시스템/사용자 기본 폴더");
+        return Some(tr("시스템/사용자 기본 폴더", "System/user default folder"));
     }
     if guard == Guard::Admin
         && let Some(reason) = admin_reason(&lower, sys_drive)
@@ -144,7 +146,7 @@ pub fn protected_reason_as(tree: &Tree, id: NodeId, guard: Guard) -> Option<&'st
                 "pagefile.sys" | "hiberfil.sys" | "swapfile.sys" | "dumpstack.log"
             )
         {
-            return Some("시스템 파일");
+            return Some(tr("시스템 파일", "System file"));
         }
     }
     None
@@ -156,16 +158,16 @@ fn admin_reason(lower: &str, sys_drive: &str) -> Option<&'static str> {
     let (parent, _) = lower.rsplit_once('\\')?;
     // 부모가 어느 드라이브든 `x:\program files` 또는 `x:\program files (x86)`
     if matches!(parent.get(3..), Some("program files" | "program files (x86)")) {
-        return Some("설치된 프로그램 폴더 (관리자 권한)");
+        return Some(tr("설치된 프로그램 폴더 (관리자 권한)", "Installed programs folder (administrator)"));
     }
     if parent == format!("{sys_drive}\\programdata") {
-        return Some("공용 프로그램 데이터 (관리자 권한)");
+        return Some(tr("공용 프로그램 데이터 (관리자 권한)", "Shared program data (administrator)"));
     }
     // {sys}\users\<이름> 아래의 꼬리
     let tail: Vec<&str> = lower.strip_prefix(&format!("{sys_drive}\\users\\"))?.split('\\').skip(1).collect();
     match tail[..] {
         [] | ["appdata"] | ["appdata", "local" | "roaming"] | ["documents" | "desktop" | "downloads"] => {
-            Some("사용자 프로필 기본 폴더 (관리자 권한)")
+            Some(tr("사용자 프로필 기본 폴더 (관리자 권한)", "User profile default folder (administrator)"))
         }
         _ => None,
     }
@@ -184,11 +186,11 @@ pub enum RecycleBin {
 /// max_mb는 볼륨의 MaxCapacity(MB)이고, 0은 뜻이 분명하지 않아 모름으로 본다.
 pub fn classify_bin(kind: u32, nuke: bool, max_mb: Option<u32>, policy_off: bool) -> RecycleBin {
     match kind {
-        DRIVE_REMOTE => RecycleBin::Unavailable("네트워크 드라이브에는 휴지통이 없습니다"),
-        DRIVE_REMOVABLE => RecycleBin::Unavailable("이동식 드라이브에는 휴지통이 없습니다"),
-        DRIVE_FIXED if nuke || policy_off => RecycleBin::Unavailable("이 드라이브는 휴지통을 쓰지 않도록 설정되어 있습니다"),
+        DRIVE_REMOTE => RecycleBin::Unavailable(tr("네트워크 드라이브에는 휴지통이 없습니다", "Network drives have no Recycle Bin")),
+        DRIVE_REMOVABLE => RecycleBin::Unavailable(tr("이동식 드라이브에는 휴지통이 없습니다", "Removable drives have no Recycle Bin")),
+        DRIVE_FIXED if nuke || policy_off => RecycleBin::Unavailable(tr("이 드라이브는 휴지통을 쓰지 않도록 설정되어 있습니다", "This drive is set not to use the Recycle Bin")),
         DRIVE_FIXED => RecycleBin::Available { capacity: max_mb.filter(|&m| m > 0).map(|m| u64::from(m) << 20) },
-        _ => RecycleBin::Unavailable("휴지통을 쓸 수 있는 드라이브인지 확인할 수 없습니다"),
+        _ => RecycleBin::Unavailable(tr("휴지통을 쓸 수 있는 드라이브인지 확인할 수 없습니다", "Can't tell whether this drive has a Recycle Bin")),
     }
 }
 
@@ -286,8 +288,11 @@ impl RecycleBlock {
     pub fn reason(&self) -> String {
         match self {
             Self::NoBin(r) => (*r).into(),
-            Self::LongPath => "경로가 260자 이상이라 휴지통으로 보낼 수 없습니다".into(),
-            Self::TooLarge { capacity } => format!("휴지통 최대 크기({})보다 큽니다", crate::human_size(*capacity)),
+            Self::LongPath => tr("경로가 260자 이상이라 휴지통으로 보낼 수 없습니다", "The path is 260 characters or longer, so it can't go to the Recycle Bin").into(),
+            Self::TooLarge { capacity } => {
+                let size = crate::human_size(*capacity);
+                tr!("휴지통 최대 크기({size})보다 큽니다", "Larger than the Recycle Bin's maximum size ({size})")
+            }
         }
     }
 }
@@ -344,7 +349,7 @@ pub fn owner_window() -> isize {
 /// 경고창이 떠 있는 동안 owner 창은 입력을 받지 않는다 (정상).
 pub fn recycle(path: &str, owner: isize) -> io::Result<()> {
     if path.encode_utf16().count() >= MAX_PATH {
-        return Err(io::Error::other("경로가 너무 길어 휴지통으로 보낼 수 없습니다 (영구 삭제만 가능)"));
+        return Err(io::Error::other(tr("경로가 너무 길어 휴지통으로 보낼 수 없습니다 (영구 삭제만 가능)", "The path is too long for the Recycle Bin (it can only be deleted permanently)")));
     }
     let mut from = wide(path);
     from.push(0); // 이중 NUL
@@ -362,22 +367,30 @@ pub fn recycle(path: &str, owner: isize) -> io::Result<()> {
     if r != 0 {
         return Err(match describe(r) {
             Some((kind, message)) => io::Error::new(kind, message),
-            None => io::Error::other(format!("휴지통으로 옮기지 못했습니다 (코드 0x{r:X})")),
+            None => io::Error::other(tr!("휴지통으로 옮기지 못했습니다 (코드 0x{r:X})", "Couldn't move to the Recycle Bin (code 0x{r:X})")),
         });
     }
     if op.fAnyOperationsAborted != 0 {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "Windows의 영구 삭제 확인에서 취소해 지우지 않았습니다"));
+        return Err(io::Error::new(io::ErrorKind::Interrupted, tr("Windows의 영구 삭제 확인에서 취소해 지우지 않았습니다", "Canceled at the Windows permanent deletion prompt; nothing was deleted")));
     }
     if std::fs::symlink_metadata(path).is_ok() {
-        return Err(io::Error::other("일부 항목을 휴지통으로 옮기지 못했습니다 (사용 중인 파일일 수 있음)"));
+        return Err(io::Error::other(tr("일부 항목을 휴지통으로 옮기지 못했습니다 (사용 중인 파일일 수 있음)", "Some items couldn't be moved to the Recycle Bin (files may be in use)")));
     }
     Ok(())
 }
 
-const MISSING: &str = "항목을 찾을 수 없습니다 (이미 옮겨졌거나 이름이 바뀌었을 수 있음)";
-const DENIED: &str = "권한이 없습니다 (관리자 권한이 필요하거나 시스템이 보호하는 파일)";
-const TOO_LONG: &str = "경로가 너무 깁니다";
-const CANCELLED: &str = "취소해서 지우지 않았습니다";
+fn missing() -> &'static str {
+    tr("항목을 찾을 수 없습니다 (이미 옮겨졌거나 이름이 바뀌었을 수 있음)", "Item not found (it may have been moved or renamed)")
+}
+fn denied() -> &'static str {
+    tr("권한이 없습니다 (관리자 권한이 필요하거나 시스템이 보호하는 파일)", "Access denied (administrator rights may be needed, or the file is protected by the system)")
+}
+fn too_long() -> &'static str {
+    tr("경로가 너무 깁니다", "The path is too long")
+}
+fn cancelled() -> &'static str {
+    tr("취소해서 지우지 않았습니다", "Canceled; nothing was deleted")
+}
 
 /// SHFileOperationW 실패 코드를 문장으로 바꾼다. DE_* 코드는 일부 Win32 코드와 값이 겹치며
 /// (0x79 = ERROR_SEM_TIMEOUT 등) 여기서는 DE_* 뜻이 먼저다. 모르는 코드면 None.
@@ -385,13 +398,13 @@ fn describe(code: i32) -> Option<(io::ErrorKind, &'static str)> {
     use io::ErrorKind::{Interrupted, NotFound, Other, PermissionDenied};
     Some(match code {
         // DE_INVALIDFILES
-        0x7C => (NotFound, MISSING),
+        0x7C => (NotFound, missing()),
         // DE_ACCESSDENIEDSRC
-        0x78 => (PermissionDenied, DENIED),
+        0x78 => (PermissionDenied, denied()),
         // DE_PATHTOODEEP, DE_FILENAMETOOLONG, DE_ERROR_MAX
-        0x79 | 0x81 | 0xB7 => (Other, TOO_LONG),
+        0x79 | 0x81 | 0xB7 => (Other, too_long()),
         // DE_OPCANCELLED
-        0x75 => (Interrupted, CANCELLED),
+        0x75 => (Interrupted, cancelled()),
         _ => return win32_message(code),
     })
 }
@@ -401,19 +414,19 @@ fn win32_message(code: i32) -> Option<(io::ErrorKind, &'static str)> {
     use io::ErrorKind::{Interrupted, NotFound, Other, PermissionDenied};
     Some(match code {
         // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
-        2 | 3 => (NotFound, MISSING),
+        2 | 3 => (NotFound, missing()),
         // ERROR_ACCESS_DENIED
-        5 => (PermissionDenied, DENIED),
+        5 => (PermissionDenied, denied()),
         // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
-        32 | 33 => (Other, "다른 프로그램이 사용 중인 파일이 있습니다"),
+        32 | 33 => (Other, tr("다른 프로그램이 사용 중인 파일이 있습니다", "A file is in use by another program")),
         // ERROR_DIR_NOT_EMPTY
-        145 => (Other, "폴더 안의 일부 항목을 지우지 못했습니다"),
+        145 => (Other, tr("폴더 안의 일부 항목을 지우지 못했습니다", "Some items in the folder couldn't be deleted")),
         // ERROR_WRITE_PROTECT
-        19 => (Other, "쓰기 금지된 드라이브입니다"),
+        19 => (Other, tr("쓰기 금지된 드라이브입니다", "The drive is write-protected")),
         // ERROR_FILENAME_EXCED_RANGE
-        206 => (Other, TOO_LONG),
+        206 => (Other, too_long()),
         // ERROR_CANCELLED
-        1223 => (Interrupted, CANCELLED),
+        1223 => (Interrupted, cancelled()),
         _ => return None,
     })
 }
@@ -444,16 +457,16 @@ pub fn still_there(path: &str, is_dir: bool, reparse: bool) -> io::Result<()> {
     let ft = match std::fs::symlink_metadata(long_path(path)) {
         Ok(m) => m.file_type(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "이미 없는 항목입니다 (다른 곳에서 지워졌거나 이름이 바뀌었을 수 있음)"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, tr("이미 없는 항목입니다 (다른 곳에서 지워졌거나 이름이 바뀌었을 수 있음)", "The item no longer exists (it may have been deleted or renamed elsewhere)")));
         }
         Err(e) => return Err(humanize(e)),
     };
     // Windows에서 junction과 symlink는 is_symlink()이고 is_dir()이 아니다
     if !reparse && ft.is_symlink() {
-        return Err(io::Error::other("스캔한 뒤 링크로 바뀐 항목입니다"));
+        return Err(io::Error::other(tr("스캔한 뒤 링크로 바뀐 항목입니다", "The item became a link after the scan")));
     }
     if ft.is_dir() != is_dir {
-        return Err(io::Error::other("스캔한 뒤 종류가 바뀐 항목입니다"));
+        return Err(io::Error::other(tr("스캔한 뒤 종류가 바뀐 항목입니다", "The item changed type after the scan")));
     }
     Ok(())
 }

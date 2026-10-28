@@ -7,11 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use darak_core::i18n::{plural, tr};
 use darak_core::remove::{
     RecycleBin, RecycleBlock, delete_permanently, owner_window, recycle, recycle_bin_for, recycle_block, still_there,
     top_level_marks,
 };
 use darak_core::scan::disk_space;
+use darak_core::tr;
 use darak_core::{Kind, NodeId, SizeMode, Tree, flags, human_size, thousands};
 use eframe::egui::{self, Color32, RichText};
 
@@ -93,7 +95,21 @@ pub struct Effects {
 
 const CANCELLED: &str = "취소해서 실행하지 않았습니다";
 const ABORTED: &str = "삭제 작업이 결과 없이 끝났습니다. 일부가 지워졌을 수 있으니 다시 스캔하세요";
-const PARTIAL: &str = "일부가 이미 지워졌거나 휴지통으로 옮겨졌을 수 있습니다. 크기가 실제와 다를 수 있으니 다시 스캔하세요.";
+
+fn cancelled() -> &'static str {
+    tr(CANCELLED, "Skipped because you cancelled")
+}
+
+fn aborted() -> &'static str {
+    tr(ABORTED, "The delete job ended without a result. Some items may have been deleted, so rescan")
+}
+
+fn partial_note() -> &'static str {
+    tr(
+        "일부가 이미 지워졌거나 휴지통으로 옮겨졌을 수 있습니다. 크기가 실제와 다를 수 있으니 다시 스캔하세요.",
+        "Some of it may already be deleted or moved to the Recycle Bin. Sizes may be off, so rescan.",
+    )
+}
 
 /// 창이 닫혀야 하면 false. 앱이 할 일(지운 노드, 일부만 지워진 폴더, 휴지통 열기)은 `fx`에 넣는다.
 pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mode: SizeMode, fx: &mut Effects) -> bool {
@@ -109,24 +125,26 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
             Stage::Review { method, confirmed, error, bin } => {
                 let doc = doc.as_mut().expect("review document identity checked");
                 let items = review_items(doc, mode);
-                ui.heading("삭제 검토");
+                ui.heading(tr("삭제 검토", "Review deletion"));
                 if items.is_empty() {
-                    ui.label(RichText::new("검토할 항목이 없습니다.").weak());
+                    ui.label(RichText::new(tr("검토할 항목이 없습니다.", "Nothing to review.")).weak());
                     ui.add_space(6.0);
-                    if ui.button("닫기").clicked() {
+                    if ui.button(tr("닫기", "Close")).clicked() {
                         open = false;
                     }
                     return;
                 }
                 let total: u64 = items.iter().map(|&i| doc.tree.node(i).size(mode)).sum();
                 let files: u64 = items.iter().map(|&i| doc.tree.node(i).files as u64).sum();
-                ui.label(format!("{}개 항목 · {} · 파일 {}개", items.len(), human_size(total), thousands(files)));
+                let (count, size, nfiles) = (items.len(), human_size(total), thousands(files));
+                let (items_w, files_w) = (plural(count as u64, "item", "items"), plural(files, "file", "files"));
+                ui.label(tr!("{count}개 항목 · {size} · 파일 {nfiles}개", "{count} {items_w} · {size} · {nfiles} {files_w}"));
                 ui.add_space(6.0);
                 let mut unmark = None;
                 egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
                     for &id in &items {
                         ui.horizontal(|ui| {
-                            if ui.small_button("✖").on_hover_text("표시 해제").clicked() {
+                            if ui.small_button("✖").on_hover_text(tr("표시 해제", "Unmark")).clicked() {
                                 unmark = Some(id);
                             }
                             let n = doc.tree.node(id);
@@ -139,12 +157,15 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                             if let Some(b @ (RecycleBlock::LongPath | RecycleBlock::TooLarge { .. })) =
                                 recycle_block(&doc.tree, id, *bin)
                             {
-                                ui.colored_label(t.warn, "⚠ 휴지통 불가").on_hover_text(b.reason());
+                                ui.colored_label(t.warn, tr("⚠ 휴지통 불가", "⚠ Can't recycle")).on_hover_text(b.reason());
                             }
                             // 접근 거부로 읽지 못한 곳이 안에 있다 (트리 합계보다 더 지워진다)
                             if n.incomplete() {
-                                ui.colored_label(t.warn, "⚠ 읽지 못한 하위 폴더 있음")
-                                    .on_hover_text("실제로 지워지는 양은 보이는 크기보다 클 수 있습니다");
+                                ui.colored_label(t.warn, tr("⚠ 읽지 못한 하위 폴더 있음", "⚠ Has unread subfolders"))
+                                    .on_hover_text(tr(
+                                        "실제로 지워지는 양은 보이는 크기보다 클 수 있습니다",
+                                        "More may be deleted than the size shown",
+                                    ));
                             }
                             let icon = if n.kind == Kind::Dir { "📁" } else { "📄" };
                             ui.add(egui::Label::new(format!("{icon} {}", doc.tree.path(id))).truncate());
@@ -157,36 +178,38 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                 }
                 ui.separator();
                 if let RecycleBin::Unavailable(r) = *bin {
-                    ui.colored_label(t.warn, format!("⚠ {r}. 영구 삭제만 가능합니다."));
+                    ui.colored_label(t.warn, tr!("⚠ {r}. 영구 삭제만 가능합니다.", "⚠ {r}. Only permanent deletion is possible."));
                 }
                 let recycle = ui
                     .add_enabled_ui(matches!(bin, RecycleBin::Available { .. }), |ui| {
-                        ui.radio_value(method, Method::Recycle, "휴지통으로 이동 (되돌릴 수 있음)")
+                        ui.radio_value(method, Method::Recycle, tr("휴지통으로 이동 (되돌릴 수 있음)", "Move to Recycle Bin (can be undone)"))
                     })
                     .inner;
                 let recycle = match *bin {
                     RecycleBin::Unavailable(r) => recycle.on_disabled_hover_text(r),
                     RecycleBin::Available { capacity: Some(c) } => {
-                        recycle.on_hover_text(format!("이 드라이브의 휴지통 최대 크기 {}", human_size(c)))
+                        let max = human_size(c);
+                        recycle.on_hover_text(tr!("이 드라이브의 휴지통 최대 크기 {max}", "Maximum Recycle Bin size on this drive: {max}"))
                     }
                     RecycleBin::Available { capacity: None } => recycle,
                 };
-                let permanent = ui.radio_value(method, Method::Permanent, "영구 삭제 (되돌릴 수 없음)");
+                let permanent =
+                    ui.radio_value(method, Method::Permanent, tr("영구 삭제 (되돌릴 수 없음)", "Delete permanently (cannot be undone)"));
                 // 방법을 바꾸면 영구 삭제 확인도 처음부터 다시 받는다
                 if recycle.changed() || permanent.changed() {
                     *error = None;
                     *confirmed = false;
                 }
                 if *method == Method::Permanent
-                    && ui.checkbox(confirmed, RichText::new("되돌릴 수 없다는 것을 이해했습니다").color(t.danger_text)).changed() {
+                    && ui.checkbox(confirmed, RichText::new(tr("되돌릴 수 없다는 것을 이해했습니다", "I understand this cannot be undone")).color(t.danger_text)).changed() {
                     *error = None;
                 }
                 ui.add_space(6.0);
                 let blocker = run_blocker(doc, &items, *method, *confirmed, *bin);
                 ui.horizontal(|ui| {
                     let label = match method {
-                        Method::Recycle => format!("🗑 휴지통으로 이동 ({})", human_size(total)),
-                        Method::Permanent => format!("⚠ 영구 삭제 ({})", human_size(total)),
+                        Method::Recycle => tr!("🗑 휴지통으로 이동 ({size})", "🗑 Move to Recycle Bin ({size})"),
+                        Method::Permanent => tr!("⚠ 영구 삭제 ({size})", "⚠ Delete permanently ({size})"),
                     };
                     let btn = egui::Button::new(RichText::new(label).strong().color(Color32::WHITE)).fill(t.danger_fill);
                     if ui.add_enabled(blocker.is_ok(), btn).clicked() {
@@ -196,7 +219,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                             Err(message) => *error = Some(message),
                         }
                     }
-                    if ui.button("취소").clicked() {
+                    if ui.button(tr("취소", "Cancel")).clicked() {
                         open = false;
                     }
                 });
@@ -209,20 +232,21 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
             }
             Stage::Running { method, items, done, cancel, started, rx } => {
                 ui.heading(match method {
-                    Method::Recycle => "휴지통으로 옮기는 중…",
-                    Method::Permanent => "영구 삭제 중…",
+                    Method::Recycle => tr("휴지통으로 옮기는 중…", "Moving to Recycle Bin…"),
+                    Method::Permanent => tr("영구 삭제 중…", "Deleting permanently…"),
                 });
                 let (d, total) = (done.load(Relaxed), items.len());
                 ui.add(egui::ProgressBar::new(d as f32 / total.max(1) as f32).text(format!("{d} / {total}")));
                 if let Some(it) = items.get(d.min(total.saturating_sub(1))) {
                     ui.add(egui::Label::new(RichText::new(&it.path).monospace().weak()).truncate());
                 }
-                ui.label(RichText::new(format!("경과 {}초", started.elapsed().as_secs())).weak());
+                let secs = started.elapsed().as_secs();
+                ui.label(RichText::new(tr!("경과 {secs}초", "Elapsed {secs}s")).weak());
                 // 지금 항목 뒤에 남은 항목이 있을 때만
                 if d + 1 < total {
                     if cancel.load(Relaxed) {
-                        ui.label(RichText::new("지금 항목이 끝나면 멈춥니다").weak());
-                    } else if ui.button("남은 항목 취소").clicked() {
+                        ui.label(RichText::new(tr("지금 항목이 끝나면 멈춥니다", "Stopping after the current item")).weak());
+                    } else if ui.button(tr("남은 항목 취소", "Cancel remaining")).clicked() {
                         cancel.store(true, Relaxed);
                     }
                 }
@@ -233,7 +257,7 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     Err(mpsc::TryRecvError::Disconnected) => {
                         let outcomes = std::mem::take(items)
                             .into_iter()
-                            .map(|it| Outcome { node: it.node, path: it.path, size: it.size, error: Some(ABORTED.into()), partial: true })
+                            .map(|it| Outcome { node: it.node, path: it.path, size: it.size, error: Some(aborted().into()), partial: true })
                             .collect();
                         next = Some(report(*method, Finished { outcomes, free: None }, fx));
                     }
@@ -243,28 +267,31 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
             Stage::Report { method, finished } => {
                 let (ok, failed): (Vec<&Outcome>, Vec<&Outcome>) = finished.outcomes.iter().partition(|o| o.error.is_none());
                 let size: u64 = ok.iter().map(|o| o.size).sum();
-                ui.heading("삭제 결과");
+                ui.heading(tr("삭제 결과", "Deletion results"));
                 if !ok.is_empty() {
+                    let (n, amount) = (ok.len(), human_size(size));
+                    let items_w = plural(n as u64, "item", "items");
                     match method {
                         Method::Recycle => {
-                            ui.colored_label(t.ok, format!("✔ 휴지통으로 옮김 {}개 · {}", ok.len(), human_size(size)));
+                            ui.colored_label(t.ok, tr!("✔ 휴지통으로 옮김 {n}개 · {amount}", "✔ Moved {n} {items_w} to Recycle Bin · {amount}"));
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("휴지통을 비우면 공간이 확보됩니다.").weak());
-                                if ui.small_button("휴지통 열기").clicked() {
+                                ui.label(RichText::new(tr("휴지통을 비우면 공간이 확보됩니다.", "Empty the Recycle Bin to free the space.")).weak());
+                                if ui.small_button(tr("휴지통 열기", "Open Recycle Bin")).clicked() {
                                     fx.open_bin = true;
                                 }
                             });
                         }
                         Method::Permanent => {
-                            ui.colored_label(t.ok, format!("✔ 영구 삭제 {}개 · {} 확보", ok.len(), human_size(size)));
+                            ui.colored_label(t.ok, tr!("✔ 영구 삭제 {n}개 · {amount} 확보", "✔ Deleted {n} {items_w} permanently · {amount} freed"));
                             // 하드링크처럼 트리 합계와 실제가 다를 때도 실제로 빈 공간을 보여 준다
                             if let Some((before, after)) = finished.free {
-                                ui.label(RichText::new(format!("여유 공간 {} → {}", human_size(before), human_size(after))).weak());
+                                let (before, after) = (human_size(before), human_size(after));
+                                ui.label(RichText::new(tr!("여유 공간 {before} → {after}", "Free space {before} → {after}")).weak());
                             }
                         }
                     }
-                    let verb = if *method == Method::Recycle { "옮긴" } else { "지운" };
-                    egui::CollapsingHeader::new(format!("{verb} 항목 {}개", ok.len())).default_open(false).show(ui, |ui| {
+                    let verb = if *method == Method::Recycle { tr("옮긴", "Moved") } else { tr("지운", "Deleted") };
+                    egui::CollapsingHeader::new(tr!("{verb} 항목 {n}개", "{verb} {n} {items_w}")).default_open(false).show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("done").max_height(160.0).show(ui, |ui| {
                             for o in &ok {
                                 ui.horizontal(|ui| {
@@ -276,19 +303,27 @@ pub fn show(ctx: &egui::Context, dlg: &mut Dialog, mut doc: Option<&mut Doc>, mo
                     });
                 }
                 if !failed.is_empty() {
-                    ui.colored_label(t.warn, format!("처리하지 못한 항목 {}개", failed.len()));
+                    let n = failed.len();
+                    let items_w = plural(n as u64, "item", "items");
+                    ui.colored_label(t.warn, tr!("처리하지 못한 항목 {n}개", "Couldn't process {n} {items_w}"));
                     egui::ScrollArea::vertical().id_salt("failed").max_height(240.0).show(ui, |ui| {
                         for o in &failed {
                             ui.label(RichText::new(&o.path).strong());
                             ui.label(RichText::new(o.error.as_deref().unwrap_or("")).weak());
                             if o.partial {
-                                ui.label(RichText::new(PARTIAL).small().color(t.warn));
+                                ui.label(RichText::new(partial_note()).small().color(t.warn));
                             }
                         }
                     });
-                    ui.label(RichText::new("처리하지 못한 항목은 표시가 남아 있어 다시 검토할 수 있습니다.").weak());
+                    ui.label(
+                        RichText::new(tr(
+                            "처리하지 못한 항목은 표시가 남아 있어 다시 검토할 수 있습니다.",
+                            "Items that couldn't be processed stay marked, so you can review them again.",
+                        ))
+                        .weak(),
+                    );
                 }
-                if ui.button("닫기").clicked() {
+                if ui.button(tr("닫기", "Close")).clicked() {
                     open = false;
                 }
             }
@@ -324,13 +359,25 @@ fn run_blocker(doc: &Doc, items: &[NodeId], method: Method, confirmed: bool, bin
         return Err(None);
     }
     if items.iter().any(|&i| doc.protected(i).is_some()) {
-        return Err(Some("보호된 항목이 있어 실행할 수 없습니다. ✖로 목록에서 빼세요".into()));
+        return Err(Some(
+            tr(
+                "보호된 항목이 있어 실행할 수 없습니다. ✖로 목록에서 빼세요",
+                "Protected items can't be deleted. Remove them from the list with ✖",
+            )
+            .into(),
+        ));
     }
     match method {
         Method::Recycle if matches!(bin, RecycleBin::Unavailable(_)) => Err(None),
         Method::Recycle => match items.iter().filter(|&&i| recycle_block(&doc.tree, i, bin).is_some()).count() {
             0 => Ok(()),
-            n => Err(Some(format!("휴지통으로 보낼 수 없는 항목이 {n}개 있습니다. ✖로 목록에서 빼거나 영구 삭제를 고르세요"))),
+            n => {
+                let items_w = plural(n as u64, "item", "items");
+                Err(Some(tr!(
+                    "휴지통으로 보낼 수 없는 항목이 {n}개 있습니다. ✖로 목록에서 빼거나 영구 삭제를 고르세요",
+                    "{n} {items_w} can't go to the Recycle Bin. Remove with ✖ or choose Delete permanently"
+                )))
+            }
         },
         Method::Permanent if !confirmed => Err(None),
         Method::Permanent => Ok(()),
@@ -342,24 +389,25 @@ fn run_blocker(doc: &Doc, items: &[NodeId], method: Method, confirmed: bool, bin
 fn build_items(doc: &Doc, ids: &[NodeId], method: Method, bin: RecycleBin) -> Result<Vec<Item>, String> {
     // 앱이 표시와 검토를 막지만 한 번 더 막는다 (읽지 않은 폴더가 0 B로 보이는 결과)
     if doc.stats.cancelled {
-        return Err("중지한 스캔의 결과로는 삭제할 수 없습니다".into());
+        return Err(tr("중지한 스캔의 결과로는 삭제할 수 없습니다", "Can't delete using the results of a stopped scan").into());
     }
     ids.iter()
         .map(|&id| {
             if id as usize >= doc.tree.len() {
-                return Err("삭제할 항목이 현재 문서에 없습니다".into());
+                return Err(tr("삭제할 항목이 현재 문서에 없습니다", "The item to delete isn't in the current document").into());
             }
             if doc.tree.node(id).has(flags::REMOVED) {
-                return Err("이미 삭제된 항목입니다".into());
+                return Err(tr("이미 삭제된 항목입니다", "Item already deleted").into());
             }
             if let Some(reason) = doc.protected(id) {
-                return Err(format!("보호된 항목: {reason}"));
+                return Err(tr!("보호된 항목: {reason}", "Protected item: {reason}"));
             }
             let path = doc.tree.path(id);
             if method == Method::Recycle
                 && let Some(block) = recycle_block(&doc.tree, id, bin)
             {
-                return Err(format!("휴지통으로 보낼 수 없는 항목: {path} ({})", block.reason()));
+                let why = block.reason();
+                return Err(tr!("휴지통으로 보낼 수 없는 항목: {path} ({why})", "Can't move to Recycle Bin: {path} ({why})"));
             }
             let n = doc.tree.node(id);
             Ok(Item { node: id, path, is_dir: n.kind == Kind::Dir, reparse: n.has(flags::REPARSE), size: n.alloc })
@@ -391,7 +439,7 @@ fn start(items: Vec<Item>, method: Method, owner: isize, root: String) -> Result
             );
             let _ = tx.send(Finished { outcomes, free: before.zip(free()) });
         })
-        .map_err(|e| format!("삭제 작업을 시작하지 못했습니다: {e}"))?;
+        .map_err(|e| tr!("삭제 작업을 시작하지 못했습니다: {e}", "Couldn't start deleting: {e}"))?;
     Ok(Stage::Running { method, items, done, cancel, started: Instant::now(), rx })
 }
 
@@ -408,7 +456,7 @@ fn run_items(
         .into_iter()
         .map(|it| {
             let (error, partial) = if cancel.load(Relaxed) {
-                (Some(CANCELLED.to_owned()), false)
+                (Some(cancelled().to_owned()), false)
             } else {
                 match check(&it).map(|()| remove(&it)) {
                     Err(e) => (Some(e.to_string()), false),
