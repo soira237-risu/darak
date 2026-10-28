@@ -163,7 +163,9 @@ try {
     # Guard the overlay: the baseline lib gains only the optional perf module
     # (inserted into the baseline's own lib, so later candidate modules never
     # leak into it), and the manifest change must be only the perf
-    # feature/example registration.
+    # feature/example registration plus package metadata, which does not
+    # affect the build. The baseline manifest is its own plus the
+    # registration, because its workspace root has no `repository` to inherit.
     $lib = [IO.File]::ReadAllText((Join-Path $repo 'crates/darak-core/src/lib.rs')).Replace("`r`n", "`n")
     $oldLib = [IO.File]::ReadAllText((Join-Path $baseline 'crates/darak-core/src/lib.rs')).Replace("`r`n", "`n")
     $perfModule = "#[cfg(feature = `"perf`")]`npub mod perf;`n`n"
@@ -174,8 +176,12 @@ try {
     $manifest = [IO.File]::ReadAllText((Join-Path $repo 'crates/darak-core/Cargo.toml')).Replace("`r`n", "`n")
     $oldManifest = [IO.File]::ReadAllText((Join-Path $baseline 'crates/darak-core/Cargo.toml')).Replace("`r`n", "`n")
     $registration = "`n[features]`nperf = []`n`n[[example]]`nname = `"search_bench`"`nrequired-features = [`"perf`"]`n"
-    Assert-True ($manifest.Replace($registration, '') -ceq $oldManifest) 'Core manifest overlay includes a non-harness change'
-    $overlay = @('crates/darak-core/src/perf.rs', 'crates/darak-core/Cargo.toml', 'crates/darak-core/examples/search_bench.rs')
+    $packageMetadata = '(?m)^(repository\.workspace = true|description = "[^"\n]*")\n'
+    Assert-True (($manifest.Replace($registration, '') -replace $packageMetadata, '') -ceq $oldManifest) 'Core manifest overlay includes a non-harness change'
+    $baselineManifestPath = Join-Path $baseline 'crates/darak-core/Cargo.toml'
+    [IO.File]::WriteAllText($baselineManifestPath, $oldManifest + $registration, [Text.UTF8Encoding]::new($false))
+    $metadata.harness += [ordered]@{ path = 'crates/darak-core/Cargo.toml'; sha256 = (Get-FileHash -Algorithm SHA256 $baselineManifestPath).Hash }
+    $overlay = @('crates/darak-core/src/perf.rs', 'crates/darak-core/examples/search_bench.rs')
     foreach ($relative in $overlay) {
         $source = Join-Path $repo $relative
         $destination = Join-Path $baseline $relative
