@@ -540,6 +540,16 @@ pub fn icon_button(ui: &mut Ui, enabled: bool, glyph: &str, size: f32) -> Respon
 
 /// 세그먼트 트랙: inset 바탕, 1px line, 모서리 4, 안쪽 2, 간격 2. 안에서 `segment`를 부른다. 전체 높이 28.
 pub fn segments<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    track(ui, H_TOOLBAR - 6.0, add)
+}
+
+/// 패널 탭 트랙 (ViewList 보드): `segments`와 같은 모양에 줄 높이 20 (`tab` 높이), 전체 높이 26
+pub fn tabs<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
+    track(ui, H_SMALL - 4.0, add)
+}
+
+/// 세그먼트 · 탭 트랙의 공통 모양. 안의 줄 높이는 `h`
+fn track<R>(ui: &mut Ui, h: f32, add: impl FnOnce(&mut Ui) -> R) -> InnerResponse<R> {
     let t = of(ui);
     Frame::new()
         .fill(t.surface_inset)
@@ -548,7 +558,7 @@ pub fn segments<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> InnerResponse
         .inner_margin(Margin::same(2))
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            control_height(ui, H_TOOLBAR - 6.0);
+            control_height(ui, h);
             ui.horizontal(add).inner
         })
 }
@@ -567,6 +577,68 @@ pub fn segment(ui: &mut Ui, on: bool, text: &str) -> Response {
             p.rect_filled(rect, CornerRadius::same(R_CHIP), t.line);
         }
         let fg = if on || resp.hovered() { t.text_primary } else { t.text_secondary };
+        p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+        if resp.has_focus() && keyboard_nav(ui.ctx()) {
+            ring(p, rect, t.accent);
+        }
+    }
+    resp
+}
+
+/// 패널 탭 하나 (`tabs` 트랙 안, ViewList 보드): 높이 20, 폭 `w` 이상, 12px.
+/// 켜짐 line 면 · text.primary 600, 꺼짐 text.secondary, 쓸 수 없으면 text.faint (검색어가 없을 때의 '검색 결과')
+pub fn tab(ui: &mut Ui, on: bool, enabled: bool, text: &str, w: f32) -> Response {
+    let t = of(ui);
+    let family = if on { crate::fonts::semibold_family(ui.ctx()) } else { FontFamily::Proportional };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::new(CAPTION, family), Color32::PLACEHOLDER);
+    let size = vec2(w.max(galley.size().x + 16.0), H_SMALL - 4.0);
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, on, text));
+    if ui.is_rect_visible(rect) {
+        let p = ui.painter();
+        if on {
+            p.rect_filled(rect, CornerRadius::same(R_CHIP), t.line);
+        }
+        let fg = if !enabled {
+            t.text_faint
+        } else if on || resp.hovered() {
+            t.text_primary
+        } else {
+            t.text_secondary
+        };
+        p.galley(rect.center() - galley.size() / 2.0, galley, fg);
+        if resp.has_focus() && keyboard_nav(ui.ctx()) {
+            ring(p, rect, t.accent);
+        }
+    }
+    resp
+}
+
+// ───────────── 토글 버튼 ─────────────
+
+/// 켜고 끄는 툴바 버튼 (ViewList 보드 '목록 패널'): 켜짐은 켜진 세그먼트처럼 line 면 · line 테두리 · 600,
+/// 꺼짐은 보조 버튼. 최소 폭 84, 높이는 현재 `interact_size.y`. 쓸 수 없으면 꺼진 모양의 비활성 버튼으로 그리고
+/// hover만 받는다 (까닭은 `on_hover_text`로 붙인다).
+pub fn toggle_button(ui: &mut Ui, enabled: bool, on: bool, text: &str) -> Response {
+    let t = of(ui);
+    let enabled = enabled && ui.is_enabled();
+    let on = on && enabled;
+    let family = if on { crate::fonts::semibold_family(ui.ctx()) } else { FontFamily::Proportional };
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), FontId::new(BODY, family), Color32::PLACEHOLDER);
+    let size = vec2((galley.size().x + 24.0).max(84.0), ui.spacing().interact_size.y);
+    let (rect, resp) = ui.allocate_exact_size(size, if enabled { Sense::click() } else { Sense::hover() });
+    resp.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, on, text));
+    if ui.is_rect_visible(rect) {
+        let (hover, down) = (resp.hovered(), resp.is_pointer_button_down_on());
+        let (fill, stroke, fg) = if on {
+            (t.line, if hover { t.line_hover } else { t.line }, t.text_primary)
+        } else {
+            look(t, Kind::Secondary, enabled, hover, down)
+        };
+        let p = ui.painter();
+        let r = CornerRadius::same(R_CONTROL);
+        p.rect_filled(rect, r, fill);
+        p.rect_stroke(rect, r, Stroke::new(1.0, stroke), StrokeKind::Inside);
         p.galley(rect.center() - galley.size() / 2.0, galley, fg);
         if resp.has_focus() && keyboard_nav(ui.ctx()) {
             ring(p, rect, t.accent);

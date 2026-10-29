@@ -21,9 +21,11 @@ use crate::drives::{Space, Volumes};
 use crate::preview_worker::{PreviewController, PreviewPacket, PreviewRequest};
 use crate::search_worker::{SearchController, SearchKey, SearchRequest, ReleaseFence, SearchControlEvent};
 use darak_core::search::{Query, now_secs2000};
+use crate::list_panel;
 use crate::search_panel;
 use crate::settings::{self, LangPref};
 use crate::theme;
+use crate::tree_list::{self, Step};
 use darak_core::i18n::{plural, set_lang, tr};
 use darak_core::tr;
 use crate::treemap::{self, Detail, Highlights, Item, ItemKind, Layout, LayoutSource, Morph, MorphKey, Style, ZoomAnim};
@@ -70,6 +72,18 @@ pub struct App {
     morph_until: Option<Instant>,
     /// 화면 언어 고르기 (Windows 언어·한국어·영어)
     lang_pref: LangPref,
+    /// 오른쪽 패널의 트리 목록을 켰는지. 이번 실행 동안만 기억한다 (설정에는 언어만 남긴다)
+    list_on: bool,
+    /// 목록을 켰을 때 오른쪽 패널에서 고른 탭
+    panel_tab: PanelTab,
+    /// 탭을 넘길지 판단하려고 기억해 둔 직전 검색어
+    seen_query: String,
+    /// 목록의 보이는 행 캐시와 스크롤 요청
+    list: tree_list::View,
+    /// 이번 프레임에 목록이 보였는지 (↑ ↓ ← → Home End를 목록이 쓴다)
+    list_visible: bool,
+    /// 목록에서 가리킨 행 (트리맵 강조에 쓴다)
+    list_hover: Option<NodeId>,
     #[cfg(feature = "perf")]
     perf_trace: Option<crate::perf_trace::PerfTrace>,
     #[cfg(feature = "perf")]
@@ -125,6 +139,13 @@ enum Confirm {
     Relaunch(Option<String>),
     /// 새 스캔·다시 스캔 (스캔할 루트, normalize_root를 거친 값)
     Scan(String),
+}
+
+/// 오른쪽 패널의 탭 (목록을 켰을 때만 보인다)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanelTab {
+    List,
+    Search,
 }
 
 /// '관리자로 실행'이 지금 할 수 있는 일
@@ -197,6 +218,12 @@ impl App {
             morph_items: Vec::new(),
             morph_until: None,
             lang_pref,
+            list_on: false,
+            panel_tab: PanelTab::List,
+            seen_query: String::new(),
+            list: tree_list::View::default(),
+            list_visible: false,
+            list_hover: None,
             #[cfg(feature = "perf")] perf_trace: trace,
             #[cfg(feature = "perf")] perf_fixture_id: None,
             #[cfg(feature = "perf")] perf_measurement: None,
@@ -795,18 +822,41 @@ impl App {
         egui::Panel::top("toolbar").frame(bar(12, 8)).show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").frame(bar(12, 6)).show(ui, |ui| self.status_bar(ui));
 
-        let show_results = self.scanning.is_none()
-            && self.doc.as_ref().is_some_and(|d| !d.search.query.trim().is_empty());
-        if show_results {
+        // 오른쪽 패널 (ViewList 보드 안 A): 목록을 켰거나 검색어가 있으면 보인다. 스캔 중에는 숨긴다.
+        // 목록을 켰으면 [목록 | 검색 결과] 탭으로 나누고, 껐으면 지금처럼 검색 결과만 보인다.
+        self.list_hover = None;
+        self.sync_panel_tab();
+        let query_active = self.doc.as_ref().is_some_and(|d| !d.search.query.trim().is_empty());
+        let side = self.scanning.is_none() && self.doc.is_some() && (self.list_on || query_active);
+        let tab = match (self.list_on, query_active) {
+            (false, _) => PanelTab::Search,
+            (true, false) => PanelTab::List,
+            (true, true) => self.panel_tab,
+        };
+        let show_results = side && tab == PanelTab::Search;
+        self.list_visible = side && tab == PanelTab::List;
+        if side {
             let mut action = search_panel::Action::None;
-            egui::Panel::right("results").resizable(true).default_size(440.0).min_size(260.0).show(ui, |ui| {
-                if let Some(doc) = &mut self.doc { search_panel::controls(ui, doc); }
-                self.update_search();
-                if let Some(doc) = &mut self.doc {
-                    action = search_panel::results(ui, doc, self.mode);
+            let mut listed = list_panel::Outcome::default();
+            // 목록 기본 폭 480, 검색 결과만이면 440. 둘 다 최소 260 (패널 하나라 폭은 함께 기억한다)
+            let width = if self.list_on { 480.0 } else { 440.0 };
+            egui::Panel::right("results").resizable(true).default_size(width).min_size(260.0).show(ui, |ui| {
+                if self.list_on {
+                    self.panel_tabs(ui, query_active, tab);
                 }
-                #[cfg(feature = "perf")]
-                { table_draw = self.perf_draw_identity(); }
+                if show_results {
+                    if let Some(doc) = &mut self.doc { search_panel::controls(ui, doc); }
+                    self.update_search();
+                    if let Some(doc) = &mut self.doc {
+                        action = search_panel::results(ui, doc, self.mode);
+                    }
+                    #[cfg(feature = "perf")]
+                    { table_draw = self.perf_draw_identity(); }
+                } else if let Some(doc) = &mut self.doc {
+                    // 삭제 결과를 반영하는 동안은 트리맵처럼 누를 수 없다
+                    let (view, mode, elevated) = (&mut self.list, self.mode, self.elevated);
+                    listed = ui.add_enabled_ui(self.pending_removal.is_none(), |ui| list_panel::show(ui, doc, view, mode, elevated)).inner;
+                }
             });
             let mut open = None;
             if let Some(doc) = &mut self.doc {
@@ -825,6 +875,7 @@ impl App {
             if let Some(id) = open {
                 self.open_file(id);
             }
+            self.apply_list(listed);
         }
 
         // Result clicks can change a focus-only scope before the treemap draws.
@@ -1037,7 +1088,11 @@ impl App {
                     }
                 }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| self.language_picker(ui));
+            // 오른쪽 끝부터 화면 언어, 그 앞에 목록 패널 토글
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                self.language_picker(ui);
+                self.list_toggle(ui);
+            });
         });
         if review {
             self.open_delete_review();
@@ -1133,6 +1188,90 @@ impl App {
         self.layout.invalidate();
         if let Err(e) = settings::save(self.lang_pref) {
             self.toast(tr!("언어 설정을 저장하지 못했습니다: {e}", "Couldn't save the language setting: {e}"));
+        }
+    }
+
+    /// 툴바의 '목록 패널' 토글 (높이 28, 켜지면 켜진 세그먼트와 같은 line 바탕 · 600).
+    /// 스캔 중에는 미리 보기 트리맵에 선택 · 삭제 표시가 없어 끈 모양으로 막고, 끝나면 이전 켜짐 상태로 돌아온다.
+    /// 단축키는 아직 정하지 않았다 (보드: Ctrl+L 후보)
+    fn list_toggle(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.scanning.is_none() && self.doc.is_some();
+        let hint = if self.scanning.is_some() {
+            tr("스캔이 끝나면 목록을 볼 수 있습니다", "The list is available when the scan finishes")
+        } else if self.doc.is_none() {
+            tr("스캔한 뒤에 목록을 볼 수 있습니다", "The list is available after a scan")
+        } else {
+            tr("트리맵 옆에 현재 폴더를 크기순 목록으로 보기", "Show the current folder as a size-sorted list beside the treemap")
+        };
+        if theme::toggle_button(ui, enabled, self.list_on, tr("목록 패널", "List panel")).on_hover_text(hint).clicked() {
+            self.list_on = !self.list_on;
+            // 켜면 목록 탭부터 보여 준다
+            if self.list_on {
+                self.panel_tab = PanelTab::List;
+            }
+        }
+    }
+
+    /// 검색어가 생기거나 바뀌면 검색 결과 탭으로, 지우면 목록 탭으로 넘긴다
+    fn sync_panel_tab(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        if doc.search.query != self.seen_query {
+            self.panel_tab = if doc.search.query.trim().is_empty() { PanelTab::List } else { PanelTab::Search };
+            self.seen_query.clone_from(&doc.search.query);
+        }
+    }
+
+    /// 패널 맨 위 줄: 왼쪽 탭 세그먼트, 목록 탭이면 오른쪽에 현재 폴더 요약 (12px text.tertiary).
+    /// 검색어가 없으면 검색 결과 탭은 text.faint로 꺼진다.
+    fn panel_tabs(&mut self, ui: &mut egui::Ui, query_active: bool, tab: PanelTab) {
+        let t = theme::of(ui);
+        let before = self.panel_tab;
+        ui.horizontal(|ui| {
+            theme::tabs(ui, |ui| {
+                if theme::tab(ui, tab == PanelTab::List, true, tr("목록", "List"), 71.0).clicked() {
+                    self.panel_tab = PanelTab::List;
+                }
+                let search = theme::tab(ui, tab == PanelTab::Search, query_active, tr("검색 결과", "Search results"), 71.0);
+                let search = if query_active {
+                    search
+                } else {
+                    search.on_hover_text(tr("검색어를 입력하면 결과가 여기에 나옵니다", "Results appear here when you search"))
+                };
+                if search.clicked() {
+                    self.panel_tab = PanelTab::Search;
+                }
+            });
+            if tab == PanelTab::List && let Some(doc) = &self.doc {
+                let text = list_panel::summary(doc, self.mode);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), theme::H_SMALL), egui::Sense::hover());
+                let mut job = egui::text::LayoutJob::single_section(
+                    text,
+                    egui::TextFormat::simple(egui::FontId::proportional(theme::CAPTION), t.text_tertiary),
+                );
+                job.wrap = egui::text::TextWrapping { max_width: rect.width().max(1.0), max_rows: 1, break_anywhere: true, overflow_character: Some('…') };
+                let g = ui.painter().layout_job(job);
+                let at = egui::Align2::RIGHT_CENTER.anchor_size(egui::pos2(rect.right(), rect.center().y), g.size());
+                ui.painter().galley(at.min, g, t.text_tertiary);
+            }
+        });
+        // 이번 프레임의 내용은 이미 정해졌으니 다음 프레임에 새 탭을 그린다
+        if self.panel_tab != before {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// 목록에서 일어난 일: 가리킨 행, 메뉴의 삭제 표시, 더블클릭한 파일 · 링크 (트리맵과 같은 정책)
+    fn apply_list(&mut self, out: list_panel::Outcome) {
+        self.list_hover = out.hovered;
+        if let Some(n) = out.toggle {
+            self.toggle_mark(n);
+        }
+        let Some(id) = out.open else { return };
+        let Some(doc) = &self.doc else { return };
+        if doc.tree.node(id).kind != Kind::Link {
+            self.open_file(id);
+        } else if filesystem_actions_enabled(doc) {
+            shell(Shell::Reveal(doc.tree.path(id)));
         }
     }
 
@@ -1530,7 +1669,7 @@ impl App {
     }
 
     fn treemap_view(&mut self, ui: &mut egui::Ui) {
-        let (mode, detail, elevated) = (self.mode, self.detail, self.elevated);
+        let (mode, detail, elevated, list_hover) = (self.mode, self.detail, self.elevated, self.list_hover);
         let dark = ui.visuals().dark_mode;
         let Some(doc) = &mut self.doc else { return };
         let (resp, painter) = treemap::canvas(ui);
@@ -1595,7 +1734,10 @@ impl App {
                 else { shown.iter().rev().find(|it| it.rect.contains(pos)) }
             }).copied()
         };
-        doc.hovered = hit.map(|it| it.node);
+        // 목록에서 가리킨 행도 같은 타일을 밝힌다
+        doc.hovered = hit.map(|it| it.node).or(list_hover);
+        // 목록은 트리맵에서 가리킨 항목의 행을 밝힌다 (작은 항목 묶음은 그 폴더 행이 아니다)
+        self.list.map_hover = selectable_node(hit.as_ref());
 
         {
             let d: &Doc = doc;
@@ -1851,6 +1993,21 @@ impl App {
         let mut detail = None;
         let mut open = None;
         let mut rescan = false;
+        // 목록이 보이면 ↑ ↓ Home End로 행을 고르고 → ←로 펼치고 접는다 (Alt 조합은 아래의 뒤로 · 앞으로 · 상위)
+        let list_step = ctx.input(|i| {
+            let plain = self.list_visible && !i.modifiers.alt && !i.modifiers.command;
+            [
+                (Key::ArrowUp, Step::Up),
+                (Key::ArrowDown, Step::Down),
+                (Key::Home, Step::Home),
+                (Key::End, Step::End),
+                (Key::ArrowLeft, Step::Left),
+                (Key::ArrowRight, Step::Right),
+            ]
+            .into_iter()
+            .find(|&(k, _)| plain && i.key_pressed(k))
+            .map(|(_, s)| s)
+        });
         let Some(doc) = &mut self.doc else { return };
         ctx.input(|i| {
             if i.modifiers.alt && i.key_pressed(Key::ArrowLeft) || i.pointer.button_pressed(PointerButton::Extra1) {
@@ -1882,6 +2039,12 @@ impl App {
                 rescan = true;
             }
         });
+        if let Some(step) = list_step {
+            let rows = self.list.rows(doc, self.mode);
+            doc.selected = tree_list::step(rows, &mut doc.expanded, doc.selected, step);
+            // 다음 프레임에 새 선택으로 스크롤하고 펼친 행을 그린다
+            ctx.request_repaint();
+        }
         if rescan {
             self.rescan();
         }
@@ -1973,7 +2136,7 @@ fn copied_id() -> egui::Id {
 }
 
 /// 오른쪽 클릭 메뉴. 삭제 표시를 바꿔야 하면 true.
-fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> bool {
+pub(crate) fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> bool {
     let t = theme::of(ui);
     let mut toggle = false;
     let path = doc.tree.path(n);
@@ -2050,22 +2213,29 @@ fn context_menu(ui: &mut egui::Ui, doc: &mut Doc, n: NodeId, elevated: bool) -> 
 
 /// 트리맵 툴팁 (컴포넌트 보드 「툴팁」): 이름 600, 경로·표는 12px, 경고는 warn.text
 fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
-    let t = theme::of(ui);
-    let tree = &doc.tree;
-    let n = tree.node(it.node);
-    let secondary = |s: String| theme::caption(s).color(t.text_secondary);
     if let ItemKind::Group { count, size } = it.kind {
+        let t = theme::of(ui);
+        let secondary = |s: String| theme::caption(s).color(t.text_secondary);
         let items = plural(count as u64, "item", "items");
         let title = theme::semibold(ui, tr!("작은 항목 {count}개", "{count} small {items}"));
         ui.label(title);
-        ui.label(secondary(format!("{} · {}", human_size(size), tree.path(it.node))));
+        ui.label(secondary(format!("{} · {}", human_size(size), doc.tree.path(it.node))));
         ui.label(secondary(tr("폴더를 확대하면 보입니다", "Zoom into the folder to see them").into()));
         return;
     }
-    let name = theme::semibold(ui, tree.name(it.node));
+    node_tooltip(ui, doc, it.node, mode);
+}
+
+/// 항목 하나의 툴팁 (트리맵 타일과 목록 행이 같은 내용을 쓴다)
+pub(crate) fn node_tooltip(ui: &mut egui::Ui, doc: &Doc, id: NodeId, mode: SizeMode) {
+    let t = theme::of(ui);
+    let tree = &doc.tree;
+    let n = tree.node(id);
+    let secondary = |s: String| theme::caption(s).color(t.text_secondary);
+    let name = theme::semibold(ui, tree.name(id));
     ui.label(name);
     // 긴 경로는 가운데를 줄인다 (앞의 드라이브와 끝의 이름은 남는다)
-    let path = theme::middle_ellipsis(ui, &tree.path(it.node), &egui::FontId::monospace(theme::MONO), 420.0);
+    let path = theme::middle_ellipsis(ui, &tree.path(id), &egui::FontId::monospace(theme::MONO), 420.0);
     ui.label(theme::mono(path).color(t.text_secondary));
     ui.add_space(6.0);
     let size = n.size(mode);
@@ -2086,7 +2256,7 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         key(ui, other.0);
         value(ui, human_size(other.1));
         ui.end_row();
-        if let Some(p) = tree.parent(it.node) {
+        if let Some(p) = tree.parent(id) {
             key(ui, tr("비율", "Share"));
             let (of_parent, of_view) = (pct(p), pct(doc.focus));
             value(ui, tr!(
@@ -2107,7 +2277,7 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         }
     });
     // 표시 상태는 배지 (글리프와 글자로도 뜻을 전한다)
-    match doc.mark_state(it.node) {
+    match doc.mark_state(id) {
         1 => {
             ui.label(theme::caption(tr("🗑 삭제 표시됨", "🗑 Marked for deletion")).color(t.danger_text));
         }
@@ -2117,14 +2287,14 @@ fn tooltip(ui: &mut egui::Ui, doc: &Doc, it: treemap::Item, mode: SizeMode) {
         _ => {}
     }
     let warn = |s: String| theme::caption(s).color(t.warn_text);
-    if let Some(note) = incomplete_note(doc, it.node) {
+    if let Some(note) = incomplete_note(doc, id) {
         ui.add_space(2.0);
         ui.label(warn(format!("⚠ {note}")));
-        if let Some(names) = unread_children(tree, it.node) {
+        if let Some(names) = unread_children(tree, id) {
             ui.label(secondary(names));
         }
     }
-    if doc.stale_within(it.node) {
+    if doc.stale_within(id) {
         ui.label(warn(tr("⚠ 일부만 지워진 폴더라 크기가 실제와 다를 수 있습니다 · 다시 스캔하세요", "⚠ Partly deleted folder, so sizes may be off · Rescan").into()));
     }
     if n.has(flags::HARDLINK_DUP) {
@@ -2562,6 +2732,12 @@ mod tests {
             morph_items: Vec::new(),
             morph_until: None,
             lang_pref: LangPref::Ko,
+            list_on: false,
+            panel_tab: PanelTab::List,
+            seen_query: String::new(),
+            list: tree_list::View::default(),
+            list_visible: false,
+            list_hover: None,
             #[cfg(feature = "perf")] perf_trace: None,
             #[cfg(feature = "perf")] perf_fixture_id: None,
             #[cfg(feature = "perf")] perf_measurement: None,
@@ -4384,6 +4560,47 @@ mod tests {
         assert!(!ctx.text_edit_focused());
         assert!(shell_log().is_empty());
         assert_eq!(app.doc.as_ref().unwrap().selected, Some(2));
+    }
+
+    #[test]
+    fn list_panel_follows_toggle_keys_and_search_tabs() {
+        let ctx = egui::Context::default();
+        let mut app = app(fixture(1));
+        // 꺼져 있으면 오른쪽 패널이 없고 툴바에 토글만 있다
+        let output = full_frame(&ctx, &mut app, vec![], 0.0);
+        assert!(text_pos(&output, "목록 패널").is_some());
+        assert!(text_pos(&output, "항목 수").is_none());
+        assert!(!app.list_visible);
+        app.list_on = true;
+        full_frame(&ctx, &mut app, vec![], 0.1);
+        let output = full_frame(&ctx, &mut app, vec![], 0.2);
+        assert!(app.list_visible);
+        assert!(text_pos(&output, "항목 수").is_some());
+        // ↓는 첫 행(가장 큰 folder), →는 펼치기, 한 번 더 →는 첫 자식
+        let mut time = 0.3;
+        for k in [Key::ArrowDown, Key::ArrowRight, Key::ArrowRight] {
+            full_frame(&ctx, &mut app, vec![key(k)], time);
+            time += 0.1;
+        }
+        let doc = app.doc.as_ref().unwrap();
+        assert_eq!(doc.selected, Some(3));
+        assert!(doc.expanded.contains(1));
+        // ←는 부모 행
+        full_frame(&ctx, &mut app, vec![key(Key::ArrowLeft)], time);
+        assert_eq!(app.doc.as_ref().unwrap().selected, Some(1));
+        // 검색어가 생기면 검색 결과 탭, 지우면 목록 탭으로 돌아온다
+        app.doc.as_mut().unwrap().search.query = "child".into();
+        full_frame(&ctx, &mut app, vec![], time + 0.1);
+        assert_eq!(app.panel_tab, PanelTab::Search);
+        assert!(!app.list_visible);
+        app.doc.as_mut().unwrap().search.query.clear();
+        full_frame(&ctx, &mut app, vec![], time + 0.2);
+        assert!(app.list_visible);
+        // 끄면 패널이 닫히고 화살표는 다시 무시한다
+        app.list_on = false;
+        full_frame(&ctx, &mut app, vec![key(Key::ArrowDown)], time + 0.3);
+        assert!(!app.list_visible);
+        assert_eq!(app.doc.as_ref().unwrap().selected, Some(1));
     }
 
     /// 오른쪽 클릭 메뉴만 그리며 `text` 항목을 누른다. 메뉴가 삭제 표시를 바꾸라고 했으면 true
