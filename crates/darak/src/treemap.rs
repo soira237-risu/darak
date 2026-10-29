@@ -629,6 +629,8 @@ const GROUP_HATCH: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 40);
 const HOVER_GLOW: Color32 = Color32::WHITE;
 /// 삭제 빗금: mark 55%, 2px, 8px 간격
 const MARK_HATCH_ALPHA: u8 = 140;
+/// 목록 칩의 안쪽 테두리: 검정 35% (두 테마)
+const CHIP_EDGE: Color32 = Color32::from_rgba_premultiplied(0, 0, 0, 89);
 
 /// 글자 크기: 폴더 제목 11.5/600, 타일 이름 12/600, 크기 11/400
 const DIR_TITLE: f32 = 11.5;
@@ -652,8 +654,14 @@ impl Style {
         Self::ramp(self.palette().dir_body, depth)
     }
 
-    fn closed_dir(&self, depth: u16) -> Color32 {
+    /// 펼치지 않은 폴더 (목록의 폴더 칩은 깊이 0 값)
+    pub fn closed_dir(&self, depth: u16) -> Color32 {
         Self::ramp(self.palette().dir_closed, depth)
+    }
+
+    /// tile.link (목록의 링크 칩)
+    pub fn link(&self) -> Color32 {
+        self.palette().link
     }
 
     /// 범주 10개를 채도 낮은 5색 + 회색으로 묶는다 (디자인 시스템 `cat.*`).
@@ -671,7 +679,7 @@ impl Style {
     }
 }
 
-fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
+pub(crate) fn lerp(a: Color32, b: Color32, t: f32) -> Color32 {
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
@@ -862,6 +870,19 @@ fn hatch(painter: &Painter, r: Rect, color: Color32, period: f32, width: f32) {
         p.line_segment([Pos2::new(x, r.max.y), Pos2::new(x + r.height(), r.min.y)], Stroke::new(width, color));
         x += step;
     }
+}
+
+/// 목록 행의 범주 칩 (모서리 2, 안쪽 1px 검정 35%). 삭제 표시면 타일과 같은 빨간 빗금을 겹친다.
+/// `fade`가 1보다 작으면 그만큼 흐리게 (검색 필터 밖)
+pub fn chip(painter: &Painter, r: Rect, fill: Color32, marked: bool, mark: Color32, fade: f32) {
+    let fa = |c: Color32| if fade < 1.0 { c.gamma_multiply(fade) } else { c };
+    let radius = CornerRadius::same(2);
+    painter.rect_filled(r, radius, fa(fill));
+    if marked {
+        let m = Color32::from_rgba_unmultiplied(mark.r(), mark.g(), mark.b(), MARK_HATCH_ALPHA);
+        hatch(painter, r, fa(m), 8.0, 2.0);
+    }
+    painter.rect_stroke(r, radius, Stroke::new(1.0, fa(CHIP_EDGE)), StrokeKind::Inside);
 }
 
 /// 그리기 영역에서 쓸 반응 영역

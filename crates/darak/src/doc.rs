@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::search_worker::{SearchCompletion, SearchKey};
+use crate::tree_list::Expanded;
 
 use darak_core::i18n::tr;
 use darak_core::remove::{Guard, protected_reason_as};
@@ -31,6 +32,8 @@ pub struct Doc {
     pub stale: BTreeSet<NodeId>,
     /// 스캔을 마친 시각 (2000년 기준 초)
     pub scanned_at: u32,
+    /// 트리 목록에서 펼친 폴더 (이동해도 남는다. 다시 스캔하면 새 문서라 비어 있다)
+    pub expanded: Expanded,
 }
 
 /// 같은 루트를 다시 스캔할 때 새 문서로 이어 가는 위치와 검색 설정
@@ -85,6 +88,7 @@ impl Doc {
             guard: Guard::default(),
             stale: BTreeSet::new(),
             scanned_at: now_secs2000(),
+            expanded: Expanded::default(),
         }
     }
 
@@ -307,6 +311,7 @@ impl Doc {
         self.forward.retain(|&id| live(id));
         self.marks.retain(|&id| live(id));
         self.stale.retain(|&id| live(id));
+        self.expanded.retain(live);
         self.rebuild_mark_bits();
         self.clear_search();
         RemovalApply::Applied

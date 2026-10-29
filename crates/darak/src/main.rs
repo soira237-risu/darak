@@ -5,6 +5,7 @@ mod delete;
 mod doc;
 mod drives;
 mod fonts;
+mod list_panel;
 #[cfg(feature = "perf")]
 mod perf_trace;
 mod preview_worker;
@@ -12,6 +13,7 @@ mod search_panel;
 mod search_worker;
 mod settings;
 mod theme;
+mod tree_list;
 mod treemap;
 
 fn main() -> eframe::Result {
